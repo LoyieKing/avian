@@ -38,7 +38,7 @@
 #define CPU_SUBTYPE_I386_ALL 3
 #define CPU_SUBTYPE_X86_64_ALL CPU_SUBTYPE_I386_ALL
 #define CPU_SUBTYPE_ARM_V7 9
-#define CPU_SUBTYPE_ARM_V8 13
+#define CPU_SUBTYPE_ARM64_ALL 0
 
 namespace {
 
@@ -161,7 +161,7 @@ class MachOPlatform : public Platform {
       break;
     case PlatformInfo::Arm64:
       cpuType = CPU_TYPE_ARM64;
-      cpuSubType = CPU_SUBTYPE_ARM_V8;
+      cpuSubType = CPU_SUBTYPE_ARM64_ALL;
       break;
     default:
       // should never happen (see MachOPlatform declarations at bottom)

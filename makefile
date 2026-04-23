@@ -4,11 +4,15 @@ name = avian
 version := $(shell grep version gradle.properties | cut -d'=' -f2)
 
 get-java-version = $(shell "$1" -version 2>&1 \
-		| grep -E 'version "1|version "9' \
-		| sed -e 's/.*version "1.\([^.]*\).*/\1/' \
-					-e 's/.*version "9.*/9/')
+		| sed -n -E 's/.*version "1\.([0-9]+).*/\1/p; s/.*version "([0-9]+).*/\1/p' \
+		| head -n 1)
 
-java-version := $(call get-java-version,$(JAVA_HOME)/bin/java)
+# The build uses -source/-target and -bootclasspath flags that are compatible
+# with Java 8 semantics. For JDK 9+, force language level 8.
+java-version := $(shell v="$(call get-java-version,$(JAVA_HOME)/bin/java)"; \
+	if test -z "$$v"; then echo 8; \
+	elif test "$$v" -ge 9; then echo 8; \
+	else echo "$$v"; fi)
 
 build-arch := $(shell uname -m \
 	| sed 's/^i.86$$/i386/' \
@@ -22,16 +26,12 @@ build-arch := $(shell uname -m \
 build-platform := \
 	$(shell uname -s | tr [:upper:] [:lower:] \
 		| sed \
-			-e 's/^mingw64.*$$/mingw32/' \
-			-e 's/^mingw32.*$$/mingw32/' \
-			-e 's/^cygwin.*$$/cygwin/' \
 			-e 's/^darwin.*$$/macosx/')
 
 arch = $(build-arch)
 target-arch = $(arch)
 
-bootimage-platform = \
-	$(subst cygwin,windows,$(subst mingw32,windows,$(build-platform)))
+bootimage-platform = $(build-platform)
 
 platform = $(bootimage-platform)
 
@@ -87,8 +87,16 @@ ifneq ($(ios),)
 	x := $(error "please use 'platform=ios' instead of 'ios=true'")
 endif
 
-ifeq ($(filter linux windows macosx ios freebsd,$(platform)),)
-	x := $(error "'$(platform)' is not a supported platform (choose one of: linux windows macosx ios freebsd)")
+ifeq ($(filter linux macosx ios freebsd,$(platform)),)
+	x := $(error "'$(platform)' is not a supported platform (choose one of: linux macosx ios freebsd)")
+endif
+
+ifneq ($(filter windows wp8,$(platform)),)
+	x := $(error "platform '$(platform)' is no longer supported")
+endif
+
+ifneq ($(filter mingw32 cygwin,$(build-platform)),)
+	x := $(error "build platform '$(build-platform)' is no longer supported")
 endif
 
 ifeq ($(platform),ios)
@@ -141,23 +149,9 @@ platform-kernel = $(subst macosx,darwin,$(subst ios,darwin,$1))
 build-kernel = $(call platform-kernel,$(build-platform))
 kernel = $(call platform-kernel,$(platform))
 
-ifeq ($(build-platform),cygwin)
-	native-path = cygpath -m
-endif
-
-windows-path = echo
-
 path-separator = :
 
-ifneq (,$(filter mingw32 cygwin,$(build-platform)))
-	path-separator = ;
-endif
-
 target-path-separator = :
-
-ifeq ($(platform),windows)
-	target-path-separator = ;
-endif
 
 library-path-variable = LD_LIBRARY_PATH
 
@@ -443,6 +437,9 @@ dlltool = dlltool
 vg = nice valgrind --num-callers=32 --db-attach=yes --freelist-vol=100000000
 vg += --leak-check=full --suppressions=valgrind.supp
 db = gdb --args
+ifeq ($(build-kernel),darwin)
+	db = lldb --
+endif
 javac = "$(JAVA_HOME)/bin/javac" -encoding UTF-8
 javah = "$(JAVA_HOME)/bin/javah"
 jar = "$(JAVA_HOME)/bin/jar"
@@ -996,12 +993,7 @@ ifeq ($(platform),wp8)
 		# "c:\Program Files[ (x86)]\Windows Kits\8.0"
 		WIN8_KIT = C:\$(programFiles)\Windows Kits\8.0
 	endif
-	ifeq ($(build-platform),cygwin)
-		windows-path = cygpath -w
-	else
-		windows-path = $(native-path)
-	endif
-	windows-java-home := $(shell $(windows-path) "$(JAVA_HOME)")
+	windows-java-home := $(shell $(native-path) "$(JAVA_HOME)")
 	target-format = pe
 	ms_cl_compiler = wp8
 	use-lto = false
@@ -1065,8 +1057,8 @@ ifeq ($(platform),wp8)
 		-DAVIAN_VERSION=\"$(version)\" -D_JNI_IMPLEMENTATION_ \
 		-DUSE_ATOMIC_OPERATIONS -DAVIAN_JAVA_HOME=\"$(javahome)\" \
 		-DAVIAN_EMBED_PREFIX=\"$(embed-prefix)\" \
-		-I"$(shell $(windows-path) "$(wp8)/zlib/upstream")" -I"$(shell $(windows-path) "$(wp8)/interop/avian-interop-client")" \
-		-I"$(shell $(windows-path) "$(wp8)/include")" -I$(src) -I$(classpath-src) \
+		-I"$(shell $(native-path) "$(wp8)/zlib/upstream")" -I"$(shell $(native-path) "$(wp8)/interop/avian-interop-client")" \
+		-I"$(shell $(native-path) "$(wp8)/include")" -I$(src) -I$(classpath-src) \
 		-I"$(build)" \
 		-I"$(windows-java-home)/include" -I"$(windows-java-home)/include/win32" \
 		-DTARGET_BYTES_PER_WORD=$(pointer-size) \
@@ -1098,8 +1090,8 @@ ifeq ($(platform),wp8)
 		-MACHINE:$(machine_type) \
 		-LIBPATH:"$(WP80_KIT)\lib\$(w8kit_arch)" -LIBPATH:"$(WP80_SDK)\lib$(vc_arch)" -LIBPATH:"$(WIN8_KIT)\Lib\win8\um\$(w8kit_arch)" \
 		ws2_32.lib \
-		"$(shell $(windows-path) "$(wp8)\lib\$(deps_arch)\$(build-type)\zlib.lib")" "$(shell $(windows-path) "$(wp8)\lib\$(deps_arch)\$(build-type)\ThreadEmulation.lib")" \
-		"$(shell $(windows-path) "$(wp8)\lib\$(deps_arch)\$(build-type)\AvianInteropClient.lib")"
+		"$(shell $(native-path) "$(wp8)\lib\$(deps_arch)\$(build-type)\zlib.lib")" "$(shell $(native-path) "$(wp8)\lib\$(deps_arch)\$(build-type)\ThreadEmulation.lib")" \
+		"$(shell $(native-path) "$(wp8)\lib\$(deps_arch)\$(build-type)\AvianInteropClient.lib")"
 	lflags += -NXCOMPAT -DYNAMICBASE -SUBSYSTEM:CONSOLE -TLBID:1
 	lflags += -NODEFAULTLIB:"ole32.lib" -NODEFAULTLIB:"kernel32.lib"
 	lflags += PhoneAppModelHost.lib WindowsPhoneCore.lib -WINMD -WINMDFILE:$(subst $(so-suffix),.winmd,$(@))
@@ -1160,9 +1152,8 @@ endif
 
 ifdef msvc
 	target-format = pe
-	windows-path = $(native-path)
-	windows-java-home := $(shell $(windows-path) "$(JAVA_HOME)")
-	zlib := $(shell $(windows-path) "$(win32)/msvc")
+	windows-java-home := $(shell $(native-path) "$(JAVA_HOME)")
+	zlib := $(shell $(native-path) "$(win32)/msvc")
 	ms_cl_compiler = regular
 	as = $(build-cc)
 	cxx = "$(msvc)/BIN/cl.exe"
@@ -1180,7 +1171,7 @@ ifdef msvc
 		-DTARGET_BYTES_PER_WORD=$(pointer-size)
 
 	ifneq ($(lzma),)
-		cflags += -I$(shell $(windows-path) "$(lzma)")
+		cflags += -I$(shell $(native-path) "$(lzma)")
 	endif
 
 	shared = -dll
@@ -1838,7 +1829,7 @@ $(build)/%.o: $(build)/android-src/%.cpp $(build)/android.dep
 	@echo "compiling $(@)"
 	@mkdir -p $(dir $(@))
 	$(cxx) $(android-cflags) $(classpath-extra-cflags) -c \
-		$$($(windows-path) $(<)) $(call output,$(@))
+		$(<) $(call output,$(@))
 
 $(build)/android.dep: $(luni-javas) $(dalvik-javas) $(libart-javas) \
 		$(xml-javas) $(okhttp-android-javas) $(okhttp-javas) $(okio-javas) \
@@ -1893,7 +1884,7 @@ $(test-dep): $(test-sources) $(test-library)
 		$(javac) -source 1.$(java-version) -target 1.$(java-version) \
 			-classpath $(test-build) -d $(test-build) -bootclasspath $(boot-classpath) $${files}; \
 	fi
-	$(javac) -source 1.2 -target 1.1 -XDjsrlimit=0 -d $(test-build) \
+	$(javac) -source 1.$(java-version) -target 1.$(java-version) -XDjsrlimit=0 -d $(test-build) \
 		-bootclasspath $(boot-classpath) test/Subroutine.java
 	@touch $(@)
 
@@ -1910,7 +1901,7 @@ $(test-extra-dep): $(test-extra-sources)
 define compile-object
 	@echo "compiling $(@)"
 	@mkdir -p $(dir $(@))
-	$(cxx) $(cflags) -c $$($(windows-path) $(<)) $(call output,$(@))
+	$(cxx) $(cflags) -c $(<) $(call output,$(@))
 endef
 
 define compile-asm-object
@@ -1922,7 +1913,7 @@ endef
 define compile-unittest-object
 	@echo "compiling $(@)"
 	@mkdir -p $(dir $(@))
-	$(cxx) $(cflags) -c $$($(windows-path) $(<)) -I$(unittest) $(call output,$(@))
+	$(cxx) $(cflags) -c $(<) -I$(unittest) $(call output,$(@))
 endef
 
 $(vm-cpp-objects): $(build)/%.o: $(src)/%.cpp $(vm-depends)
@@ -2000,7 +1991,7 @@ endif
 $(build)/%.o: $(lzma)/C/%.c
 	@echo "compiling $(@)"
 	@mkdir -p $(dir $(@))
-	$(cc) $(lzma-cflags) -c $$($(windows-path) $(<)) $(call output,$(@))
+	$(cc) $(lzma-cflags) -c $(<) $(call output,$(@))
 
 $(vm-asm-objects): $(build)/%-asm.o: $(src)/%.$(asm-format)
 	$(compile-asm-object)
