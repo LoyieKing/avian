@@ -14,8 +14,10 @@ build-arch := $(shell uname -m \
 	| sed 's/^i.86$$/i386/' \
 	| sed 's/^x86pc$$/i386/' \
 	| sed 's/amd64/x86_64/' \
-	| sed 's/^arm.*$$/arm/' \
-	| sed 's/aarch64/arm64/')
+	| sed 's/^aarch64$$/arm64/' \
+	| sed 's/^arm64$$/arm64/' \
+	| sed 's/^armv.*$$/arm/' \
+	| sed 's/^arm$$/arm/')
 
 build-platform := \
 	$(shell uname -s | tr [:upper:] [:lower:] \
@@ -87,12 +89,6 @@ endif
 
 ifeq ($(filter linux windows macosx ios freebsd,$(platform)),)
 	x := $(error "'$(platform)' is not a supported platform (choose one of: linux windows macosx ios freebsd)")
-endif
-
-ifeq ($(platform),macosx)
-	ifneq ($(filter arm arm64,$(arch)),)
-		x := $(error "please use ('arch=arm' or 'arch=arm64') 'platform=ios' to build for ios-arm")
-	endif
 endif
 
 ifeq ($(platform),ios)
@@ -882,6 +878,13 @@ ifeq ($(kernel),darwin)
 				cflags += -arch x86_64
 				asmflags += -arch x86_64
 				lflags += -arch x86_64
+		endif
+
+		ifeq ($(arch),arm64)
+				classpath-extra-cflags += -arch arm64
+				cflags += -arch arm64
+				asmflags += -arch arm64
+				lflags += -arch arm64
 		endif
 	endif
 	cflags += -I$(JAVA_HOME)/include/darwin
