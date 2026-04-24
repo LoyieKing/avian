@@ -183,6 +183,8 @@ inline bool atomicCompareAndSwap32(uint32_t* p, uint32_t old, uint32_t new_)
 }
 
 #ifdef ARCH_arm64
+#define AVIAN_HAS_CAS64
+
 inline bool atomicCompareAndSwap64(uint64_t* p, uint64_t old, uint64_t new_)
 {
   return __sync_bool_compare_and_swap(p, old, new_);

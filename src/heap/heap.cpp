@@ -15,6 +15,8 @@
 
 #include <avian/util/math.h>
 
+#include "avian/system/memory.h"
+
 using namespace vm;
 using namespace avian::util;
 
@@ -568,6 +570,7 @@ class Fixie {
   {
     assertT(c, this->handle == 0);
     assertT(c, next == 0);
+    avian::system::Memory::JitWriteScope scope;
 
     this->handle = handle;
     if (handle) {
@@ -582,6 +585,8 @@ class Fixie {
 
   void remove(Context* c UNUSED)
   {
+    avian::system::Memory::JitWriteScope scope;
+
     if (handle) {
       assertT(c, *handle == this);
       *handle = next;
@@ -957,6 +962,7 @@ void free(Context* c, Fixie** fixies, bool resetImmortal)
         if (DebugFixies) {
           fprintf(stderr, "reset immortal fixie %p\n", f);
         }
+        avian::system::Memory::JitWriteScope scope;
         *p = f->next;
         memset(f->mask(), 0, Fixie::maskSize(f->size, f->hasMask()));
         f->next = 0;
@@ -1012,6 +1018,9 @@ void sweepFixies(Context* c)
 
   while (c->visitedFixies) {
     Fixie* f = c->visitedFixies;
+    if (f->immortal()) {
+      avian::system::Memory::beginJitWrite();
+    }
     f->remove(c);
 
     if (not f->immortal()) {
@@ -1044,6 +1053,9 @@ void sweepFixies(Context* c)
     }
 
     f->marked(false);
+    if (f->immortal()) {
+      avian::system::Memory::endJitWrite();
+    }
   }
 
   c->tenuredFixieCeiling
@@ -1136,9 +1148,16 @@ void* update3(Context* c, void* o, bool* needsVisit)
       if (DebugFixies) {
         fprintf(stderr, "mark fixie %p\n", f);
       }
-      f->marked(true);
-      f->dead(false);
-      f->move(c, &(c->markedFixies));
+      if (f->immortal()) {
+        avian::system::Memory::JitWriteScope scope;
+        f->marked(true);
+        f->dead(false);
+        f->move(c, &(c->markedFixies));
+      } else {
+        f->marked(true);
+        f->dead(false);
+        f->move(c, &(c->markedFixies));
+      }
     }
     *needsVisit = false;
     return o;
@@ -1582,6 +1601,9 @@ void visitDirtyFixies(Context* c, Fixie** p)
 {
   while (*p) {
     Fixie* f = *p;
+    if (f->immortal()) {
+      avian::system::Memory::beginJitWrite();
+    }
 
     bool wasDirty UNUSED = false;
     bool clean = true;
@@ -1637,6 +1659,9 @@ void visitDirtyFixies(Context* c, Fixie** p)
     } else {
       p = &(f->next);
     }
+    if (f->immortal()) {
+      avian::system::Memory::endJitWrite();
+    }
   }
 }
 
@@ -1644,6 +1669,9 @@ void visitMarkedFixies(Context* c)
 {
   while (c->markedFixies) {
     Fixie* f = c->markedFixies;
+    if (f->immortal()) {
+      avian::system::Memory::beginJitWrite();
+    }
     f->remove(c);
 
     if (DebugFixies) {
@@ -1669,6 +1697,9 @@ void visitMarkedFixies(Context* c)
     c->client->walk(f->body(), &w);
 
     f->move(c, &(c->visitedFixies));
+    if (f->immortal()) {
+      avian::system::Memory::endJitWrite();
+    }
   }
 }
 
@@ -2007,8 +2038,9 @@ class MyHeap : public Heap {
 
     expect(&c, not limitExceeded());
 
-    return (new (p) Fixie(&c, sizeInWords, objectMask, handle, immortal))
-        ->body();
+    Fixie* fixie = new (p) Fixie(&c, sizeInWords, objectMask, handle, immortal);
+
+    return fixie->body();
   }
 
   virtual void* allocateFixed(Alloc* allocator,

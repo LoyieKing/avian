@@ -104,6 +104,15 @@ GcField* fieldForOffset(Thread* t, object o, unsigned offset)
   }
 }
 
+object longAccessLock(Thread* t, object o, unsigned offset)
+{
+  if (objectClass(t, o)->arrayDimensions()) {
+    return objectClass(t, o);
+  } else {
+    return fieldForOffset(t, o, offset);
+  }
+}
+
 }  // namespace
 
 extern "C" AVIAN_EXPORT int64_t JNICALL
@@ -957,16 +966,22 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
   uint64_t update;
   memcpy(&update, arguments + 6, 8);
 
-#ifdef AVIAN_HAS_CAS64
+#if defined(AVIAN_HAS_CAS64)
   return atomicCompareAndSwap64(
       &fieldAtOffset<uint64_t>(target, offset), expect, update);
 #else
+  object lock = longAccessLock(t, target, offset);
+
   PROTECT(t, target);
-  ACQUIRE_FIELD_FOR_WRITE(t, fieldForOffset(t, target, offset));
+  PROTECT(t, lock);
+  acquire(t, lock);
+
   if (fieldAtOffset<uint64_t>(target, offset) == expect) {
     fieldAtOffset<uint64_t>(target, offset) = update;
+    release(t, lock);
     return true;
   } else {
+    release(t, lock);
     return false;
   }
 #endif
@@ -983,11 +998,7 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
 
   object lock;
   if (BytesPerWord < 8) {
-    if (objectClass(t, o)->arrayDimensions()) {
-      lock = objectClass(t, o);
-    } else {
-      lock = fieldForOffset(t, cast<GcSingleton>(t, o), offset);
-    }
+    lock = longAccessLock(t, o, offset);
 
     PROTECT(t, o);
     PROTECT(t, lock);
@@ -1018,11 +1029,7 @@ extern "C" AVIAN_EXPORT void JNICALL
 
   object lock;
   if (BytesPerWord < 8) {
-    if (objectClass(t, o)->arrayDimensions()) {
-      lock = objectClass(t, o);
-    } else {
-      lock = fieldForOffset(t, cast<GcSingleton>(t, o), offset);
-    }
+    lock = longAccessLock(t, o, offset);
 
     PROTECT(t, o);
     PROTECT(t, lock);

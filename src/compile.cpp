@@ -7020,7 +7020,10 @@ uint8_t* finish(MyThread* t,
       = static_cast<uint8_t*>(allocator->allocate(length, TargetBytesPerWord));
 
   a->setDestination(start);
-  a->write();
+  {
+    Memory::JitWriteScope scope;
+    a->write();
+  }
 
   logCompile(t, start, length, 0, name, 0);
 
@@ -7141,6 +7144,7 @@ void insertCallNode(MyThread* t, GcCallNode* node);
 
 void finish(MyThread* t, FixedAllocator* allocator, Context* context)
 {
+  Memory::JitWriteScope scope;
   avian::codegen::Compiler* c = context->compiler;
 
   if (false) {
@@ -7216,7 +7220,10 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
     }
   }
 
-  c->write();
+  {
+    Memory::JitWriteScope scope2;
+    c->write();
+  }
 
   BootContext* bc = context->bootContext;
   if (bc) {
@@ -10470,7 +10477,10 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
     expect(t, a->endBlock(false)->resolve(0, 0) <= p->thunks.table.length); \
                                                                             \
     a->setDestination(start);                                               \
-    a->write();                                                             \
+    {                                                                       \
+      Memory::JitWriteScope scope;                                          \
+      a->write();                                                           \
+    }                                                                       \
                                                                             \
     logCompile(t, start, p->thunks.table.length, 0, #s, 0);                 \
                                                                             \
@@ -10576,7 +10586,10 @@ uintptr_t compileVirtualThunk(MyThread* t,
       codeAllocator(t)->allocate(*size, TargetBytesPerWord));
 
   a->setDestination(start);
-  a->write();
+  {
+    Memory::JitWriteScope scope;
+    a->write();
+  }
 
   const size_t virtualThunkBaseNameLength = strlen(baseName);
   const size_t maxIntStringLength = 10;

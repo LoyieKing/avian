@@ -10,6 +10,8 @@
 
 #include "avian/target.h"
 
+#include <avian/system/memory.h>
+
 #include <avian/util/runtime-array.h>
 
 #include <avian/codegen/compiler.h>
@@ -2908,6 +2910,8 @@ class MyCompiler : public Compiler {
 
   virtual void write()
   {
+    avian::system::Memory::JitWriteScope scope;
+
     c.assembler->write();
 
     int i = 0;
@@ -2926,6 +2930,7 @@ class MyCompiler : public Compiler {
 
           virtual bool resolve(int64_t value, void** location)
           {
+            avian::system::Memory::JitWriteScope scope;
             *target = targetVW(value);
             if (location)
               *location = target;

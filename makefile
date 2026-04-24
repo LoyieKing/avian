@@ -440,6 +440,14 @@ db = gdb --args
 ifeq ($(build-kernel),darwin)
 	db = lldb --
 endif
+
+darwin-jit-entitlements = $(build)/jit.entitlements
+
+define sign-darwin-jit-entitlements
+	@if [ "$(build-kernel)" = "darwin" ]; then \
+		codesign --force --sign - --entitlements $(darwin-jit-entitlements) $(@); \
+	fi
+endef
 javac = "$(JAVA_HOME)/bin/javac" -encoding UTF-8
 javah = "$(JAVA_HOME)/bin/javah"
 jar = "$(JAVA_HOME)/bin/jar"
@@ -603,6 +611,10 @@ endif
 
 ifeq ($(armv6),true)
 	cflags += -DAVIAN_ASSUME_ARMV6
+endif
+
+ifeq ($(kernel),darwin)
+	cflags += -DAVIAN_DARWIN
 endif
 
 ifeq ($(platform),ios)
@@ -2161,11 +2173,13 @@ endef
 endif
 endif
 
-$(executable): $(executable-objects)
+$(executable): $(executable-objects) | $(darwin-jit-entitlements)
 	$(link-executable)
+	$(sign-darwin-jit-entitlements)
 
-$(unittest-executable): $(unittest-executable-objects)
+$(unittest-executable): $(unittest-executable-objects) | $(darwin-jit-entitlements)
 	$(link-executable)
+	$(sign-darwin-jit-entitlements)
 
 $(bootimage-generator): $(bootimage-generator-objects) $(vm-objects)
 	echo building $(bootimage-generator) arch=$(build-arch) platform=$(bootimage-platform)
@@ -2234,7 +2248,7 @@ endif
 
 # todo: the $(no-lto) flag below is due to odd undefined reference errors on
 # Ubuntu 11.10 which may be fixable without disabling LTO.
-$(executable-dynamic): $(driver-dynamic-objects) $(dynamic-library)
+$(executable-dynamic): $(driver-dynamic-objects) $(dynamic-library) | $(darwin-jit-entitlements)
 	@echo "linking $(@)"
 ifdef ms_cl_compiler
 	$(ld) $(lflags) -LIBPATH:$(build) -DEFAULTLIB:$(name) \
@@ -2247,6 +2261,21 @@ else
 	$(ld) $(driver-dynamic-objects) -L$(build) -ljvm $(lflags) $(no-lto) $(rpath) -o $(@)
 endif
 	$(strip) $(strip-all) $(@)
+	$(sign-darwin-jit-entitlements)
+
+$(darwin-jit-entitlements):
+	@mkdir -p $(dir $(@))
+	@printf '%s\n' \
+		'<?xml version="1.0" encoding="UTF-8"?>' \
+		'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+		'<plist version="1.0">' \
+		'<dict>' \
+		'  <key>com.apple.security.get-task-allow</key>' \
+		'  <true/>' \
+		'  <key>com.apple.security.cs.allow-jit</key>' \
+		'  <true/>' \
+		'</dict>' \
+		'</plist>' > $(@)
 
 $(generator): $(generator-objects) $(generator-lzma-objects)
 	@echo "linking $(@)"

@@ -12,6 +12,9 @@
 #include "fixup.h"
 #include "block.h"
 
+#include <avian/arch.h>
+#include <avian/system/memory.h>
+
 namespace {
 
 const unsigned InstructionSize = 4;
@@ -119,7 +122,12 @@ void* updateOffset(vm::System* s, uint8_t* instruction, int64_t value)
     expect(s, bounded(0, 8, v));
   }
 
-  *p = (v & mask) | ((~mask) & *p);
+  {
+    avian::system::Memory::JitWriteScope scope;
+    *p = (v & mask) | ((~mask) & *p);
+  }
+
+  vm::syncInstructionCache(instruction, InstructionSize);
 
   return instruction + InstructionSize;
 }
@@ -157,7 +165,9 @@ ConstantPoolListener::ConstantPoolListener(vm::System* s,
 
 bool ConstantPoolListener::resolve(int64_t value, void** location)
 {
+  avian::system::Memory::JitWriteScope scope;
   *address = value;
+  vm::syncInstructionCache(address, sizeof(*address));
   if (location) {
     *location = returnAddress ? static_cast<void*>(returnAddress) : address;
   }
