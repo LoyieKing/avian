@@ -49,6 +49,7 @@ Context::Context(vm::System* system,
       localFootprint(0),
       machineCodeSize(0),
       alignedFrameSize(0),
+      prologueEnd(0),
       availableGeneralRegisterCount(regFile->generalRegisters.limit
                                     - regFile->generalRegisters.start),
       targetInfo(arch->targetInfo())

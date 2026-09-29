@@ -1979,6 +1979,7 @@ void compile(Context* c,
   }
 
   a->allocateFrame(c->alignedFrameSize);
+  c->prologueEnd = a->offset();
 
   for (Event* e = c->firstEvent; e; e = e->next) {
     if (DebugCompile) {
@@ -2901,6 +2902,11 @@ class MyCompiler : public Compiler {
   virtual unsigned poolSize()
   {
     return c.constantCount * TargetBytesPerWord;
+  }
+
+  virtual unsigned prologueSize()
+  {
+    return c.prologueEnd->value();
   }
 
   virtual void write(uint8_t* buffer, uint8_t* address)

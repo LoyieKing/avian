@@ -186,6 +186,11 @@ class Compiler {
   // word boundary.  Layout does not depend on where the code will go.
   virtual unsigned resolve() = 0;
   virtual unsigned poolSize() = 0;
+  // Offset from the start of the code of the first instruction after
+  // the prologue, where the frame (alignedFrameSize words plus the
+  // architecture's frame header) is fully set up.  Valid after
+  // resolve().
+  virtual unsigned prologueSize() = 0;
   // Emits the code and its constant pool into `buffer`, linked to run
   // at `address`; see Assembler::write.  Promises for code addresses
   // (e.g. machineIp) resolve relative to `address` from here on.
