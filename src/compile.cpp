@@ -7478,7 +7478,14 @@ void updateCall(MyThread* t,
                 void* returnAddress,
                 void* target)
 {
-  t->arch->updateCall(op, returnAddress, target);
+  avian::codegen::CodePatch patch
+      = t->arch->callPatch(op, returnAddress, target);
+
+  {
+    Memory::JitWriteScope scope;
+    memcpy(patch.address, patch.bytes, patch.size);
+  }
+  syncInstructionCache(patch.address, patch.size);
 }
 
 void* compileMethod2(MyThread* t, void* ip);

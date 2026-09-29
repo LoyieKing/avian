@@ -341,9 +341,9 @@ class MyArchitecture : public Architecture {
     return *instruction == 0xE8 and actualTarget == target;
   }
 
-  virtual void updateCall(lir::UnaryOperation op,
-                          void* returnAddress,
-                          void* newTarget)
+  virtual CodePatch callPatch(lir::UnaryOperation op,
+                              void* returnAddress,
+                              void* newTarget)
   {
     bool assertTAlignment UNUSED;
     switch (op) {
@@ -391,7 +391,7 @@ class MyArchitecture : public Architecture {
 
       int32_t v32 = v;
 
-      memcpy(instruction + 1, &v32, 4);
+      return CodePatch(instruction + 1, &v32, 4);
     } else {
       uint8_t* instruction = static_cast<uint8_t*>(returnAddress) - 13;
 
@@ -405,14 +405,8 @@ class MyArchitecture : public Architecture {
               (not assertTAlignment)
               or reinterpret_cast<uintptr_t>(instruction + 2) % 8 == 0);
 
-      memcpy(instruction + 2, &newTarget, 8);
+      return CodePatch(instruction + 2, &newTarget, 8);
     }
-  }
-
-  virtual void setConstant(void* dst, uint64_t constant)
-  {
-    target_uintptr_t v = targetVW(constant);
-    memcpy(dst, &v, TargetBytesPerWord);
   }
 
   virtual unsigned alignFrameSize(unsigned sizeInWords)

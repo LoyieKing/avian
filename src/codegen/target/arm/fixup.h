@@ -80,6 +80,14 @@ void appendOffsetTask(Context* con,
                       Promise* promise,
                       Promise* instructionOffset);
 
+// Returns the branch instruction `instruction` (B, BL or, on arm64,
+// B.cond), assumed to be located at `address`, re-encoded to branch to
+// `target`.  Pure: reads and writes no memory.
+uint32_t retargetBranch(vm::System* s,
+                        uint32_t instruction,
+                        const uint8_t* address,
+                        int64_t target);
+
 void* updateOffset(vm::System* s, uint8_t* instruction, int64_t value);
 
 class ConstantPoolEntry : public Promise {
