@@ -9,6 +9,7 @@
    details. */
 
 #include "avian/machine.h"
+#include "avian/debug.h"
 #include "avian/util.h"
 #include "avian/alloc-vector.h"
 #include "avian/process.h"
@@ -32,6 +33,8 @@
 #include "debug-util.h"
 
 using namespace vm;
+
+
 
 extern "C" uint64_t vmInvoke(void* thread,
                              void* function,
@@ -789,6 +792,37 @@ class Subroutine {
   bool visited;
 };
 
+
+int captureDebugFrames(Thread* thread, debug::WalkerFrame* out, int max)
+{
+  MyThread* t = static_cast<MyThread*>(thread);
+  int n = 0;
+  for (MyStackWalker walker(t); walker.valid() and n < max; walker.next()) {
+    GcMethod* method = walker.method();
+    if (method == 0 or method->name() == 0 or method->class_() == 0)
+      continue;
+    debug::WalkerFrame* frame = out + n;
+    frame->className[0] = 0;
+    frame->methodName[0] = 0;
+    frame->spec[0] = 0;
+    const char* cn = reinterpret_cast<const char*>(method->class_()->name()->body().begin());
+    const char* mn = reinterpret_cast<const char*>(method->name()->body().begin());
+    const char* sp = method->spec()
+                         ? reinterpret_cast<const char*>(method->spec()->body().begin())
+                         : "";
+    ::snprintf(frame->className, sizeof frame->className, "%s", cn);
+    ::snprintf(frame->methodName, sizeof frame->methodName, "%s", mn);
+    ::snprintf(frame->spec, sizeof frame->spec, "%s", sp);
+    int machine = walker.ip();
+    int bci = debug::machineOffsetToBci(frame->className, frame->methodName, frame->spec, machine);
+    if (bci < 0)
+      continue;
+    frame->index = bci;
+    ++n;
+  }
+  return n;
+}
+
 class Context;
 
 class TraceElement : public avian::codegen::TraceHandler {
@@ -884,7 +918,7 @@ enum Thunk {
 #undef THUNK
 };
 
-const unsigned ThunkCount = idleIfNecessaryThunk + 1;
+const unsigned ThunkCount = fieldWatchThunk + 1;
 
 intptr_t getThunk(MyThread* t, Thunk thunk);
 
@@ -1192,6 +1226,7 @@ class Context {
         traceLogCount(0),
         dirtyRoots(false),
         leaf(true),
+        debugBits(0),
         eventLog(t->m->system, t->m->heap, 1024),
         protector(this),
         resource(this),
@@ -1224,6 +1259,7 @@ class Context {
         traceLogCount(0),
         dirtyRoots(false),
         leaf(true),
+        debugBits(0),
         eventLog(t->m->system, t->m->heap, 0),
         protector(this),
         resource(this),
@@ -1294,6 +1330,7 @@ class Context {
   unsigned traceLogCount;
   bool dirtyRoots;
   bool leaf;
+  uint8_t* debugBits;
   Vector eventLog;
   MyProtector protector;
   MyResource resource;
@@ -2203,14 +2240,54 @@ void findUnwindTarget(MyThread* t,
 
   GcMethod* target = t->trace->targetMethod;
   bool mostRecent = true;
+  GcMethod* throwMethod = 0;
+  void* throwIp = 0;
+  bool notedException = false;
 
   *targetIp = 0;
   while (*targetIp == 0) {
     GcMethod* method = methodForIp(t, ip);
     if (method) {
+      if (throwMethod == 0) {
+        throwMethod = method;
+        throwIp = ip;
+      }
       void* handler = findExceptionHandler(t, method, ip);
 
       if (handler) {
+        if (debug::enabled() and t->exception and not notedException
+            and not debug::suppressThrow(t)) {
+          notedException = true;
+          char cn[256], mn[256], spn[256];
+          cn[0] = mn[0] = spn[0] = 0;
+          if (throwMethod->class_() and throwMethod->class_()->name())
+            ::snprintf(cn, sizeof cn, "%s", reinterpret_cast<const char*>(throwMethod->class_()->name()->body().begin()));
+          if (throwMethod->name())
+            ::snprintf(mn, sizeof mn, "%s", reinterpret_cast<const char*>(throwMethod->name()->body().begin()));
+          if (throwMethod->spec())
+            ::snprintf(spn, sizeof spn, "%s", reinterpret_cast<const char*>(throwMethod->spec()->body().begin()));
+          uint8_t* compiled = reinterpret_cast<uint8_t*>(methodCompiled(t, throwMethod));
+          int off = difference(throwIp, compiled);
+          if (off > 0)
+            --off;
+          int throwBci = debug::machineOffsetToBci(cn, mn, spn, off);
+          if (throwBci < 0)
+            throwBci = 0;
+          char ccn[256], cmn[256], csp[256];
+          ccn[0] = cmn[0] = csp[0] = 0;
+          if (method->class_() and method->class_()->name())
+            ::snprintf(ccn, sizeof ccn, "%s", reinterpret_cast<const char*>(method->class_()->name()->body().begin()));
+          if (method->name())
+            ::snprintf(cmn, sizeof cmn, "%s", reinterpret_cast<const char*>(method->name()->body().begin()));
+          if (method->spec())
+            ::snprintf(csp, sizeof csp, "%s", reinterpret_cast<const char*>(method->spec()->body().begin()));
+          uint8_t* ch = reinterpret_cast<uint8_t*>(methodCompiled(t, method));
+          int coff = difference(handler, ch);
+          int catchBci = debug::machineOffsetToBci(ccn, cmn, csp, coff);
+          if (catchBci < 0)
+            catchBci = 0;
+          debug::onException(t, t->exception, 1, throwMethod, throwBci, method, catchBci);
+        }
         *targetIp = handler;
 
         nextFrame(t, &ip, &stack, method, target, mostRecent);
@@ -2236,6 +2313,29 @@ void findUnwindTarget(MyThread* t,
         target = method;
       }
     } else {
+      if (debug::enabled() and t->exception and throwMethod and not notedException
+          and not debug::suppressThrow(t)) {
+        notedException = true;
+        int throwBci = 0;
+        if (throwMethod) {
+          char cn[256], mn[256], spn[256];
+          cn[0] = mn[0] = spn[0] = 0;
+          if (throwMethod->class_() and throwMethod->class_()->name())
+            ::snprintf(cn, sizeof cn, "%s", reinterpret_cast<const char*>(throwMethod->class_()->name()->body().begin()));
+          if (throwMethod->name())
+            ::snprintf(mn, sizeof mn, "%s", reinterpret_cast<const char*>(throwMethod->name()->body().begin()));
+          if (throwMethod->spec())
+            ::snprintf(spn, sizeof spn, "%s", reinterpret_cast<const char*>(throwMethod->spec()->body().begin()));
+          uint8_t* compiled = reinterpret_cast<uint8_t*>(methodCompiled(t, throwMethod));
+          int off = difference(throwIp, compiled);
+          if (off > 0)
+            --off;
+          throwBci = debug::machineOffsetToBci(cn, mn, spn, off);
+          if (throwBci < 0)
+            throwBci = 0;
+        }
+        debug::onException(t, t->exception, 0, throwMethod, throwBci, 0, 0);
+      }
       expect(t, ip);
       *targetIp = ip;
       *targetFrame = 0;
@@ -3133,6 +3233,369 @@ void idleIfNecessary(MyThread* t)
 {
   if (UNLIKELY(t->m->exclusive)) {
     ENTER(t, Thread::IdleState);
+  }
+  if (UNLIKELY(debug::enabled()))
+    debug::safepoint(t);
+}
+
+void NO_RETURN popCompiledFrame(MyThread* t, void* ip, void* stack,
+                                 uintptr_t codeStart, unsigned codeSize,
+                                 unsigned footprint, GcMethod* method,
+                                 uintptr_t low, uintptr_t high, bool useFloat)
+{
+  // Bounds are the compilation that is actually on the stack. Redefine
+  // points the method at a fresh thunk, so method->code()->compiled()
+  // is not that range anymore.
+  expect(t, codeStart);
+  GcMethod* calleeTarget = t->trace ? t->trace->targetMethod : 0;
+  void* link = 0;
+  bool mostRecent = false;
+  if (t->traceContext) {
+    link = t->traceContext->link;
+    mostRecent = t->traceContext->methodIsMostRecent;
+  }
+  t->arch->nextFrame(reinterpret_cast<void*>(codeStart),
+                     codeSize,
+                     footprint,
+                     link,
+                     mostRecent,
+                     calleeTarget ? calleeTarget->parameterFootprint() : -1,
+                     &ip,
+                     &stack);
+  if (method)
+    releaseLock(t, method, stack);
+  void* frame = static_cast<void**>(stack) + t->arch->framePointerOffset();
+  void* sp = static_cast<void**>(stack) + t->arch->frameReturnAddressSize();
+  if (t->trace) {
+    t->trace->targetMethod = 0;
+    t->trace->nativeMethod = 0;
+  }
+  popResources(t);
+  transition(t, ip, sp, t->continuation, t->trace);
+  // Continues at the caller's return address with a synthetic result.
+  // The invoke is not restarted and its arguments are not rebuilt.
+  if (useFloat)
+    vmJumpFloat(ip, frame, sp, t, low, high);
+  else
+    vmJump(ip, frame, sp, t, low, high);
+}
+
+void debugCheckpoint(MyThread* t, uintptr_t bci, uintptr_t bits)
+{
+  // block() drains debugger mail on this thread. Capture the compiled
+  // frame before that, including code bounds, so a redefine while the
+  // thread is suspended cannot hide the frame that is still on the stack.
+  void* frameIp = getIp(t);
+  void* frameStack = t->stack;
+  GcMethod* method = methodForIp(t, frameIp);
+  PROTECT(t, method);
+  uintptr_t codeStart = 0;
+  unsigned codeSize = 0;
+  unsigned footprint = 0;
+  if (method and method->code() and method->code()->compiled()) {
+    codeStart = method->code()->compiled();
+    codeSize = method->code()->compiledSize();
+    footprint = alignedFrameSize(t, method);
+  }
+  debug::checkpoint(t, static_cast<int32_t>(bci), bits, 0);
+  int mode = 0;
+  int tag = 0;
+  uint64_t value = 0;
+  if (debug::takePop(t, &mode, &tag, &value)) {
+    uintptr_t low = static_cast<uintptr_t>(value);
+    uintptr_t high = static_cast<uintptr_t>(value >> 32);
+    bool objectTag = tag == 'L' or tag == '[' or tag == 's' or tag == 't'
+                     or tag == 'g' or tag == 'l' or tag == 'c';
+    if (objectTag)
+      low = reinterpret_cast<uintptr_t>(debug::objectForId(value));
+    bool useFloat = false;
+    if (method) {
+      unsigned rc = method->returnCode();
+      useFloat = rc == FloatField or rc == DoubleField;
+      if (mode != 2) {
+        low = 0;
+        high = 0;
+      }
+    }
+    popCompiledFrame(t, frameIp, frameStack, codeStart, codeSize, footprint,
+                     method, low, high, useFloat);
+  }
+}
+
+void fieldWatch(MyThread* t, uintptr_t field, uintptr_t instance, uintptr_t write,
+                uintptr_t bits, uintptr_t method, uintptr_t bci)
+{
+  if (not debug::watchingFields())
+    return;
+  object valueRef = 0;
+  GcField* f = reinterpret_cast<GcField*>(field);
+  object inst = reinterpret_cast<object>(instance);
+  int report = write ? 1 : 0;
+  // write == 2: float/double were stored first. Read the bits back so
+  // the event carries the real value. truncateThenExtend would convert
+  // numerically, and there is no IR bitcast.
+  if (write == 2 and f and inst) {
+    bits = static_cast<uintptr_t>(getFieldValue(t, inst, f));
+    report = 1;
+    if (f->flags() & ACC_STATIC)
+      inst = 0;
+  } else if (write and f and f->code() == ObjectField) {
+    valueRef = reinterpret_cast<object>(bits);
+  }
+  debug::onField(t, reinterpret_cast<void*>(field), inst,
+                 report, static_cast<uint64_t>(bits), valueRef,
+                 reinterpret_cast<void*>(method), static_cast<int32_t>(bci));
+}
+
+// A watch may suspend and collect.  The instance and the stored value have
+// already been popped, so put them back in the Java frame map for the call
+// and reload them afterwards.  That restores the pre-pop depth, which fits
+// in maxStack.
+void compileFieldWatch(MyThread* t, Frame* frame, GcField* field,
+                       ir::Value*& table, ir::Value*& value, bool hasValue,
+                       bool isStatic, int write, int fieldCode,
+                       GcMethod* method, int bci)
+{
+  if (not debug::enabled())
+    return;
+  avian::codegen::Compiler* c = frame->c;
+  if (not isStatic)
+    frame->push(ir::Type::object(), table);
+  if (hasValue) {
+    switch (fieldCode) {
+    case LongField:
+      frame->pushLarge(ir::Type::i8(), value);
+      break;
+    case DoubleField:
+      frame->pushLarge(ir::Type::f8(), value);
+      break;
+    case ObjectField:
+      frame->push(ir::Type::object(), value);
+      break;
+    case FloatField:
+      frame->push(ir::Type::f4(), value);
+      break;
+    default:
+      frame->push(ir::Type::i4(), value);
+      break;
+    }
+  }
+  ir::Value* bitsArg = c->constant(0, ir::Type::iptr());
+  if (hasValue and write) {
+    switch (fieldCode) {
+    case ByteField:
+    case BooleanField:
+    case CharField:
+    case ShortField:
+    case IntField:
+      bitsArg = c->truncateThenExtend(
+          ir::ExtendMode::Signed, ir::Type::iptr(), ir::Type::i4(), value);
+      break;
+    case LongField:
+      if (TargetBytesPerWord == 8)
+        bitsArg = value;
+      break;
+    case ObjectField:
+      bitsArg = value;
+      break;
+    default:
+      break;
+    }
+  }
+  c->nativeCall(
+      c->constant(getThunk(t, fieldWatchThunk), ir::Type::iptr()),
+      0,
+      frame->trace(0, 0),
+      ir::Type::void_(),
+      args(c->threadRegister(),
+           frame->append(field),
+           (isStatic and write != 2) ? c->constant(0, ir::Type::iptr()) : table,
+           c->constant(write ? write : 0, ir::Type::iptr()),
+           bitsArg,
+           frame->append(method),
+           c->constant(static_cast<intptr_t>(bci), ir::Type::iptr())));
+  if (hasValue) {
+    switch (fieldCode) {
+    case LongField:
+      value = frame->popLarge(ir::Type::i8());
+      break;
+    case DoubleField:
+      value = frame->popLarge(ir::Type::f8());
+      break;
+    case ObjectField:
+      value = frame->pop(ir::Type::object());
+      break;
+    case FloatField:
+      value = frame->pop(ir::Type::f4());
+      break;
+    default:
+      value = frame->pop(ir::Type::i4());
+      break;
+    }
+  }
+  if (not isStatic)
+    table = frame->pop(ir::Type::object());
+}
+
+int compilerLocalIndex(GcMethod* method, int slot, int footprint)
+{
+  int parameterFootprint = method->parameterFootprint();
+  if (slot < parameterFootprint)
+    return parameterFootprint - slot - footprint;
+  return slot;
+}
+
+int jitFrameOp(Thread* thread, int op, int frame, int slot, debug::SlotIO* io)
+{
+  MyThread* t = static_cast<MyThread*>(thread);
+  if (op == 4 or op == 5) {
+    if (frame != 0) {
+      io->status = 33;
+      return 33;
+    }
+    MyStackWalker walker(t);
+    GcMethod* method = 0;
+    for (; walker.valid(); walker.next()) {
+      if (walker.state != MyStackWalker::Method)
+        continue;
+      method = walker.method();
+      break;
+    }
+    if (method == 0) {
+      // Mail runs inside checkpoint, after the compiled sp has been
+      // dropped. The suspend snapshot still names the Java frame, and
+      // debugCheckpoint pops it when the thread resumes.
+      if (frame == 0 and debug::suspendedTopFrame(t)) {
+        if (op == 5) {
+          int want = debug::topReturnTag(t);
+          int got = io->tag;
+          bool obj = got == 'L' or got == '[' or got == 's' or got == 't'
+                     or got == 'g' or got == 'l' or got == 'c';
+          if (want == 'L') {
+            if (not obj) {
+              io->status = 34;
+              return 34;
+            }
+          } else if (want and got != want) {
+            io->status = 34;
+            return 34;
+          }
+          debug::requestEarly(t, io->tag, io->bits);
+        } else
+          debug::requestPop(t);
+        io->status = 0;
+        return 0;
+      }
+      io->status = 32;
+      return 32;
+    }
+    if (op == 5) {
+      int want = 'V';
+      switch (method->returnCode()) {
+      case ByteField: want = 'B'; break;
+      case BooleanField: want = 'Z'; break;
+      case CharField: want = 'C'; break;
+      case ShortField: want = 'S'; break;
+      case FloatField: want = 'F'; break;
+      case IntField: want = 'I'; break;
+      case LongField: want = 'J'; break;
+      case DoubleField: want = 'D'; break;
+      case ObjectField: want = 'L'; break;
+      default: want = 'V'; break;
+      }
+      int got = io->tag;
+      bool obj = got == 'L' or got == '[' or got == 's' or got == 't'
+                 or got == 'g' or got == 'l' or got == 'c';
+      if (want == 'L') {
+        if (not obj) {
+          io->status = 34;
+          return 34;
+        }
+      } else if (got != want) {
+        io->status = 34;
+        return 34;
+      }
+      debug::requestEarly(t, got, io->bits);
+    } else {
+      debug::requestPop(t);
+    }
+    io->status = 0;
+    return 0;
+  }
+  MyStackWalker walker(t);
+  int seen = -1;
+  GcMethod* method = 0;
+  void* fp = 0;
+  for (; walker.valid(); walker.next()) {
+    if (walker.state != MyStackWalker::Method)
+      continue;
+    ++seen;
+    if (seen == frame) {
+      method = walker.method();
+      fp = walker.stack;
+      break;
+    }
+  }
+  if (method == 0 or method->code() == 0) {
+    io->status = 32;
+    return 32;
+  }
+  if (op == 3) {
+    io->tag = 'L';
+    io->status = 0;
+    if (method->flags() & ACC_STATIC) {
+      io->ref = 0;
+      return 0;
+    }
+    slot = 0;
+  }
+  int footprint = (io->tag == 'J' or io->tag == 'D') ? 2 : 1;
+  int index = compilerLocalIndex(method, slot, footprint);
+  if (index < 0 or static_cast<unsigned>(index) >= method->code()->maxLocals()) {
+    io->status = 35;
+    return 35;
+  }
+  void* frameIp = walker.ip_;
+  void* frameStack = fp;
+  nextFrame(t, &frameIp, &frameStack, method, walker.target, walker.count_ == 0);
+  void* locals = stackForFrame(t, frameStack, method);
+  uintptr_t* cell = reinterpret_cast<uintptr_t*>(localObject(t, locals, method, static_cast<unsigned>(index)));
+  bool objectSlot = io->tag == 'L' or io->tag == '[' or io->tag == 's' or io->tag == 't'
+                    or io->tag == 'g' or io->tag == 'l' or io->tag == 'c' or op == 3;
+  if (op == 2) {
+    if (objectSlot)
+      *reinterpret_cast<object*>(cell) = static_cast<object>(io->ref);
+    else if (footprint == 2) {
+      cell[0] = static_cast<uintptr_t>(io->bits >> 32);
+      cell[1] = static_cast<uintptr_t>(io->bits & 0xFFFFFFFF);
+    } else {
+      cell[0] = static_cast<uintptr_t>(static_cast<uint32_t>(io->bits));
+    }
+    io->status = 0;
+    return 0;
+  }
+  if (objectSlot) {
+    io->ref = *reinterpret_cast<object*>(cell);
+    io->tag = 'L';
+  } else if (footprint == 2) {
+    io->bits = (static_cast<uint64_t>(cell[0]) << 32)
+               | (static_cast<uint64_t>(cell[1]) & 0xFFFFFFFF);
+  } else {
+    io->bits = static_cast<uint32_t>(cell[0]);
+  }
+  io->status = 0;
+  return 0;
+}
+
+void invalidateCompiled(Thread* t, void* method)
+{
+  GcMethod* m = static_cast<GcMethod*>(method);
+  if (m == 0 or m->code() == 0)
+    return;
+  m->code()->compiled() = local::defaultThunk(static_cast<MyThread*>(t));
+  if (methodVirtual(t, m)) {
+    uintptr_t thunk = virtualThunk(static_cast<MyThread*>(t), m->offset());
+    m->class_()->vtable()[m->offset()] = reinterpret_cast<void*>(thunk);
   }
 }
 
@@ -4091,6 +4554,10 @@ void compile(MyThread* t,
   Frame* frame = initialFrame;
   avian::codegen::Compiler* c = frame->c;
   Context* context = frame->context;
+  if (debug::enabled() and context->debugBits == 0 and context->method->code()
+      and context->method->code()->length()) {
+    context->debugBits = debug::allocateBits(t, context->method->code()->length());
+  }
   unsigned stackSize = context->method->code()->maxStack();
   Stack stack(t);
   unsigned ip = initialIp;
@@ -4114,6 +4581,18 @@ loop:
     }
 
     frame->startLogicalIp(ip);
+
+    if (debug::enabled()) {
+      c->nativeCall(
+          c->constant(getThunk(t, debugCheckpointThunk), ir::Type::iptr()),
+          0,
+          frame->trace(0, 0),
+          ir::Type::void_(),
+          args(c->threadRegister(),
+               c->constant(static_cast<intptr_t>(ip), ir::Type::iptr()),
+               c->constant(reinterpret_cast<intptr_t>(context->debugBits),
+                           ir::Type::iptr())));
+    }
 
     if (exceptionHandlerStart >= 0) {
       c->initLocalsFromLogicalIp(exceptionHandlerStart);
@@ -4661,6 +5140,7 @@ loop:
 
     case getfield:
     case getstatic: {
+      int fieldBci = static_cast<int>(ip - 1);
       uint16_t index = codeReadInt16(t, code, ip);
 
       object reference
@@ -4709,6 +5189,13 @@ loop:
             c->saveLocals();
             frame->trace(0, 0);
           }
+        }
+
+        {
+          ir::Value* ignored = 0;
+          compileFieldWatch(t, frame, field, table, ignored, false,
+                            instruction == getstatic, 0, field->code(),
+                            context->method, fieldBci);
         }
 
         switch (field->code()) {
@@ -6070,6 +6557,7 @@ loop:
 
     case putfield:
     case putstatic: {
+      int fieldBci = static_cast<int>(ip - 1);
       uint16_t index = codeReadInt16(t, code, ip);
 
       object reference
@@ -6135,6 +6623,16 @@ loop:
         } else {
           table = frame->pop(ir::Type::object());
         }
+
+        // Float and double cannot be passed through an integer native
+        // argument without a bitcast. Store them first and read the
+        // bits back (write == 2). Int, long and object stay before the
+        // store so a debugger still sees the old value as "is".
+        bool readBack = fieldCode == FloatField or fieldCode == DoubleField;
+        if (not readBack)
+          compileFieldWatch(t, frame, field, table, value, true,
+                            instruction == putstatic, 1, fieldCode,
+                            context->method, fieldBci);
 
         switch (fieldCode) {
         case ByteField:
@@ -6210,6 +6708,11 @@ loop:
         default:
           abort(t);
         }
+
+        if (readBack)
+          compileFieldWatch(t, frame, field, table, value, false,
+                            instruction == putstatic, 2, fieldCode,
+                            context->method, fieldBci);
 
         if (field->flags() & ACC_VOLATILE) {
           if (TargetBytesPerWord == 4
@@ -7297,6 +7800,25 @@ void finish(MyThread* t, Context* context)
         t, context, reinterpret_cast<intptr_t>(start));
 
     GcCode* code = context->method->code();
+
+    if (context->debugBits) {
+      unsigned length = context->method->code()->length();
+      int32_t* map = static_cast<int32_t*>(malloc(sizeof(int32_t) * (length ? length : 1)));
+      if (map) {
+        for (unsigned bci = 0; bci < length; ++bci) {
+          map[bci] = -1;
+          if (context->subroutineCount == 0 and bci < context->visitTable.count
+              and context->visitTable[bci] > 0) {
+            Promise* promise = context->compiler->machineIp(bci);
+            if (promise and promise->resolved()) {
+              map[bci] = static_cast<int32_t>(
+                  promise->value() - reinterpret_cast<intptr_t>(start));
+            }
+          }
+        }
+      }
+      debug::publishCompiled(t, context->method, context->debugBits, length, map);
+    }
 
     code = makeCode(t,
                     0,
@@ -8609,6 +9131,10 @@ object invoke(Thread* thread, GcMethod* method, ArgumentList* arguments)
   }
 
   if (t->exception) {
+    // A debugger invoke must not unwind the frame it stopped in.
+    if (debug::suppressThrow(t))
+      return 0;
+
     if (UNLIKELY(t->getFlags() & Thread::UseBackupHeapFlag)) {
       collect(t, Heap::MinorCollection);
     }
@@ -9491,7 +10017,12 @@ class MyProcessor : public Processor {
       // about, so not while generating a boot image.
       jitDebug = avian::codegen::makeJitDebugInfo(allocator);
     }
+    if (codeMemory)
+      debug::setCodeMemory(codeMemory);
 #endif
+    debug::registerWalker(captureDebugFrames);
+    debug::registerFrameFn(jitFrameOp);
+    debug::registerInvalidator(invalidateCompiled);
 
     if (image and code) {
       local::boot(static_cast<MyThread*>(t), image, code);

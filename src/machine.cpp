@@ -10,6 +10,7 @@
 
 #include "avian/jnienv.h"
 #include "avian/machine.h"
+#include "avian/debug.h"
 #include "avian/util.h"
 #include <avian/util/stream.h>
 #include "avian/constants.h"
@@ -27,6 +28,8 @@
 
 using namespace vm;
 using namespace avian::util;
+
+
 
 namespace {
 
@@ -519,7 +522,6 @@ void postVisit(Thread* t, Heap::Visitor* v)
 
   GcFinalizer* firstNewTenuredFinalizer = 0;
   GcFinalizer* lastNewTenuredFinalizer = 0;
-
   {
     object unreachable = 0;
     for (GcFinalizer** p = &(m->finalizers); *p;) {
@@ -2285,6 +2287,30 @@ void disassembleCode(const char* prefix, uint8_t* code, unsigned length)
   }
 }
 
+void appendLocal(uint8_t** buf, unsigned* n, unsigned* cap, const void* src, unsigned len)
+{
+  if (*n + len > *cap) {
+    unsigned c = *cap ? *cap * 2 : 64;
+    while (c < *n + len)
+      c *= 2;
+    uint8_t* grown = static_cast<uint8_t*>(realloc(*buf, c));
+    if (grown == 0)
+      return;
+    *buf = grown;
+    *cap = c;
+  }
+  memcpy(*buf + *n, src, len);
+  *n += len;
+}
+
+void appendU16(uint8_t** buf, unsigned* n, unsigned* cap, unsigned v)
+{
+  uint8_t b[2];
+  b[0] = static_cast<uint8_t>(v >> 8);
+  b[1] = static_cast<uint8_t>(v);
+  appendLocal(buf, n, cap, b, 2);
+}
+
 GcCode* parseCode(Thread* t, Stream& s, GcSingleton* pool)
 {
   PROTECT(t, pool);
@@ -2340,6 +2366,38 @@ GcCode* parseCode(Thread* t, Stream& s, GcSingleton* pool)
       }
 
       code->setLineNumberTable(t, lnt);
+    } else if (vm::strcmp(reinterpret_cast<const int8_t*>("LocalVariableTable"),
+                          name->body().begin()) == 0) {
+      unsigned count = s.read2();
+      uint8_t* buf = 0;
+      unsigned n = 0;
+      unsigned cap = 0;
+      appendU16(&buf, &n, &cap, count);
+      for (unsigned i = 0; i < count; ++i) {
+        unsigned start = s.read2();
+        unsigned len = s.read2();
+        unsigned nameIndex = s.read2();
+        unsigned descIndex = s.read2();
+        unsigned slot = s.read2();
+        GcByteArray* nm = cast<GcByteArray>(t, singletonObject(t, pool, nameIndex - 1));
+        GcByteArray* ds = cast<GcByteArray>(t, singletonObject(t, pool, descIndex - 1));
+        int nameLen = nm ? nm->length() : 0;
+        if (nameLen > 0 and nm->body()[nameLen - 1] == 0)
+          --nameLen;
+        int descLen = ds ? ds->length() : 0;
+        if (descLen > 0 and ds->body()[descLen - 1] == 0)
+          --descLen;
+        appendU16(&buf, &n, &cap, start);
+        appendU16(&buf, &n, &cap, len);
+        appendU16(&buf, &n, &cap, slot);
+        appendU16(&buf, &n, &cap, nameLen);
+        if (nameLen > 0)
+          appendLocal(&buf, &n, &cap, nm->body().begin(), nameLen);
+        appendU16(&buf, &n, &cap, descLen);
+        if (descLen > 0)
+          appendLocal(&buf, &n, &cap, ds->body().begin(), descLen);
+      }
+      debug::setPendingLocals(buf, n);
     } else {
       s.skip(length);
     }
@@ -2490,6 +2548,7 @@ void parseMethodTable(Thread* t, Stream& s, GcClass* class_, GcSingleton* pool)
 
         if (vm::strcmp(reinterpret_cast<const int8_t*>("Code"),
                        attributeName->body().begin()) == 0) {
+          debug::setPendingLocals(0, 0);
           code = parseCode(t, s, pool);
         } else if (vm::strcmp(reinterpret_cast<const int8_t*>("Exceptions"),
                               attributeName->body().begin()) == 0) {
@@ -2577,6 +2636,11 @@ void parseMethodTable(Thread* t, Stream& s, GcClass* class_, GcSingleton* pool)
           code);
 
       PROTECT(t, method);
+
+      debug::bindPendingLocals(
+          reinterpret_cast<const char*>(method->class_()->name()->body().begin()),
+          reinterpret_cast<const char*>(method->name()->body().begin()),
+          reinterpret_cast<const char*>(method->spec()->body().begin()));
 
       if (methodVirtual(t, method)) {
         ++declaredVirtualCount;
@@ -3842,6 +3906,18 @@ Thread::Thread(Machine* m, GcThread* javaThread, Thread* parent)
           static_cast<uintptr_t*>(m->heap->allocate(ThreadHeapSizeInBytes))),
       heap(defaultHeap),
       backupHeapIndex(0),
+      debugSuspend(0),
+      debugStepping(0),
+      debugStepSize(0),
+      debugStepDepth(0),
+      debugStepBase(0),
+      debugStepLine(-1),
+      debugStepMethod(0),
+      debugInBlock(0),
+      debugSuppressBci(-1),
+      debugSuppressCookie(0),
+      debugDepth(0),
+      debugSnap(0),
       flags(ActiveFlag)
 {
 }
@@ -4879,9 +4955,14 @@ GcClass* resolveSystemClass(Thread* t,
   PROTECT(t, loader);
   PROTECT(t, spec);
 
+  GcClass* class_ = 0;
+  // Destroyed after the class lock so ClassPrepare can block without
+  // holding it.  Only a class this call actually defines is armed.
+  debug::ClassPrepareNotifier prepare(t, &class_);
+
   ACQUIRE(t, t->m->classLock);
 
-  GcClass* class_ = findLoadedClass(t, loader, spec);
+  class_ = findLoadedClass(t, loader, spec);
   if (class_ == 0) {
     PROTECT(t, class_);
 
@@ -4975,6 +5056,7 @@ GcClass* resolveSystemClass(Thread* t,
           t, cast<GcHashMap>(t, loader->map()), spec, class_, byteArrayHash);
 
       updatePackageMap(t, class_);
+      prepare.arm();
     } else if (throw_) {
       throwNew(t, throwType, "%s", spec->body().begin());
     }
@@ -5213,6 +5295,7 @@ void postInitClass(Thread* t, GcClass* c)
 
   if (t->exception
       and instanceOf(t, type(t, GcException::Type), t->exception)) {
+    debug::noteClassStatus(t, c, false, true);
     c->vmFlags() |= NeedInitFlag | InitErrorFlag;
     c->vmFlags() &= ~InitFlag;
 
@@ -5228,6 +5311,7 @@ void postInitClass(Thread* t, GcClass* c)
     throw_(t, initExecption->as<GcThrowable>(t));
   } else {
     c->vmFlags() &= ~(NeedInitFlag | InitFlag);
+    debug::noteClassStatus(t, c, true, false);
   }
   t->m->classLock->notifyAll(t->systemThread);
 }
@@ -5608,6 +5692,8 @@ void visitRoots(Machine* m, Heap::Visitor* v)
       v->visit(&(r->target));
     }
   }
+
+  debug::visit(v);
 }
 
 void logTrace(FILE* f, const char* fmt, ...)
@@ -5924,24 +6010,15 @@ GcClass* defineClass(Thread* t,
 
   GcClass* c = parseClass(t, loader, buffer, length);
 
-  // char name[byteArrayLength(t, className(t, c))];
-  // memcpy(name, &byteArrayBody(t, className(t, c), 0),
-  //        byteArrayLength(t, className(t, c)));
-  // replace('/', '-', name);
-
-  // const unsigned BufferSize = 1024;
-  // char path[BufferSize];
-  // snprintf(path, BufferSize, "/tmp/avian-define-class/%s.class", name);
-
-  // FILE* file = fopen(path, "wb");
-  // if (file) {
-  //   fwrite(buffer, length, 1, file);
-  //   fclose(file);
-  // }
-
   PROTECT(t, c);
 
   saveLoadedClass(t, loader, c);
+
+  // resolveSystemClass arms ClassPrepare itself. defineClass did not,
+  // so a class installed this way never got a loader finalizer and
+  // could not unload.
+  debug::ClassPrepareNotifier prepare(t, &c);
+  prepare.arm();
 
   return c;
 }

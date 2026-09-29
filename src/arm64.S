@@ -107,6 +107,12 @@ GLOBAL(vmJump):
   mov   x19, x3
   br    x30
 
+.globl GLOBAL(vmJumpFloat)
+.align 2
+GLOBAL(vmJumpFloat):
+  fmov  d0, x4
+  b     GLOBAL(vmJump)
+
 #define CHECKPOINT_THREAD 8
 #define CHECKPOINT_STACK 48
 

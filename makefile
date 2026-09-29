@@ -1284,6 +1284,7 @@ vm-sources = \
 	$(src)/system/code-memory.cpp \
 	$(src)/finder.cpp \
 	$(src)/machine.cpp \
+	$(src)/debug.cpp \
 	$(src)/util.cpp \
 	$(src)/heap/heap.cpp \
 	$(src)/$(process).cpp \
@@ -1793,6 +1794,9 @@ $(build)/run-tests.sh: $(test-classes) makefile $(build)/extra-dir/multi-classpa
 	echo "$(shell echo $(library-path) | sed 's|$(build)|\.|g') ./$(name)-unittest${exe-suffix} ./$(notdir $(test-executable)) $(mode) \"-Djava.library.path=. -cp test$(target-path-separator)extra-dir\" \\" >> $(@)
 	echo "$(call class-names,$(test-build),$(filter-out $(test-support-classes), $(test-classes))) \\" >> $(@)
 	echo "$(continuation-tests) $(tail-tests)" >> $(@)
+	echo 'st=$$?' >> $(@)
+	echo "python3 \"$(shell pwd)/test/jdwp-test.py\" ./$(notdir $(test-executable)) \"test$(target-path-separator)extra-dir\" $(process) || st=1" >> $(@)
+	echo 'exit $$st' >> $(@)
 
 $(build)/jdk-run-tests.sh: $(test-classes) makefile $(build)/extra-dir/multi-classpath-test.txt $(build)/test/multi-classpath-test.txt
 	echo 'cd $$(dirname $$0)' > $(@)
@@ -1897,7 +1901,7 @@ $(test-dep): $(test-sources) $(test-library)
 	@mkdir -p $(test-build)
 	files="$(shell $(MAKE) -s --no-print-directory build=$(build) $(test-classes))"; \
 	if test -n "$${files}"; then \
-		$(javac) -source 1.$(java-version) -target 1.$(java-version) \
+		$(javac) -g -source 1.$(java-version) -target 1.$(java-version) \
 			-classpath $(test-build) -d $(test-build) -bootclasspath $(boot-classpath) $${files}; \
 	fi
 	$(javac) -source 1.$(java-version) -target 1.$(java-version) -XDjsrlimit=0 -d $(test-build) \

@@ -107,6 +107,10 @@ GLOBAL(vmJump):
    movl   12(%esp),%esp
    jmp    *%esi
 
+.globl GLOBAL(vmJumpFloat)
+GLOBAL(vmJumpFloat):
+   jmp    GLOBAL(vmJump)
+
 #define VMRUN_FRAME_SIZE 24
 
 .globl GLOBAL(vmRun)

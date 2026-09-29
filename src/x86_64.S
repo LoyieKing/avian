@@ -144,6 +144,12 @@ GLOBAL(vmJump):
    movq   %r9,%rbx
    jmp    *%rcx
 
+.globl GLOBAL(vmJumpFloat)
+GLOBAL(vmJumpFloat):
+   movq   40(%rsp),%rax
+   movq   %rax,%xmm0
+   jmp    GLOBAL(vmJump)
+
 #define VMRUN_FRAME_SIZE 80
    
 .globl GLOBAL(vmRun)
@@ -299,6 +305,11 @@ GLOBAL(vmJump):
    movq   %r8,%rax
    movq   %r9,%rdx
    jmp    *%rdi
+
+.globl GLOBAL(vmJumpFloat)
+GLOBAL(vmJumpFloat):
+   movq   %r8,%xmm0
+   jmp    GLOBAL(vmJump)
 
 #define VMRUN_FRAME_SIZE 64
    

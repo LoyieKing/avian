@@ -10,6 +10,7 @@
 
 #include "avian/jnienv.h"
 #include "avian/machine.h"
+#include "avian/debug.h"
 #include "avian/util.h"
 #include "avian/processor.h"
 #include "avian/constants.h"
@@ -104,6 +105,7 @@ jint JNICALL DestroyJavaVM(Machine* m)
 {
   Thread* t;
   AttachCurrentThread(m, &t, 0);
+  debug::shutdown(t);
 
   if (runRaw(t, destroyJavaVM, 0)) {
     t->exit();
@@ -3357,6 +3359,8 @@ uint64_t boot(Thread* t, uintptr_t*)
 
   t->m->classpath->boot(t);
 
+  debug::boot(t);
+
   const char* port = findProperty(t, "avian.trace.port");
   if (port) {
     GcString* host = makeString(t, "0.0.0.0");
@@ -3627,6 +3631,12 @@ extern "C" AVIAN_EXPORT jint JNICALL
   unsigned propertyCount = 0;
 
   for (int i = 0; i < a->nOptions; ++i) {
+    const char* option = a->options[i].optionString;
+    if (strncmp(option, "-Xrunjdwp:", 10) == 0) {
+      debug::configure(option + 10);
+    } else if (strncmp(option, "-agentlib:jdwp=", 15) == 0) {
+      debug::configure(option + 15);
+    }
     if (strncmp(a->options[i].optionString, "-X", 2) == 0) {
       const char* p = a->options[i].optionString + 2;
       if (strncmp(p, "mx", 2) == 0) {
