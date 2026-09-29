@@ -69,14 +69,14 @@ struct Elf32 {
   typedef uint32_t Addr;
   typedef uint32_t Off;
   typedef uint32_t Xword;
-  static const uint8_t Class = 1;
+  enum { Class = 1 };  // ELFCLASS32
 };
 
 struct Elf64 {
   typedef uint64_t Addr;
   typedef uint64_t Off;
   typedef uint64_t Xword;
-  static const uint8_t Class = 2;
+  enum { Class = 2 };  // ELFCLASS64
 };
 
 #if defined(__x86_64__)
