@@ -84,7 +84,9 @@ util::Slice<uint8_t> Memory::allocate(size_t sizeInBytes, Permissions perms)
     }
 #endif
     std::fflush(stderr);
-    exit(1);
+    // Report failure to the caller instead of exiting; e.g. compile.cpp
+    // expect()s a non-null code area and aborts through the VM's normal
+    // error path.
     return util::Slice<uint8_t>(0, 0);
   }
   else {
