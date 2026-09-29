@@ -23,6 +23,7 @@
 #include <avian/util/slice.h>
 
 using namespace vm;
+
 using namespace avian::system;
 
 namespace local {
@@ -787,13 +788,37 @@ object interpret3(Thread* t, const int base)
 loop:
   if (UNLIKELY(vm::debug::enabled())) {
     vm::debug::checkpoint(t, static_cast<int32_t>(ip), 0, frameMethod(t, frame));
-    if (UNLIKELY(vm::debug::takePop(t))) {
+    int popMode = 0;
+    int popTag = 0;
+    uint64_t popBits = 0;
+    if (UNLIKELY(vm::debug::takePop(t, &popMode, &popTag, &popBits))) {
       GcMethod* popped = frameMethod(t, frame);
       unsigned rc = popped->returnCode();
       popFrame(t);
       if (frame < base)
         return 0;
-      switch (rc) {
+      if (popMode == 2) {
+        switch (popTag) {
+        case 'J':
+        case 'D':
+          pushLong(t, popBits);
+          break;
+        case 'L':
+        case '[':
+        case 's':
+        case 't':
+        case 'g':
+        case 'l':
+        case 'c':
+          pushObject(t, static_cast<object>(vm::debug::objectForId(popBits)));
+          break;
+        case 'V':
+          break;
+        default:
+          pushInt(t, static_cast<int32_t>(popBits));
+          break;
+        }
+      } else switch (rc) {
       case LongField:
       case DoubleField:
         pushLong(t, 0);
@@ -3083,7 +3108,7 @@ throw_:
   }
 
   pokeInt(t, t->frame + FrameIpOffset, t->ip);
-  if (UNLIKELY(vm::debug::enabled() and exception)) {
+  if (UNLIKELY(vm::debug::enabled() and exception and not vm::debug::suppressThrow(t))) {
     int caught = 0;
     int catchBci = 0;
     GcMethod* catchMethod = 0;
@@ -3370,12 +3395,41 @@ int debugFrameOp(vm::Thread* thread, int op, int frameIndex, int slot, vm::debug
     return 30;
   }
   GcMethod* method = frameMethod(t, f);
-  if (op == 4) {
+  if (op == 4 or op == 5) {
     if (frameIndex != 0) {
-      io->status = 30;
-      return 30;
+      io->status = 33;
+      return 33;
     }
-    vm::debug::requestPop(t);
+    if (op == 5) {
+      int want = 'V';
+      switch (method->returnCode()) {
+      case ByteField: want = 'B'; break;
+      case BooleanField: want = 'Z'; break;
+      case CharField: want = 'C'; break;
+      case ShortField: want = 'S'; break;
+      case FloatField: want = 'F'; break;
+      case IntField: want = 'I'; break;
+      case LongField: want = 'J'; break;
+      case DoubleField: want = 'D'; break;
+      case ObjectField: want = 'L'; break;
+      default: want = 'V'; break;
+      }
+      int got = io->tag;
+      bool obj = got == 'L' or got == '[' or got == 's' or got == 't'
+                 or got == 'g' or got == 'l' or got == 'c';
+      if (want == 'L') {
+        if (not obj) {
+          io->status = 34;
+          return 34;
+        }
+      } else if (got != want) {
+        io->status = 34;
+        return 34;
+      }
+      vm::debug::requestEarly(t, got, io->bits);
+    } else {
+      vm::debug::requestPop(t);
+    }
     io->status = 0;
     return 0;
   }

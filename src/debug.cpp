@@ -4,6 +4,7 @@
 #include "avian/debug.h"
 
 #include "avian/machine.h"
+#include "avian/heapwalk.h"
 #include "avian/util.h"
 #include "avian/constants.h"
 
@@ -24,6 +25,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <netdb.h>
 #include <unistd.h>
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -31,6 +33,8 @@
 #endif
 
 using namespace vm;
+
+
 
 namespace vm {
 namespace debug {
@@ -71,6 +75,7 @@ struct FieldRec {
   uint64_t id;
   char* name;
   char* spec;
+  char* generic;
   int32_t flags;
   int32_t offset;
 };
@@ -101,6 +106,7 @@ struct MethodRec {
   uint64_t id;
   char* name;
   char* spec;
+  char* generic;
   int32_t flags;
   int32_t codeLength;  // -1 native or absent
   LineRec* lines;
@@ -115,6 +121,7 @@ struct ClassRec {
   uint64_t id;
   char* name;  // internal binary name
   char* signature;
+  char* generic;  // Signature attribute, or empty
   char* source;
   char* superName;
   int32_t flags;
@@ -181,6 +188,8 @@ struct Packet {
 
 bool enabledFlag = false;
 bool suspendOnConnect = false;
+bool listenMode = true;
+char connectHost[128] = "127.0.0.1";
 bool disposed = false;
 bool serverAlive = false;
 int requestedPort = 0;
@@ -870,6 +879,15 @@ void readLines(Thread* t, GcMethod* method, MethodRec* mr)
   (void)t;
 }
 
+char* genericOf(object sig)
+{
+  if (sig == 0)
+    return dupZ("");
+  return dupBytes(static_cast<GcByteArray*>(sig));
+}
+
+void watchLoader(Thread* t, GcClass* c);
+
 ClassRec* ingest(Thread* t, GcClass* c)
 {
   if (c == 0 or c->name() == 0)
@@ -908,6 +926,7 @@ ClassRec* ingest(Thread* t, GcClass* c)
       GcField* f = cast<GcField>(t, ftable->body()[i]);
       fields[n].name = dupBytes(f->name());
       fields[n].spec = dupBytes(f->spec());
+      fields[n].generic = f->addendum() ? genericOf(f->addendum()->signature()) : dupZ("");
       fields[n].flags = f->flags();
       fields[n].offset = f->offset();
       ++n;
@@ -934,6 +953,7 @@ ClassRec* ingest(Thread* t, GcClass* c)
       GcMethod* m = cast<GcMethod>(t, mtable->body()[i]);
       methods[n].name = dupBytes(m->name());
       methods[n].spec = dupBytes(m->spec());
+      methods[n].generic = m->addendum() ? genericOf(m->addendum()->signature()) : dupZ("");
       methods[n].flags = m->flags();
       methods[n].argCount = m->parameterFootprint();
       methods[n].site = 0;
@@ -960,6 +980,10 @@ ClassRec* ingest(Thread* t, GcClass* c)
       existing->status = status;
       existing->typeTag = tag;
       existing->primitive = primitive;
+      if (existing->generic == 0 or existing->generic[0] == 0) {
+        free(existing->generic);
+        existing->generic = c->addendum() ? genericOf(c->addendum()->signature()) : dupZ("");
+      }
       for (int i = 0; i < methodCount; ++i) {
         methods[i].id = nextMemberId++;
         linkSite(&methods[i], existing->name);
@@ -981,6 +1005,7 @@ ClassRec* ingest(Thread* t, GcClass* c)
       for (int i = 0; i < methodCount; ++i) {
         free(methods[i].name);
         free(methods[i].spec);
+        free(methods[i].generic);
         free(methods[i].lines);
         if (methods[i].vars) {
           for (int v = 0; v < methods[i].varCount; ++v) {
@@ -996,9 +1021,11 @@ ClassRec* ingest(Thread* t, GcClass* c)
       for (int i = 0; i < fieldCount; ++i) {
         free(fields[i].name);
         free(fields[i].spec);
+        free(fields[i].generic);
       }
       free(fields);
     }
+    watchLoader(t, c);
     return existing;
   }
 
@@ -1006,6 +1033,7 @@ ClassRec* ingest(Thread* t, GcClass* c)
   rec->id = nextClassId++;
   rec->name = name;
   rec->signature = dupZ(signature);
+  rec->generic = c->addendum() ? genericOf(c->addendum()->signature()) : dupZ("");
   rec->source = source;
   rec->superName = superName;
   rec->flags = flags;
@@ -1025,7 +1053,58 @@ ClassRec* ingest(Thread* t, GcClass* c)
   rec->next = classes;
   classes = rec;
   unlockReg();
+  watchLoader(t, c);
   return rec;
+}
+
+void deliverUnload(const char* signature);
+
+void finalizeLoader(Thread* t, object loader)
+{
+  GcClassLoader* l = static_cast<GcClassLoader*>(loader);
+  if (l == 0 or l->map() == 0)
+    return;
+  GcHashMap* map = cast<GcHashMap>(t, l->map());
+  PROTECT(t, map);
+  for (HashMapIterator it(t, map); it.hasMore();) {
+    GcTriple* n = it.next();
+    if (n == 0 or n->second() == 0)
+      continue;
+    GcClass* c = cast<GcClass>(t, n->second());
+    if (c == 0 or c->name() == 0)
+      continue;
+    char sig[600];
+    const char* name = reinterpret_cast<const char*>(c->name()->body().begin());
+    if (name[0] == '[')
+      ::snprintf(sig, sizeof sig, "%s", name);
+    else
+      ::snprintf(sig, sizeof sig, "L%s;", name);
+    deliverUnload(sig);
+  }
+}
+
+void watchLoader(Thread* t, GcClass* c)
+{
+  if (c == 0 or c->loader() == 0)
+    return;
+  GcClassLoader* loader = c->loader();
+  if (loader == roots(t)->bootLoader() or loader == roots(t)->appLoader())
+    return;
+  bool seen = false;
+  {
+    ACQUIRE(t, t->m->referenceLock);
+    for (GcFinalizer* f = t->m->finalizers; f;
+         f = cast<GcFinalizer>(t, f->next())) {
+      if (f->target() != loader)
+        continue;
+      void (*function)(Thread*, object);
+      memcpy(&function, &f->finalize(), BytesPerWord);
+      if (function == finalizeLoader)
+        seen = true;
+    }
+  }
+  if (not seen)
+    addFinalizer(t, loader, finalizeLoader);
 }
 
 void scanMap(Thread* t, GcHashMap* map)
@@ -1507,7 +1586,9 @@ void cmdCapabilities(uint32_t id, int n)
     // VM can do it: field watch, redefine, pop frames.
     if (i == 0 or i == 1)
       bit = 1;
-    if (n > 7 and (i == 7 or i == 10))
+    // 7 redefine, 10 pop, 15 instance info, 16 monitor events,
+    // 20 early return.
+    if (n > 7 and (i == 7 or i == 10 or i == 15 or i == 16 or i == 20))
       bit = 1;
     b1(&b, bit);
   }
@@ -1521,7 +1602,7 @@ void writeClass(Buf* b, ClassRec* c, bool generic)
   b8(b, c->id);
   bstr(b, c->signature);
   if (generic)
-    bstr(b, "");
+    bstr(b, c->generic ? c->generic : "");
   b4(b, c->status);
 }
 
@@ -1638,7 +1719,7 @@ void writeMethods(Buf* b, ClassRec* c, bool generic)
     bstr(b, m->name);
     bstr(b, m->spec);
     if (generic)
-      bstr(b, "");
+      bstr(b, m->generic ? m->generic : "");
     b4(b, m->flags);
   }
 }
@@ -1652,7 +1733,7 @@ void writeFields(Buf* b, ClassRec* c, bool generic)
     bstr(b, f->name);
     bstr(b, f->spec);
     if (generic)
-      bstr(b, "");
+      bstr(b, f->generic ? f->generic : "");
     b4(b, f->flags);
   }
 }
@@ -1661,11 +1742,39 @@ void cmdStack(uint32_t id, unsigned cmd, Reader* r);
 void cmdStaticGet(uint32_t id, Reader* r, ClassRec* c);
 void cmdVariableTable(uint32_t id, Reader* r, bool generic);
 void cmdObjectRef(uint32_t id, unsigned cmd, Reader* r);
+void cmdPin(uint32_t id, Reader* r, int delta);
 void cmdInvoke(uint32_t id, Reader* r, bool instance);
 void cmdRedefine(uint32_t id, Reader* r);
 void noteWatch(Request* r, int delta);
 void disposeObject(uint64_t id);
 
+bool threadSuspended(Thread* t);
+
+Thread* anySuspended()
+{
+  struct Arg {
+    Thread* found;
+  } arg;
+  arg.found = 0;
+  struct Local {
+    static void visit(Thread* t, void* p)
+    {
+      Arg* a = static_cast<Arg*>(p);
+      if (a->found == 0 and threadSuspended(t) and t->systemThread
+          and t->state != Thread::ZombieState and t->state != Thread::JoinedState)
+        a->found = t;
+    }
+  };
+  if (machine_)
+    eachThread(machine_->rootThread, Local::visit, &arg);
+  return arg.found;
+}
+
+struct Mail;
+bool readTagged(Reader* r, int* tag, uint64_t* bits);
+void cmdInstances(uint32_t id, uint64_t classId, int max);
+void cmdReferrers(uint32_t id, Thread* t, uint64_t objectId, int max);
+void cmdEarly(uint32_t id, Thread* t, Reader* r);
 void cmdReference(uint32_t id, unsigned cmd, Reader* r)
 {
   uint64_t cid = r8(r);
@@ -1717,7 +1826,7 @@ void cmdReference(uint32_t id, unsigned cmd, Reader* r)
     break;
   case 13:
     bstr(&b, c->signature);
-    bstr(&b, "");
+    bstr(&b, c->generic ? c->generic : "");
     break;
   case 14:
     writeFields(&b, c, true);
@@ -1725,6 +1834,14 @@ void cmdReference(uint32_t id, unsigned cmd, Reader* r)
   case 15:
     writeMethods(&b, c, true);
     break;
+  case 16: {
+    uint64_t cid = c->id;
+    unlockReg();
+    bufFree(&b);
+    int max = static_cast<int>(r4(r));
+    cmdInstances(id, cid, max);
+    return;
+  }
   case 6: {
     uint64_t cid = c->id;
     unlockReg();
@@ -1913,6 +2030,15 @@ void cmdThread(uint32_t id, unsigned cmd, Reader* r)
     Snap* s = static_cast<Snap*>(t->debugSnap);
     b4(&b, s ? s->count : 0);
     break;
+  }
+  case 14: {
+    bufFree(&b);
+    if (not threadSuspended(t)) {
+      sendReply(id, kThreadNotSuspended, 0);
+      return;
+    }
+    cmdEarly(id, t, r);
+    return;
   }
   case 12: {
     int n = loadThreadSuspend(t);
@@ -2259,8 +2385,12 @@ void dispatch(uint32_t id, unsigned set, unsigned cmd, Reader* r)
     }
     break;
   case 9:
-    if (cmd == 1 or cmd == 2) {
+    if (cmd == 1 or cmd == 2 or cmd == 10) {
       cmdObjectRef(id, cmd, r);
+      return;
+    }
+    if (cmd == 7 or cmd == 8) {
+      cmdPin(id, r, cmd == 7 ? 1 : -1);
       return;
     }
     if (cmd == 6) {
@@ -2402,9 +2532,72 @@ class Server : public System::Runnable {
   }
   System::Thread* self;
 
+  void connectClient()
+  {
+#ifndef _WIN32
+    int port = requestedPort;
+    if (port <= 0) {
+      fprintf(stderr, "jdwp: server=n requires address=host:port\n");
+      __atomic_store_n(&boundPort, -1, __ATOMIC_RELEASE);
+      return;
+    }
+    clientSocket = -1;
+    for (int attempt = 0; attempt < 50 and clientSocket < 0; ++attempt) {
+      clientSocket = ::socket(AF_INET, SOCK_STREAM, 0);
+      if (clientSocket < 0)
+        break;
+#ifdef SO_NOSIGPIPE
+      int one = 1;
+      setsockopt(clientSocket, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+      sockaddr_in addr;
+      memset(&addr, 0, sizeof addr);
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(static_cast<uint16_t>(port));
+      if (inet_pton(AF_INET, connectHost, &addr.sin_addr) != 1) {
+        hostent* he = gethostbyname(connectHost);
+        if (he == 0 or he->h_addr_list[0] == 0) {
+          ::close(clientSocket);
+          clientSocket = -1;
+          break;
+        }
+        memcpy(&addr.sin_addr, he->h_addr_list[0], sizeof addr.sin_addr);
+      }
+      if (::connect(clientSocket, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
+        ::close(clientSocket);
+        clientSocket = -1;
+        usleep(100000);
+      }
+    }
+    if (clientSocket < 0) {
+      fprintf(stderr, "jdwp: could not connect to %s:%d\n", connectHost, port);
+      __atomic_store_n(&boundPort, -1, __ATOMIC_RELEASE);
+      return;
+    }
+    int one = 1;
+    setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    // Unblock boot. suspend=y then waits inside boot() while we handshake.
+    __atomic_store_n(&boundPort, port, __ATOMIC_RELEASE);
+    fprintf(stderr, "Connecting to transport dt_socket at address: %s:%d\n",
+            connectHost, port);
+    fflush(stderr);
+    serverAlive = true;
+    serveLoop();
+    closeClient();
+    serverAlive = false;
+#else
+    fprintf(stderr, "jdwp: sockets are not implemented on this platform\n");
+    __atomic_store_n(&boundPort, -1, __ATOMIC_RELEASE);
+#endif
+  }
+
   void runServer()
   {
 #ifndef _WIN32
+    if (not listenMode) {
+      connectClient();
+      return;
+    }
     listenSocket = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listenSocket < 0) {
       perror("jdwp socket");
@@ -2473,6 +2666,8 @@ bool parseOptions(const char* options)
   bool transportOk = false;
   bool serverOk = false;
   suspendOnConnect = false;
+  listenMode = true;
+  ::snprintf(connectHost, sizeof connectHost, "127.0.0.1");
   requestedPort = 0;
   char buf[512];
   ::snprintf(buf, sizeof buf, "%s", options ? options : "");
@@ -2491,10 +2686,11 @@ bool parseOptions(const char* options)
       }
       transportOk = true;
     } else if (::strcmp(key, "server") == 0) {
-      if (::strcmp(val, "y") != 0) {
-        fprintf(stderr, "jdwp: only server=y is supported\n");
+      if (::strcmp(val, "y") != 0 and ::strcmp(val, "n") != 0) {
+        fprintf(stderr, "jdwp: server= must be y or n\n");
         return false;
       }
+      listenMode = ::strcmp(val, "y") == 0;
       serverOk = true;
     } else if (::strcmp(key, "suspend") == 0) {
       suspendOnConnect = ::strcmp(val, "y") == 0;
@@ -2502,6 +2698,13 @@ bool parseOptions(const char* options)
       const char* colon = strrchr(val, ':');
       const char* portStr = colon ? colon + 1 : val;
       requestedPort = atoi(portStr);
+      if (colon and colon != val) {
+        unsigned n = static_cast<unsigned>(colon - val);
+        if (n >= sizeof connectHost)
+          n = sizeof connectHost - 1;
+        memcpy(connectHost, val, n);
+        connectHost[n] = 0;
+      }
     } else if (::strcmp(key, "onthrow") == 0 or ::strcmp(key, "onuncaught") == 0
                or ::strcmp(key, "launch") == 0 or ::strcmp(key, "timeout") == 0) {
       // accepted and ignored
@@ -2536,6 +2739,9 @@ unsigned pendingLocalsLen = 0;
 struct ObjSlot {
   object target;
   uint64_t id;
+  // JDWP object ids do not keep an object alive unless the debugger
+  // called DisableCollection. pins > 0 is a strong root.
+  int pins;
 };
 
 ObjSlot* objects = 0;
@@ -2551,6 +2757,9 @@ volatile int inhibitSuspend = 0;
 struct PopNote {
   Thread* thread;
   int armed;
+  int mode;  // 1 pop, 2 early return
+  int tag;
+  uint64_t bits;
 };
 PopNote pops[32];
 
@@ -2582,6 +2791,10 @@ struct Mail {
   int outTag;
   uint64_t outBits;
   uint64_t outEx;
+  int* heapTags;
+  uint64_t* heapIds;
+  int heapCap;
+  int heapCount;
   int error;
   int done;
   Mail* next;
@@ -2759,6 +2972,7 @@ uint64_t internObject(object o)
   }
   objects[slot].target = o;
   objects[slot].id = nextObjectId++;
+  objects[slot].pins = 0;
   return objects[slot].id;
 }
 
@@ -2825,9 +3039,37 @@ int tagOfObject(Thread* t, object o)
 void visitObjects(Heap::Visitor* v)
 {
   for (int i = 0; i < objectCount; ++i) {
-    if (objects[i].id and objects[i].target)
+    if (objects[i].id and objects[i].target and objects[i].pins > 0)
       v->visit(&objects[i].target);
   }
+}
+
+void updateWeakIdsImpl(Thread* t, Heap::Visitor* v)
+{
+  for (int i = 0; i < objectCount; ++i) {
+    if (objects[i].id == 0 or objects[i].target == 0 or objects[i].pins > 0)
+      continue;
+    if (t->m->heap->status(objects[i].target) == Heap::Unreachable)
+      objects[i].target = 0;
+    else if (v)
+      v->visit(&objects[i].target);
+  }
+}
+
+void cmdPin(uint32_t id, Reader* r, int delta)
+{
+  uint64_t oid = r8(r);
+  int found = 0;
+  for (int i = 0; i < objectCount; ++i) {
+    if (objects[i].id != oid)
+      continue;
+    objects[i].pins += delta;
+    if (objects[i].pins < 0)
+      objects[i].pins = 0;
+    found = 1;
+    break;
+  }
+  sendReply(id, found ? 0 : kInvalidObject, 0);
 }
 
 bool threadSuspended(Thread* t)
@@ -2835,11 +3077,14 @@ bool threadSuspended(Thread* t)
   return loadSuspend() > 0 or loadThreadSuspend(t) > 0 or t->debugInBlock;
 }
 
-void requestPopImpl(Thread* t)
+void armPop(Thread* t, int mode, int tag, uint64_t bits)
 {
   for (int i = 0; i < 32; ++i) {
     if (pops[i].thread == t) {
       pops[i].armed = 1;
+      pops[i].mode = mode;
+      pops[i].tag = tag;
+      pops[i].bits = bits;
       return;
     }
   }
@@ -2847,16 +3092,36 @@ void requestPopImpl(Thread* t)
     if (pops[i].thread == 0) {
       pops[i].thread = t;
       pops[i].armed = 1;
+      pops[i].mode = mode;
+      pops[i].tag = tag;
+      pops[i].bits = bits;
       return;
     }
   }
 }
 
-bool takePopImpl(Thread* t)
+void requestPopImpl(Thread* t)
+{
+  armPop(t, 1, 0, 0);
+}
+
+bool suspendedTopFrameImpl(Thread* t)
+{
+  Snap* s = static_cast<Snap*>(t->debugSnap);
+  return s and s->count > 0 and s->frames[0].methodId != 0;
+}
+
+bool takePopImpl(Thread* t, int* mode, int* tag, uint64_t* bits)
 {
   for (int i = 0; i < 32; ++i) {
     if (pops[i].thread == t and pops[i].armed) {
       pops[i].armed = 0;
+      if (mode)
+        *mode = pops[i].mode ? pops[i].mode : 1;
+      if (tag)
+        *tag = pops[i].tag;
+      if (bits)
+        *bits = pops[i].bits;
       return true;
     }
   }
@@ -3103,10 +3368,14 @@ bool filtersOk(Request* r, Thread* t, ClassRec* loc)
   return true;
 }
 
+volatile int monitorEventCount = 0;
+
 void noteWatch(Request* r, int delta)
 {
   if (r and (r->kind == 20 or r->kind == 21))
     __atomic_fetch_add(&fieldWatchCount, delta, __ATOMIC_RELEASE);
+  if (r and r->kind >= 43 and r->kind <= 46)
+    __atomic_fetch_add(&monitorEventCount, delta, __ATOMIC_RELEASE);
 }
 
 struct EventHit {
@@ -3368,16 +3637,17 @@ void deliverException(Thread* t, object ex, int caught, GcMethod* throwMethod,
     else
       writeLocation(&b, 1, 0, 0, 0);
   }
-  if (__atomic_load_n(&inhibitSuspend, __ATOMIC_ACQUIRE) == 0 and throwMethod)
+  if (throwMethod)
     setSnap(t, makeSnap(t, throwBci, 0, throwMethod));
   sendEvent(policy, &b);
   bufFree(&b);
-  // inhibitSuspend: the thread is inside the JIT unwinder.  Record the
-  // suspend so the next consistent checkpoint blocks, but do not Idle here.
+  // Block before the unwinder jumps, so the debugger stops at the throw
+  // instead of only at the next checkpoint (the handler). The machine
+  // stack is still the throw frame; nextFrame has not run yet for a
+  // caught exception, and vmJump has not run for an uncaught one.
   if (policy != kSuspendNone and not t->debugInBlock)
     suspendFor(t, policy);
-  if (__atomic_load_n(&inhibitSuspend, __ATOMIC_ACQUIRE) == 0)
-    finishSuspend(t);
+  finishSuspend(t);
 }
 
 void deliverThread(Thread* t, int kind)
@@ -3665,10 +3935,289 @@ void handleRedefine(Thread* t, Mail* m)
   unlockReg();
 }
 
+const int kHeapCap = 64;
+void replyHeap(uint32_t id, Mail* m)
+{
+  Buf b;
+  bufInit(&b);
+  b4(&b, m->heapCount);
+  for (int i = 0; i < m->heapCount; ++i) {
+    b1(&b, m->heapTags[i] ? m->heapTags[i] : 'L');
+    b8(&b, m->heapIds[i]);
+  }
+  sendReply(id, 0, &b);
+  bufFree(&b);
+}
+
+
+void cmdInstances(uint32_t id, uint64_t classId, int max)
+{
+  if (max < 0)
+    max = 0;
+  Thread* thr = anySuspended();
+  if (thr == 0) {
+    sendReply(id, kThreadNotSuspended, 0);
+    return;
+  }
+  int tags[kHeapCap];
+  uint64_t ids[kHeapCap];
+  Mail m;
+  memset(&m, 0, sizeof m);
+  m.thread = thr;
+  m.op = 11;
+  m.classId = classId;
+  m.heapTags = tags;
+  m.heapIds = ids;
+  m.heapCap = max == 0 or max > kHeapCap ? kHeapCap : max;
+  int err = postMail(&m);
+  if (err) {
+    sendReply(id, err, 0);
+    return;
+  }
+  replyHeap(id, &m);
+}
+
+void cmdReferrers(uint32_t id, Thread* t, uint64_t objectId, int max)
+{
+  if (max < 0)
+    max = 0;
+  int tags[kHeapCap];
+  uint64_t ids[kHeapCap];
+  Mail m;
+  memset(&m, 0, sizeof m);
+  m.thread = t;
+  m.op = 12;
+  m.objectId = objectId;
+  m.heapTags = tags;
+  m.heapIds = ids;
+  m.heapCap = max == 0 or max > kHeapCap ? kHeapCap : max;
+  int err = postMail(&m);
+  if (err) {
+    sendReply(id, err, 0);
+    return;
+  }
+  replyHeap(id, &m);
+}
+
+void cmdEarly(uint32_t id, Thread* t, Reader* r)
+{
+  int tag = 0;
+  uint64_t bits = 0;
+  if (not readTagged(r, &tag, &bits)) {
+    sendReply(id, kIllegalArgument, 0);
+    return;
+  }
+  Mail m;
+  memset(&m, 0, sizeof m);
+  m.thread = t;
+  m.op = 10;
+  m.frame = 0;
+  m.tag = tag;
+  m.bits = bits;
+  int err = postMail(&m);
+  sendReply(id, err, 0);
+}
+
+void heapRemember(Mail* m, Thread* t, object o)
+{
+  if (o == 0 or m->heapCount >= m->heapCap or m->heapCount >= kHeapCap)
+    return;
+  uint64_t id = internObject(o);
+  for (int i = 0; i < m->heapCount; ++i)
+    if (m->heapIds[i] == id)
+      return;
+  m->heapTags[m->heapCount] = tagOfObject(t, o);
+  m->heapIds[m->heapCount] = id;
+  ++m->heapCount;
+}
+
+class InstanceVisitor : public HeapVisitor {
+ public:
+  InstanceVisitor(Thread* t, GcClass* type, Mail* m) : t(t), type(type), m(m)
+  {
+  }
+  virtual void root() {}
+  virtual unsigned visitNew(object p)
+  {
+    if (p and type and instanceOf(t, type, p))
+      heapRemember(m, t, p);
+    return 1;
+  }
+  virtual void visitOld(object, unsigned) {}
+  virtual void push(object, unsigned, unsigned) {}
+  virtual void pop() {}
+  Thread* t;
+  GcClass* type;
+  Mail* m;
+};
+
+class ReferrerVisitor : public HeapVisitor {
+ public:
+  ReferrerVisitor(Thread* t, object target, Mail* m) : t(t), target(target), m(m)
+  {
+  }
+  virtual void root() {}
+  virtual unsigned visitNew(object) { return 1; }
+  virtual void visitOld(object, unsigned) {}
+  virtual void push(object parent, unsigned, unsigned childOffset)
+  {
+    if (parent == 0 or target == 0)
+      return;
+    object child = static_cast<object>(maskAlignedPointer(
+        fieldAtOffset<void*>(parent, childOffset * BytesPerWord)));
+    if (child == target)
+      heapRemember(m, t, parent);
+  }
+  virtual void pop() {}
+  Thread* t;
+  object target;
+  Mail* m;
+};
+
+void walkHeap(Thread* t, HeapVisitor* v)
+{
+  HeapWalker* w = makeHeapWalker(t, v);
+  w->visitAllRoots();
+  w->dispose();
+}
+
+void handleInstances(Thread* t, Mail* m)
+{
+  lockReg();
+  ClassRec* cr = findClass(m->classId);
+  char name[256];
+  name[0] = 0;
+  if (cr)
+    ::snprintf(name, sizeof name, "%s", cr->name);
+  unlockReg();
+  if (name[0] == 0) {
+    m->error = kInvalidClass;
+    return;
+  }
+  GcClass* type = findLiveClass(t, name);
+  if (type == 0) {
+    m->error = kInvalidClass;
+    return;
+  }
+  PROTECT(t, type);
+  InstanceVisitor v(t, type, m);
+  walkHeap(t, &v);
+}
+
+void handleReferrers(Thread* t, Mail* m)
+{
+  object target = objectFor(m->objectId);
+  if (target == 0 and m->objectId != 0) {
+    m->error = kInvalidObject;
+    return;
+  }
+  if (target == 0)
+    return;
+  PROTECT(t, target);
+  ReferrerVisitor v(t, target, m);
+  walkHeap(t, &v);
+}
+
+void deliverMonitor(Thread* t, object o, int kind, int64_t extra, int flag)
+{
+  if (not enabledFlag or t == 0)
+    return;
+  if (__atomic_load_n(&monitorEventCount, __ATOMIC_ACQUIRE) <= 0)
+    return;
+  WalkerFrame top;
+  memset(&top, 0, sizeof top);
+  int wn = walkerFn ? walkerFn(t, &top, 1) : 0;
+  uint64_t oid = internObject(o);
+  int otag = tagOfObject(t, o);
+  lockReg();
+  ClassRec* loc = wn ? findClassByName(top.className) : 0;
+  MethodRec* mr = wn ? findMethodByName(top.className, top.methodName, top.spec) : 0;
+  EventHit hits[8];
+  int n = collect(t, kind, loc, hits, 8, 0, 0);
+  int policy = kSuspendNone;
+  for (int i = 0; i < n; ++i)
+    if (hits[i].policy > policy)
+      policy = hits[i].policy;
+  int ltag = loc ? loc->typeTag : 1;
+  uint64_t cid = loc ? loc->id : 0;
+  uint64_t mid = mr ? mr->id : 0;
+  int32_t bci = wn ? top.index : 0;
+  unlockReg();
+  if (n == 0)
+    return;
+  Buf b;
+  bufInit(&b);
+  b1(&b, policy);
+  b4(&b, n);
+  for (int i = 0; i < n; ++i) {
+    b1(&b, kind);
+    b4(&b, hits[i].id);
+    b8(&b, reinterpret_cast<uint64_t>(t));
+    b1(&b, otag);
+    b8(&b, oid);
+    writeLocation(&b, ltag, cid, mid, bci);
+    if (kind == 45)
+      b8(&b, static_cast<uint64_t>(extra));
+    else if (kind == 46)
+      b1(&b, flag ? 1 : 0);
+  }
+  Snap* snap = makeSnap(t, bci, 0, 0);
+  if (snap and snap->count > 1 and snap->frames[0].methodId == 0) {
+    free(snap->frames[0].className);
+    free(snap->frames[0].methodName);
+    free(snap->frames[0].spec);
+    memmove(&snap->frames[0], &snap->frames[1],
+            sizeof(SnapFrame) * (snap->count - 1));
+    --snap->count;
+  }
+  setSnap(t, snap);
+  sendEvent(policy, &b);
+  bufFree(&b);
+  if (policy != kSuspendNone and not t->debugInBlock)
+    suspendFor(t, policy);
+  finishSuspend(t);
+}
+
+void deliverUnload(const char* signature)
+{
+  if (not enabledFlag or signature == 0)
+    return;
+  lockReg();
+  ClassRec* loc = 0;
+  for (ClassRec* c = classes; c; c = c->next) {
+    if (c->signature and ::strcmp(c->signature, signature) == 0) {
+      loc = c;
+      break;
+    }
+  }
+  EventHit hits[8];
+  int n = collect(0, 9, loc, hits, 8, 0, 0);
+  int policy = kSuspendNone;
+  for (int i = 0; i < n; ++i)
+    if (hits[i].policy > policy)
+      policy = hits[i].policy;
+  unlockReg();
+  if (n == 0)
+    return;
+  Buf b;
+  bufInit(&b);
+  // Unload runs on the finalizer during collection. Do not suspend.
+  b1(&b, kSuspendNone);
+  b4(&b, n);
+  for (int i = 0; i < n; ++i) {
+    b1(&b, 9);
+    b4(&b, hits[i].id);
+    bstr(&b, signature);
+  }
+  sendEvent(kSuspendNone, &b);
+  bufFree(&b);
+  (void)policy;
+}
+
 void handleMail(Thread* t, Mail* m)
 {
   m->error = 0;
-  if (m->op == 1 or m->op == 2 or m->op == 3 or m->op == 4) {
+  if (m->op == 1 or m->op == 2 or m->op == 3 or m->op == 4 or m->op == 10) {
     if (frameFn == 0) {
       m->error = kOpaque;
       return;
@@ -3683,7 +4232,8 @@ void handleMail(Thread* t, Mail* m)
       if (m->op == 2)
         io.ref = objectFor(m->bits);
     }
-    int st = frameFn(t, m->op, m->frame, m->slot, &io);
+    int frameOp = m->op == 10 ? 5 : m->op;
+    int st = frameFn(t, frameOp, m->frame, m->slot, &io);
     m->error = st ? st : io.status;
     if (m->error)
       return;
@@ -3773,6 +4323,14 @@ void handleMail(Thread* t, Mail* m)
     unlockReg();
     if (cr == 0)
       m->error = kInvalidObject;
+    return;
+  }
+  if (m->op == 11) {
+    handleInstances(t, m);
+    return;
+  }
+  if (m->op == 12) {
+    handleReferrers(t, m);
     return;
   }
   m->error = kNotImplemented;
@@ -4053,6 +4611,11 @@ void cmdObjectRef(uint32_t id, unsigned cmd, Reader* r)
       writeTagged(&b, m.tags[i], m.vals[i]);
     sendReply(id, 0, &b);
     bufFree(&b);
+    return;
+  }
+  if (cmd == 10) {
+    int max = static_cast<int>(r4(r));
+    cmdReferrers(id, t, oid, max);
     return;
   }
   sendReply(id, kNotImplemented, 0);
@@ -4514,6 +5077,11 @@ void visit(Heap::Visitor* visitor)
     visitObjects(visitor);
 }
 
+void updateWeakIds(Thread* t, Heap::Visitor* visitor)
+{
+  updateWeakIdsImpl(t, visitor);
+}
+
 void registerFrameFn(FrameFn fn)
 {
   frameFn = fn;
@@ -4571,9 +5139,42 @@ void requestPop(Thread* t)
     requestPopImpl(t);
 }
 
-bool takePop(Thread* t)
+bool suspendedTopFrame(Thread* t)
 {
-  return t and takePopImpl(t);
+  return t and suspendedTopFrameImpl(t);
+}
+
+bool takePop(Thread* t, int* mode, int* tag, uint64_t* bits)
+{
+  return t and takePopImpl(t, mode, tag, bits);
+}
+
+void requestEarly(Thread* t, int tag, uint64_t bits)
+{
+  if (t)
+    armPop(t, 2, tag, bits);
+}
+
+void* objectForId(uint64_t id)
+{
+  return objectFor(id);
+}
+
+bool monitorEvents()
+{
+  return __atomic_load_n(&monitorEventCount, __ATOMIC_ACQUIRE) > 0;
+}
+
+void onMonitor(Thread* t, void* monitorObject, int kind, int64_t extra, int flag)
+{
+  if (t)
+    deliverMonitor(t, static_cast<object>(monitorObject), kind, extra, flag);
+}
+
+void onClassUnload(Thread* t, const char* signature)
+{
+  (void)t;
+  deliverUnload(signature);
 }
 
 bool suppressThrow(Thread* t)

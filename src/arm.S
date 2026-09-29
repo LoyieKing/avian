@@ -99,6 +99,11 @@ GLOBAL(vmJump):
   mov   r8, r3
   bx    lr
 
+.globl GLOBAL(vmJumpFloat)
+.align 2
+GLOBAL(vmJumpFloat):
+  b     GLOBAL(vmJump)
+
 #define CHECKPOINT_THREAD 4
 #define CHECKPOINT_STACK 24
 

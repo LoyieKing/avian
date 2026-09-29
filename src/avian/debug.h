@@ -32,11 +32,12 @@ namespace debug {
 bool enabled();
 
 // Parse the option string of -Xrunjdwp: or -agentlib:jdwp= (no prefix).
-// Call before the VM boots.  Unknown transport / server=n leaves JDWP off.
+// Call before the VM boots.  server=y listens; server=n connects to a
+// debugger that is already listening (dt_socket client mode).
 void configure(const char* options);
 
-// Listen, and if suspend=y block the calling thread until a debugger
-// resumes the VM.  Call at the end of boot, before the launcher runs.
+// Listen or connect, and if suspend=y block the calling thread until a
+// debugger resumes the VM.  Call at the end of boot, before the launcher runs.
 void boot(Thread* t);
 
 // VM is going away.  Sends VMDeath if a debugger is attached.
@@ -111,6 +112,7 @@ void bindPendingLocals(const char* className, const char* methodName,
 
 // Heap roots for debugger object ids.  Called from the VM root visitor.
 void visit(Heap::Visitor* visitor);
+void updateWeakIds(Thread* t, Heap::Visitor* visitor);
 
 struct SlotIO {
   int tag;
@@ -143,7 +145,20 @@ void onException(Thread* t, void* exception, int caught, void* throwMethod,
 void onThreadStart(Thread* t);
 void onThreadDeath(Thread* t);
 void requestPop(Thread* t);
-bool takePop(Thread* t);
+bool suspendedTopFrame(Thread* t);
+// mode 1: PopFrames (return a zero/null of the method's type).
+// mode 2: ForceEarlyReturn. tag/bits are the JDWP value. Object tags
+// carry an object id, resolved when the frame is actually left.
+bool takePop(Thread* t, int* mode, int* tag, uint64_t* bits);
+void requestEarly(Thread* t, int tag, uint64_t bits);
+void* objectForId(uint64_t id);
+// kind is a JDWP monitor event: 43 contended enter, 44 contended
+// entered, 45 wait (extra is the timeout), 46 waited (flag is timed_out).
+void onMonitor(Thread* t, void* object, int kind, int64_t extra, int flag);
+bool monitorEvents();
+// signature is a JNI type name such as "Lcom/foo;". Delivered when a
+// non-bootstrap loader becomes unreachable and its classes go with it.
+void onClassUnload(Thread* t, const char* signature);
 // While set, an exception that escapes a debugger invoke is captured on
 // the thread instead of unwinding the frame the debugger stopped in.
 bool suppressThrow(Thread* t);

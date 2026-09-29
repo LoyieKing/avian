@@ -44,18 +44,25 @@ self-contained applications.
 JDWP
 ----
 
-Avian can host a JDWP (`dt_socket`) server so `jdb`, IntelliJ, or VS Code
-can attach:
+Avian can speak JDWP (`dt_socket`) with `jdb`, IntelliJ, or VS Code.
+`server=y` listens; `server=n` connects to a debugger that is already
+listening. Both sides use the same `JDWP-Handshake` (each writes the 14
+bytes, then reads them) and the same packets after that.
 
     avian -Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=5005 -cp . MyMain
     jdb -attach 5005
 
+    # debugger listens first; the VM connects (dt_socket client mode)
+    avian -Xrunjdwp:transport=dt_socket,server=n,suspend=y,address=127.0.0.1:5005 -cp . MyMain
+
 `-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005` is
-accepted as well. `address=0` prints the chosen port on stderr
-(`Listening for transport dt_socket at address: N`). `server=n` is not
-supported. Set `AVIAN_JDWP_LOG=1` to log every JDWP command. Windows
-sockets are not implemented: the flag is accepted and then ignored, and
-the process is not suspended.
+accepted as well. `address=host:port` splits on the last `:`.
+`address=0` with `server=y` prints the chosen port on stderr
+(`Listening for transport dt_socket at address: N`). `server=n` prints
+`Connecting to transport dt_socket at address: host:port` and retries
+the connect briefly. Set `AVIAN_JDWP_LOG=1` to log every JDWP command.
+Windows sockets are not implemented: the flag is accepted and then
+ignored, and the process is not suspended.
 
 Suspension is cooperative. A thread stops at a safepoint the VM already
 has: every bytecode while interpreting, every bytecode of a method that
@@ -78,25 +85,39 @@ On top of that, JDWP is still just a client of the same event layer:
   locals that exist. The interpreter uses the operand stack. The JIT
   uses the same slot map as GC, with parameters reversed by
   `parameterFootprint`. A compiled frame that cannot be read returns
-  `OPAQUE_FRAME` (32) instead of a guessed value.
+  `OPAQUE_FRAME` (32) instead of a guessed value. The generic-signature
+  string in the variable table is empty.
 * `StackFrame.ThisObject` is local 0 for an instance frame, and null
   for a static or native frame.
-* Heap objects the debugger names get a stable id (id 0 is null). The
-  table is a GC root. `ObjectReference.ReferenceType` and `GetValues`
-  (instance fields) and `ReferenceType.GetValues` (statics) run on the
-  suspended thread. `DisposeObjects` drops ids.
+* Heap objects the debugger names get a stable id (id 0 is null). An id
+  is a strong root only after `ObjectReference.DisableCollection`
+  (command 7); `EnableCollection` (command 8) drops the pin. An id whose
+  object was collected stays that id and reads back as null
+  (`INVALID_OBJECT` is 20), rather than being reused.
+  `ObjectReference.ReferenceType` and `GetValues` (instance fields) and
+  `ReferenceType.GetValues` (statics) run on the suspended thread.
+  `DisposeObjects` drops ids.
+* `ReferenceType.Instances` (set 2, command 16) and
+  `ObjectReference.ReferringObjects` (set 9, command 10) walk the heap
+  (`canGetInstanceInfo`). `maxInstances` / `maxReferrers` of 0 means
+  "all", capped at 64. Subtypes are included. The walk runs on a
+  suspended thread and is accurate only while threads are suspended.
 * Exception events (caught and uncaught) and `ThreadStart` /
   `ThreadDeath`. The main thread does not pass through `Thread.start`,
-  so it often has no `ThreadStart`. A JIT throw is reported from the
-  unwinder without entering Idle there; the suspend itself happens at
-  the next checkpoint, which is the catch handler when the exception is
-  caught.
+  so it often has no `ThreadStart`. A JIT throw suspends at the throw
+  site (the unwinder no longer defers it to the catch). A compiled
+  invoke that throws while the caller is suspended does not unwind that
+  frame; the exception is returned to the debugger.
 * Field access and modification, in the interpreter and in methods
   JIT-compiled after JDWP is enabled. Same checkpoint/patch idea as
-  breakpoints: the watch is a call, and the instance and the value stay
-  in the Java frame map so a collection during the suspend is safe.
-  Float and double modification events from compiled code carry a zero
-  value; ints, longs, and object references do not.
+  breakpoints. Float and double modification events are reported after
+  the store, so the bits are the value that was written (not zero).
+  Access events carry no value, matching JDWP.
+* Monitor events, from `monitorEnter` / `Object.wait` in the runtime, so
+  both the interpreter and JIT (including methods compiled before the
+  agent) see them: 43 contended enter, 44 contended entered, 45 wait
+  (with the timeout), 46 waited. `timed_out` on 46 is approximated.
+  `canRequestMonitorEvents` is set.
 * `RedefineClasses` for a bytecode-only swap. The new code object is
   installed, and methods compiled after the redefine are invalidated
   back to the default thunk (virtual methods included). Schema changes,
@@ -104,22 +125,46 @@ On top of that, JDWP is still just a client of the same event layer:
   JDWP redefine errors (62-69). A frame already running the old body
   keeps it. A direct call already patched to the old address is not
   rewritten. Boot-image classes are not re-parsed.
-* `PopFrames` (StackFrame command 4, top frame only). The interpreter
-  drops the frame and pushes a zero return so the caller stays
-  balanced; it does not re-execute the invoke, and the caller's pc is
-  the instruction after the call. A compiled frame returns
-  `OPAQUE_FRAME` (32): there is no edge back to the invoke bytecode.
+* `PopFrames` (StackFrame command 4, top frame only) and
+  `ForceEarlyReturn` (ThreadReference command 14, `canForceEarlyReturn`).
+  The interpreter pushes the early-return value, or a zero for a plain
+  pop, and does not re-execute the invoke. A compiled frame is left by
+  jumping to the caller's return address with that value in the return
+  register (`vmJump`, or `vmJumpFloat` on x86_64 and arm64). The code
+  range is captured when the thread stops, so a redefine while it is
+  suspended does not hide the frame. Not the current frame is 33, a
+  type mismatch is 34. i386 and arm32 have no x87/VFP move in
+  `vmJumpFloat`, so a float or double early return there is not placed
+  in the floating return register.
 * `ClassType.InvokeMethod` and `ObjectReference.InvokeMethod` run on a
   suspended thread, which is enough for jdb `print` / `eval` of a simple
-  call. The invoke does not hit nested breakpoints. An exception thrown
-  out of an interpreted invoke is returned in the reply. An exception
-  thrown out of a compiled invoke may still unwind the suspended frame.
+  call. The invoke does not hit nested breakpoints.
+* Class unload (event kind 9) when a class loaded by a custom
+  `ClassLoader` is actually unloaded. The loader's `jclass` is a weak
+  reference, and a native finalizer reports `Lname;` once the loader is
+  unreachable. Bootstrap and application loaders are not unloaded.
+  The event has no thread and does not suspend. `System.gc` is a major
+  collection; it does not promise a particular class dies on a given
+  call.
+* Generic signatures are the class-file `Signature` attribute, not a
+  source string. `ReferenceType.SignatureWithGeneric` (command 13),
+  `ReferenceType.FieldsWithGeneric` (14), and
+  `ReferenceType.MethodsWithGeneric` (15). For `Box<T>` the class
+  signature looks like `<T:Ljava/lang/Object;>Ljava/lang/Object;`, the
+  field like `TT;`, the method like `()TT;`.
 
-Not implemented: monitor events, heap walking, early return, class
-unload, source-debug extension, real generic signatures, `server=n`,
-Windows sockets, and 32-bit builds (the `TARGET_THREAD_*` offsets in
-`target-fields.h` were only shifted for LP64). CI is 64-bit only.
+`VirtualMachine.Capabilities` and `CapabilitiesNew` advertise field
+watch, redefine, pop frames, instance info, monitor events, and early
+return.
 
+Not implemented: preemptive suspend, breakpoints inside boot-image /
+AOT code, source-debug extension, generic signatures on local
+variables, and Windows sockets. A 32-bit build compiles and passes the
+`TARGET_THREAD_*` constant check (i386 `uint64` aligns to 4, so the
+MyThread offsets differ from LP64). The i386 interpreter passes the
+JDWP test. The i386 JIT aborts in the register allocator when a method
+is compiled with a checkpoint on every bytecode, so compile-mode JDWP
+does not run there yet. CI itself is 64-bit only.
 
 
 Supported Platforms

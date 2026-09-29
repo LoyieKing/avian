@@ -16,7 +16,9 @@ HANDSHAKE = b"JDWP-Handshake"
 PROC = None
 def die(msg):
     extra = ""
-    if PROC is not None and PROC.poll() is not None:
+    if PROC is not None:
+        if PROC.poll() is None:
+            PROC.kill()
         try:
             out, err2 = PROC.communicate(timeout=2)
             extra = " rc=%s out=%r err=%r" % (PROC.returncode, out, err2)
@@ -453,23 +455,39 @@ def main():
     plus = methods.get(("plus", "(I)I"))
     bump = methods.get(("bump", "()V"))
     leaf = methods.get(("leaf", "()V"))
+    early = methods.get(("early", "()I"))
+    fail = methods.get(("fail", "()I"))
     field_n = fields.get(("n", "I"))
-    if not plus or not bump or not leaf or not field_n:
-        die("missing members plus=%s bump=%s leaf=%s n=%s" % (plus, bump, leaf, field_n))
+    field_f = fields.get(("f", "F"))
+    field_d = fields.get(("d", "D"))
+    if not plus or not bump or not leaf or not field_n or not field_f or not field_d or not early or not fail:
+        die("missing members %s" % (methods, ))
 
     def loc(method, index):
         return u1(1) + u8(type_id) + u8(method) + u8(index)
 
     conn.send(15, 1, u1(2) + u1(2) + u4(1) + u1(7) + loc(bump, 0))
+    conn.send(15, 1, u1(2) + u1(2) + u4(1) + u1(7) + loc(early, 0))
     conn.send(15, 1, u1(2) + u1(2) + u4(1) + u1(7) + loc(leaf, 0))
     # Field modification, this field only, suspend all.
-    conn.send(15, 1, u1(21) + u1(2) + u4(1) + u1(9) + u8(type_id) + u8(field_n))
+    for fid in (field_n, field_f, field_d):
+        conn.send(15, 1, u1(21) + u1(2) + u4(1) + u1(9) + u8(type_id) + u8(fid))
     # Exception, all types, caught and uncaught, only in JdwpDebug.
     conn.send(15, 1, u1(4) + u1(2) + u4(2) + u1(8) + u8(0) + u1(1) + u1(1)
               + u1(5) + ustring("JdwpDebug"))
     conn.send(15, 1, u1(6) + u1(0) + u4(0))  # ThreadStart, suspend none
     conn.send(15, 1, u1(7) + u1(0) + u4(0))  # ThreadDeath, suspend none
+    # Monitor events, suspend none so they do not stall the script.
+    for kind in (43, 44, 45, 46):
+        conn.send(15, 1, u1(kind) + u1(0) + u4(0))
+    conn.send(15, 1, u1(9) + u1(0) + u4(1) + u1(5) + ustring("Unloaded"))
     conn.send(15, 2, u1(8) + u4(prepare_id))  # clear ClassPrepare
+
+    def mod_value(events):
+        # kind at 5, request 4, thread 8, location 1+8+8+8, refType 1+8+8, object 1+8, then value
+        i = 5 + 1 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + 8 + 8 + 1 + 8
+        tag, bits, _ = read_value(events, i)
+        return tag, bits
 
     conn.send(1, 9)
     ev = conn.wait_event(2)
@@ -477,7 +495,6 @@ def main():
     bump_method = struct.unpack_from(">Q", events, 5 + 1 + 4 + 8 + 1 + 8)[0]
     if bump_method != bump:
         die("expected bump breakpoint, method %s" % bump_method)
-    # This object of the instance frame.
     threads = conn.send(1, 4)
     tn = struct.unpack_from(">I", threads, 0)[0]
     inst_frame = None
@@ -510,32 +527,125 @@ def main():
     tag, bits, _ = read_value(fvals, 4)
     if tag != ord("I") or bits != 0:
         die("field n before bump is %s/%s" % (tag, bits))
+    insts = conn.send(2, 16, u8(type_id) + u4(0))
+    icount = struct.unpack_from(">I", insts, 0)[0]
+    if icount < 1:
+        die("ReferenceType.Instances returned %s" % icount)
+    refs = conn.send(9, 10, u8(this_id) + u4(0))
+    rcount = struct.unpack_from(">I", refs, 0)[0]
+    if rcount < 1:
+        die("ReferringObjects returned 0")
 
-    conn.send(1, 9)
-    ev = conn.wait_event(21)
-    events = ev[2]
-    watch_method = struct.unpack_from(">Q", events, 5 + 1 + 4 + 8 + 1 + 8)[0]
-    if watch_method != bump:
-        die("field watch location method %s wanted %s" % (watch_method, bump))
-    if len(events) < 74 or events[69] != ord("I"):
-        die("field watch value header %r" % events[60:74])
-    written = struct.unpack_from(">I", events, 70)[0]
-    if written != 1:
-        die("field watch new value %s" % written)
+    def expect_mod(fid, tag_want, bits_want, label):
+        conn.send(1, 9)
+        ev = conn.wait_event(21)
+        tag, bits = mod_value(ev[2])
+        if tag != tag_want or bits != bits_want:
+            die("%s modification tag=%s bits=%s want %s/%s" % (label, tag, bits, tag_want, bits_want))
+
+    expect_mod(field_n, ord("I"), 1, "int")
+    expect_mod(field_f, ord("F"), struct.unpack(">I", struct.pack(">f", 1.5))[0], "float")
+    expect_mod(field_d, ord("D"), struct.unpack(">Q", struct.pack(">d", 2.5))[0], "double")
+
     conn.send(1, 9)
     ev = conn.wait_event(4)
     events = ev[2]
+    ex_thread = struct.unpack_from(">Q", events, 5 + 1 + 4)[0]
     throw_method = struct.unpack_from(">Q", events, 5 + 1 + 4 + 8 + 1 + 8)[0]
+    throw_index = struct.unpack_from(">Q", events, 5 + 1 + 4 + 8 + 1 + 8 + 8)[0]
     boom = methods.get(("boom", "()V"))
     if throw_method != boom:
         die("exception location method %s wanted %s" % (throw_method, boom))
-    ex = ev[2]
-    # kind at 5, then request, thread, location, tagged exception
-    if ex[5] != 4:
-        die("expected exception event")
+    # After the tagged exception comes the catch location.
+    i = 5 + 1 + 4 + 8 + (1 + 8 + 8 + 8)
+    _, _, i = read_value(events, i)
+    catch_index = struct.unpack_from(">Q", events, i + 1 + 8 + 8)[0]
+    if throw_index == catch_index:
+        die("exception stopped at the handler index %s" % throw_index)
+    # The suspended top frame is the throw, not the catch.
+    fr = conn.send(11, 6, u8(ex_thread) + u4(0) + u4(1))
+    top = struct.unpack_from(">Q", fr, 4 + 8 + 1 + 8)[0]
+    top_index = struct.unpack_from(">Q", fr, 4 + 8 + 1 + 8 + 8)[0]
+    if top != boom or top_index != throw_index:
+        die("suspended frame method %s index %s, event %s" % (top, top_index, throw_index))
+
     conn.send(1, 9)
     conn.wait_event(6)
     conn.wait_event(7)
+    for kind in (43, 44, 45, 46):
+        conn.wait_event(kind)
+    try:
+        conn.wait_event(9, timeout=2)
+    except SystemExit:
+        # ClassUnload is delivered by a loader finalizer. Give the
+        # collector another moment; the event may already be queued
+        # under a different read. Re-raise if it truly never arrived.
+        raise
+    ev = conn.wait_event(2)
+    events = ev[2]
+    early_method = struct.unpack_from(">Q", events, 5 + 1 + 4 + 8 + 1 + 8)[0]
+    if early_method != early:
+        die("expected early breakpoint, method %s" % early_method)
+    # ForceEarlyReturn of 9. The method's own return is 7.
+    threads = conn.send(1, 4)
+    tn = struct.unpack_from(">I", threads, 0)[0]
+    early_thread = chosen
+    for k in range(tn):
+        tid = struct.unpack_from(">Q", threads, 4 + 8 * k)[0]
+        err, fc = conn.send_raw(11, 7, u8(tid))
+        if err or len(fc) < 4 or struct.unpack(">I", fc)[0] == 0:
+            continue
+        fr = conn.send(11, 6, u8(tid) + u4(0) + u4(1))
+        top = struct.unpack_from(">Q", fr, 4 + 8 + 1 + 8)[0]
+        if top == early:
+            early_thread = tid
+            break
+    err, body = conn.send_raw(11, 14, u8(early_thread) + tagged_int(9))
+    if err:
+        die("ForceEarlyReturn failed: %s" % err)
+
+    # Generic signatures on the nested Box.
+    found = conn.send(1, 2, ustring("LJdwpDebug$Box;"))
+    n = struct.unpack_from(">I", found, 0)[0]
+    if n < 1:
+        die("Box not loaded")
+    box_id = struct.unpack_from(">Q", found, 5)[0]
+    sigg = conn.send(2, 13, u8(box_id))
+    jni, i = read_str(sigg, 0)
+    gen, i = read_str(sigg, i)
+    # JVMS Signature attribute, not a source-level "Box<T>" string.
+    if "Box" not in jni or not gen.startswith("<T:") or "Ljava/lang/Object;" not in gen:
+        die("class generic %s / %s" % (jni, gen))
+    meths = conn.send(2, 15, u8(box_id))
+    mn = struct.unpack_from(">I", meths, 0)[0]
+    i = 4
+    got_get = None
+    for _ in range(mn):
+        i += 8
+        name, i = read_str(meths, i)
+        spec, i = read_str(meths, i)
+        generic, i = read_str(meths, i)
+        i += 4
+        if name == "get":
+            got_get = generic
+    if got_get != "()TT;":
+        die("method generic %r" % got_get)
+    flds = conn.send(2, 14, u8(box_id))
+    fn = struct.unpack_from(">I", flds, 0)[0]
+    i = 4
+    got_val = None
+    for _ in range(fn):
+        i += 8
+        name, i = read_str(flds, i)
+        spec, i = read_str(flds, i)
+        generic, i = read_str(flds, i)
+        i += 4
+        if name == "value":
+            got_val = generic
+    if got_val != "TT;":
+        die("field generic %r" % got_val)
+
+    conn.send(1, 9)
     ev = conn.wait_event(2)
     events = ev[2]
     leaf_method = struct.unpack_from(">Q", events, 5 + 1 + 4 + 8 + 1 + 8)[0]
@@ -548,6 +658,16 @@ def main():
     if tag != ord("I") or bits != 3 or exid != 0:
         die("plus(2) tag=%s bits=%s ex=%s" % (tag, bits, exid))
 
+    inv = conn.send(3, 3, u8(type_id) + u8(chosen) + u8(fail) + u4(0) + u4(1))
+    tag, bits, i = read_value(inv, 0)
+    extag, exid, _ = read_value(inv, i)
+    if exid == 0:
+        die("fail() did not report an exception")
+    fr = conn.send(11, 6, u8(chosen) + u4(0) + u4(1))
+    top = struct.unpack_from(">Q", fr, 4 + 8 + 1 + 8)[0]
+    if top != leaf:
+        die("throwing invoke unwound the suspended frame, top %s" % top)
+
     blob = redefine_bytes()
     err, body = conn.send_raw(1, 18, u4(1) + u8(type_id) + u4(len(blob)) + blob)
     if err:
@@ -558,8 +678,6 @@ def main():
     if tag != ord("I") or bits != 12 or exid != 0:
         die("redefined plus(2) tag=%s bits=%s ex=%s" % (tag, bits, exid))
 
-    # Pop the leaf frame. Interpreter must do it. Compiled frames are
-    # opaque: the JIT has no edge back to the invoke bytecode.
     threads = conn.send(1, 4)
     tn = struct.unpack_from(">I", threads, 0)[0]
     leaf_frame = None
@@ -578,14 +696,10 @@ def main():
     if leaf_frame is None:
         die("no leaf frame to pop")
     err, body = conn.send_raw(16, 4, u8(leaf_thread) + u8(leaf_frame))
-    if process == "interpret":
-        if err:
-            die("PopFrames failed in the interpreter: %s" % err)
-    elif err not in (0, 32):
-        die("PopFrames unexpected error %s" % err)
+    if err:
+        die("PopFrames failed: %s" % err)
 
     conn.send(1, 9)  # run to completion
-    # The VM may exit as soon as it is resumed, before Dispose is answered.
     try:
         conn.send_raw(1, 6)
     except SystemExit:
@@ -596,12 +710,63 @@ def main():
     except subprocess.TimeoutExpired:
         proc.kill()
         out, err2 = proc.communicate()
-        die("process hung; stdout=%r stderr=%r" % (out, err + err2))
+        die("process hung; stdout=%r stderr=%r" % (out, err2))
     if proc.returncode != 0:
-        die("exit %s stdout=%r stderr=%r" % (proc.returncode, out, err + err2))
-    if b"result=42" not in out:
+        die("exit %s stdout=%r stderr=%r" % (proc.returncode, out, err2))
+    if b"result=42" not in out or b"early=9" not in out:
         die("missing result stdout=%r" % out)
+    if b"leaf=0" not in out:
+        die("PopFrames did not skip leaf stdout=%r" % out)
+    run_client(avian, classpath)
     sys.stdout.write("jdwp-test: ok\n")
+
+
+def run_client(avian, classpath):
+    global PROC
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    proc = subprocess.Popen(
+        [avian, "-cp", classpath,
+         "-Xrunjdwp:transport=dt_socket,server=n,suspend=y,address=127.0.0.1:%d" % port,
+         "JdwpDebug"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    PROC = proc
+    srv.settimeout(20)
+    try:
+        sock, _ = srv.accept()
+    except socket.timeout:
+        die("server=n did not connect")
+    sock.sendall(HANDSHAKE)
+    got = b""
+    while len(got) < len(HANDSHAKE):
+        chunk = sock.recv(len(HANDSHAKE) - len(got))
+        if not chunk:
+            die("client handshake closed")
+        got += chunk
+    if got != HANDSHAKE:
+        die("bad client handshake %r" % got)
+    conn = Conn(sock)
+    version = conn.send(1, 1)
+    desc, i = read_str(version, 0)
+    if not desc:
+        die("empty version")
+    conn.send(1, 9)
+    try:
+        conn.send_raw(1, 6)
+    except SystemExit:
+        pass
+    sock.close()
+    out, err2 = proc.communicate(timeout=20)
+    if proc.returncode != 0:
+        die("client exit %s stdout=%r stderr=%r" % (proc.returncode, out, err2))
+    if b"result=42" not in out or b"early=7" not in out:
+        die("client stdout=%r stderr=%r" % (out, err2))
+    if b"Connecting to transport dt_socket" not in err2:
+        die("client missing connect line %r" % err2)
+
 
 
 if __name__ == "__main__":

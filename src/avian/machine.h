@@ -3118,7 +3118,15 @@ inline void acquire(Thread* t, object o)
     fprintf(stderr, "thread %p acquires %p for %x\n", t, m, hash);
   }
 
-  monitorAcquire(t, m);
+  if (not monitorTryAcquire(t, m)) {
+    // Contended. Report before waiting, and again once we own it.
+    // Neither call holds t->lock; the slow path of monitorAcquire does.
+    if (UNLIKELY(debug::monitorEvents()))
+      debug::onMonitor(t, o, 43, 0, 0);
+    monitorAcquire(t, m);
+    if (UNLIKELY(debug::monitorEvents()))
+      debug::onMonitor(t, o, 44, 0, 0);
+  }
 }
 
 inline void release(Thread* t, object o)
@@ -3158,7 +3166,19 @@ inline void wait(Thread* t, object o, int64_t milliseconds)
   if (m and m->owner() == t) {
     PROTECT(t, m);
 
+    if (UNLIKELY(debug::monitorEvents()))
+      debug::onMonitor(t, o, 45, milliseconds, 0);
+
+    int64_t started = t->m->system->now();
     bool interrupted = monitorWait(t, m, milliseconds);
+
+    if (UNLIKELY(debug::monitorEvents())) {
+      int timedOut = 0;
+      if (not interrupted and milliseconds > 0
+          and t->m->system->now() - started >= milliseconds)
+        timedOut = 1;
+      debug::onMonitor(t, o, 46, 0, timedOut);
+    }
 
     if (interrupted) {
       if (t->m->alive or (t->getFlags() & Thread::DaemonFlag) == 0) {
@@ -3698,24 +3718,70 @@ inline GcMethodRuntimeData* getMethodRuntimeData(Thread* t, GcMethod* method)
                                        [method->runtimeDataIndex() - 1]);
 }
 
+inline bool unloadableClassLoader(Thread* t, GcClass* c)
+{
+  GcClassLoader* loader = c->loader();
+  if (loader == 0)
+    return false;
+  return loader != roots(t)->bootLoader() and loader != roots(t)->appLoader();
+}
+
+// The runtime-data table is a GC root. A strong jclass there pins the
+// VM class, which pins its loader, so a custom loader can never become
+// unreachable. Mirrors for those loaders are held only by a weak
+// reference: the Java Class object stays alive while the application
+// holds it, and disappears with the loader.
+inline GcJclass* cachedJclass(Thread* t, object slot)
+{
+  if (slot == 0)
+    return 0;
+  if (objectClass(t, slot) == type(t, GcWeakReference::Type)) {
+    object target = cast<GcWeakReference>(t, slot)->target();
+    return target ? cast<GcJclass>(t, target) : 0;
+  }
+  return cast<GcJclass>(t, slot);
+}
+
 inline GcJclass* getJClass(Thread* t, GcClass* c)
 {
   PROTECT(t, c);
 
-  GcJclass* jclass = cast<GcJclass>(t, getClassRuntimeData(t, c)->jclass());
+  GcJclass* jclass = cachedJclass(t, getClassRuntimeData(t, c)->jclass());
 
   loadMemoryBarrier();
 
   if (jclass == 0) {
     ACQUIRE(t, t->m->classLock);
 
-    jclass = cast<GcJclass>(t, getClassRuntimeData(t, c)->jclass());
+    jclass = cachedJclass(t, getClassRuntimeData(t, c)->jclass());
     if (jclass == 0) {
       jclass = t->m->classpath->makeJclass(t, c);
+      PROTECT(t, jclass);
 
       storeStoreMemoryBarrier();
 
-      getClassRuntimeData(t, c)->setJclass(t, jclass);
+      if (unloadableClassLoader(t, c)) {
+        object slot = getClassRuntimeData(t, c)->jclass();
+        GcWeakReference* w = 0;
+        if (slot and objectClass(t, slot) == type(t, GcWeakReference::Type))
+          w = cast<GcWeakReference>(t, slot);
+        if (w == 0) {
+          // Null target until the reference is on the weak list and
+          // strongly reachable from the runtime table. Those three
+          // stores happen with no safepoint between them.
+          w = makeWeakReference(t, 0, 0, 0, 0);
+          PROTECT(t, w);
+          ACQUIRE(t, t->m->referenceLock);
+          w->setTarget(t, jclass);
+          w->vmNext() = t->m->weakReferences;
+          t->m->weakReferences = cast<GcJreference>(t, w);
+          getClassRuntimeData(t, c)->setJclass(t, w);
+        } else {
+          w->setTarget(t, jclass);
+        }
+      } else {
+        getClassRuntimeData(t, c)->setJclass(t, jclass);
+      }
     }
   }
 

@@ -29,6 +29,8 @@
 using namespace vm;
 using namespace avian::util;
 
+
+
 namespace {
 
 const bool DebugClassReader = false;
@@ -520,7 +522,6 @@ void postVisit(Thread* t, Heap::Visitor* v)
 
   GcFinalizer* firstNewTenuredFinalizer = 0;
   GcFinalizer* lastNewTenuredFinalizer = 0;
-
   {
     object unreachable = 0;
     for (GcFinalizer** p = &(m->finalizers); *p;) {
@@ -6009,24 +6010,15 @@ GcClass* defineClass(Thread* t,
 
   GcClass* c = parseClass(t, loader, buffer, length);
 
-  // char name[byteArrayLength(t, className(t, c))];
-  // memcpy(name, &byteArrayBody(t, className(t, c), 0),
-  //        byteArrayLength(t, className(t, c)));
-  // replace('/', '-', name);
-
-  // const unsigned BufferSize = 1024;
-  // char path[BufferSize];
-  // snprintf(path, BufferSize, "/tmp/avian-define-class/%s.class", name);
-
-  // FILE* file = fopen(path, "wb");
-  // if (file) {
-  //   fwrite(buffer, length, 1, file);
-  //   fclose(file);
-  // }
-
   PROTECT(t, c);
 
   saveLoadedClass(t, loader, c);
+
+  // resolveSystemClass arms ClassPrepare itself. defineClass did not,
+  // so a class installed this way never got a loader finalizer and
+  // could not unload.
+  debug::ClassPrepareNotifier prepare(t, &c);
+  prepare.arm();
 
   return c;
 }
