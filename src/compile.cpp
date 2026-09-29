@@ -15,7 +15,8 @@
 #include "avian/target.h"
 #include "avian/arch.h"
 
-#include <avian/system/memory.h>
+#include <avian/system/code-memory.h>
+#include <avian/codegen/jit-debug.h>
 
 #include <avian/codegen/assembler.h>
 #include <avian/codegen/architecture.h>
@@ -27,7 +28,6 @@
 #include <avian/util/runtime-array.h>
 #include <avian/util/list.h>
 #include <avian/util/slice.h>
-#include <avian/util/fixed-allocator.h>
 
 #include "debug-util.h"
 
@@ -408,7 +408,7 @@ GcMethod* methodForIp(MyThread* t, void* ip)
 
   // we must use a version of the method tree at least as recent as the
   // compiled form of the method containing the specified address (see
-  // compile(MyThread*, FixedAllocator*, BootContext*, object)):
+  // compile(MyThread*, BootContext*, GcMethod*)):
   loadMemoryBarrier();
 
   return cast<GcMethod>(t,
@@ -958,6 +958,8 @@ class Context {
     virtual void visit(Heap::Visitor* v)
     {
       v->visit(&(c->method));
+      v->visit(&(c->objectPoolArray));
+      v->visit(&(c->callNodes));
 
       for (PoolElement* p = c->objectPool; p; p = p->next) {
         v->visit(&(p->target));
@@ -1172,6 +1174,8 @@ class Context {
         method(method),
         bootContext(bootContext),
         objectPool(0),
+        objectPoolArray(0),
+        callNodes(0),
         subroutineCount(0),
         traceLog(0),
         visitTable(
@@ -1180,10 +1184,11 @@ class Context {
             &zone,
             method->code()->length() * frameMapSizeInWords(t, method),
             ~(uintptr_t)0)),
-        executableAllocator(0),
+        executableMemory(0),
         executableStart(0),
         executableSize(0),
         objectPoolCount(0),
+        callNodeCount(0),
         traceLogCount(0),
         dirtyRoots(false),
         leaf(true),
@@ -1205,14 +1210,17 @@ class Context {
         method(0),
         bootContext(0),
         objectPool(0),
+        objectPoolArray(0),
+        callNodes(0),
         subroutineCount(0),
         traceLog(0),
         visitTable(0, 0),
         rootTable(0, 0),
-        executableAllocator(0),
+        executableMemory(0),
         executableStart(0),
         executableSize(0),
         objectPoolCount(0),
+        callNodeCount(0),
         traceLogCount(0),
         dirtyRoots(false),
         leaf(true),
@@ -1236,8 +1244,8 @@ class Context {
 
     assembler->dispose();
 
-    if (executableAllocator) {
-      executableAllocator->free(executableStart, executableSize);
+    if (executableMemory) {
+      executableMemory->free(executableStart, executableSize);
     }
 
     eventLog.dispose();
@@ -1267,14 +1275,22 @@ class Context {
   GcMethod* method;
   BootContext* bootContext;
   PoolElement* objectPool;
+  // The materialized pool for objectPool (see makeObjectPool); owned by
+  // this context until publishObjectPool hands it to the VM.
+  GcArray* objectPoolArray;
+  // Call nodes for this method's call sites, chained through their next
+  // fields; owned by this context until publishCallNodes links them
+  // into the call table.
+  GcCallNode* callNodes;
   unsigned subroutineCount;
   TraceElement* traceLog;
   Slice<uint16_t> visitTable;
   Slice<uintptr_t> rootTable;
-  Alloc* executableAllocator;
-  void* executableStart;
+  CodeMemory* executableMemory;
+  uint8_t* executableStart;
   unsigned executableSize;
   unsigned objectPoolCount;
+  unsigned callNodeCount;
   unsigned traceLogCount;
   bool dirtyRoots;
   bool leaf;
@@ -1414,7 +1430,7 @@ void storeLocal(Context* context,
                                 translateLocalIndex(context, footprint, index));
 }
 
-avian::util::FixedAllocator* codeAllocator(MyThread* t);
+CodeMemory* codeMemory(MyThread* t);
 
 ir::Type operandTypeForFieldCode(Thread* t, unsigned code)
 {
@@ -1630,7 +1646,7 @@ class Frame {
                          new (&context->zone) avian::codegen::OffsetPromise(
                              p,
                              -reinterpret_cast<intptr_t>(
-                                 codeAllocator(t)->memory.begin())),
+                                 codeMemory(t)->region().begin())),
                          ir::Type::iptr()))
                : addressOperand(p);
   }
@@ -2408,10 +2424,7 @@ void tryInitClass(MyThread* t, GcClass* class_)
   initClass(t, class_);
 }
 
-void compile(MyThread* t,
-             FixedAllocator* allocator,
-             BootContext* bootContext,
-             GcMethod* method);
+void compile(MyThread* t, BootContext* bootContext, GcMethod* method);
 
 GcMethod* resolveMethod(Thread* t, GcPair* pair)
 {
@@ -2451,7 +2464,7 @@ int64_t prepareMethodForCall(MyThread* t, GcMethod* target)
     if (unresolved(t, methodAddress(t, target))) {
       PROTECT(t, target);
 
-      compile(t, codeAllocator(t), 0, target);
+      compile(t, 0, target);
     }
 
     if (target->flags() & ACC_NATIVE) {
@@ -3126,10 +3139,9 @@ void idleIfNecessary(MyThread* t)
 bool useLongJump(MyThread* t, uintptr_t target)
 {
   uintptr_t reach = t->arch->maximumImmediateJump();
-  FixedAllocator* a = codeAllocator(t);
-  uintptr_t start = reinterpret_cast<uintptr_t>(a->memory.begin());
-  uintptr_t end = reinterpret_cast<uintptr_t>(a->memory.begin())
-                  + a->memory.count;
+  Slice<uint8_t> code = codeMemory(t)->region();
+  uintptr_t start = reinterpret_cast<uintptr_t>(code.begin());
+  uintptr_t end = reinterpret_cast<uintptr_t>(code.begin()) + code.count;
   assertT(t, end - start < reach);
 
   return (target > end && (target - start) > reach)
@@ -3143,7 +3155,13 @@ void logCompile(MyThread* t,
                 unsigned size,
                 const char* class_,
                 const char* name,
-                const char* spec);
+                const char* spec,
+                unsigned prologueSize = 0,
+                unsigned frameSize = 0);
+
+unsigned frameSizeInBytes(MyThread* t, unsigned footprint);
+
+unsigned thunkFrameSize(MyThread* t);
 
 unsigned simpleFrameMapTableSize(MyThread* t, GcMethod* method, GcIntArray* map)
 {
@@ -7010,22 +7028,40 @@ int compareTraceElementPointers(const void* va, const void* vb)
   }
 }
 
+// Assembles the code `a` has laid out (`length` bytes) into `start`,
+// which must lie in code memory, and publishes it.  Scratch memory for
+// staging comes from `zone`.
+void emitCode(MyThread* t,
+              Zone* zone,
+              avian::codegen::Assembler* a,
+              uint8_t* start,
+              unsigned length)
+{
+  CodeMemory::Writer writer(codeMemory(t), start, length, zone);
+  a->write(writer.buffer(), start);
+  writer.commit();
+}
+
+uint8_t* allocateCode(MyThread* t, unsigned size)
+{
+  uint8_t* start = codeMemory(t)->allocate(size);
+  expect(t, start);
+  return start;
+}
+
 uint8_t* finish(MyThread* t,
-                FixedAllocator* allocator,
+                Context* context,
                 avian::codegen::Assembler* a,
                 const char* name,
-                unsigned length)
+                unsigned length,
+                unsigned prologueSize,
+                unsigned frameSize)
 {
-  uint8_t* start
-      = static_cast<uint8_t*>(allocator->allocate(length, TargetBytesPerWord));
+  uint8_t* start = allocateCode(t, length);
 
-  a->setDestination(start);
-  {
-    Memory::JitWriteScope scope;
-    a->write();
-  }
+  emitCode(t, &context->zone, a, start, length);
 
-  logCompile(t, start, length, 0, name, 0);
+  logCompile(t, start, length, 0, name, 0, prologueSize, frameSize);
 
   return start;
 }
@@ -7140,11 +7176,44 @@ GcIntArray* makeSimpleFrameMapTable(MyThread* t,
   return table;
 }
 
-void insertCallNode(MyThread* t, GcCallNode* node);
+void reserveCallNodes(MyThread* t, unsigned count);
 
-void finish(MyThread* t, FixedAllocator* allocator, Context* context)
+void publishCallNodes(MyThread* t, Context* context);
+
+GcArray* makeObjectPool(MyThread* t, Context* context)
 {
-  Memory::JitWriteScope scope;
+  // The pool is referenced by absolute address from the compiled code
+  // (see Frame::append), so it must never move: allocate it as a fixed
+  // object.  It lives in ordinary heap memory, not in the executable
+  // area, so the collector never has to write to code memory.
+  //
+  // Element 0 links the pool into compileRoots()->objectPools, which is
+  // what keeps it (and everything it references) alive once the method
+  // has been published; until then the Context's protector does.  See
+  // publishObjectPool.
+  const unsigned length = context->objectPoolCount + 1;
+  GcArray* pool = reinterpret_cast<GcArray*>(
+      allocate3(t,
+                Machine::FixedAllocation,
+                GcArray::FixedSize + (length * BytesPerWord),
+                true));
+
+  initArray(t, pool, length);
+
+  unsigned i = 1;
+  for (PoolElement* p = context->objectPool; p; p = p->next) {
+    unsigned offset = ArrayBody + ((i++) * BytesPerWord);
+
+    p->address = reinterpret_cast<uintptr_t>(pool) + offset;
+
+    setField(t, pool, offset, p->target);
+  }
+
+  return pool;
+}
+
+void finish(MyThread* t, Context* context)
+{
   avian::codegen::Compiler* c = context->compiler;
 
   if (false) {
@@ -7179,50 +7248,30 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
 
   // we must acquire the class lock here at the latest
 
-  unsigned codeSize = c->resolve(allocator->memory.begin() + allocator->offset);
+  // Allocate the object pool before reserving any code space: this
+  // may trigger a collection or throw, and doing it first means there
+  // is nothing to roll back in the code area if it does.
+  if (context->objectPool) {
+    context->objectPoolArray = makeObjectPool(t, context);
+  }
+
+  unsigned codeSize = c->resolve();
 
   unsigned total = pad(codeSize, TargetBytesPerWord)
                    + pad(c->poolSize(), TargetBytesPerWord);
 
-  target_uintptr_t* code = static_cast<target_uintptr_t*>(
-      allocator->allocate(total, TargetBytesPerWord));
-  uint8_t* start = reinterpret_cast<uint8_t*>(code);
+  uint8_t* start = allocateCode(t, total);
 
-  context->executableAllocator = allocator;
-  context->executableStart = code;
+  // Until compile() publishes the method, this space is ours to give
+  // back if anything below throws.
+  context->executableMemory = codeMemory(t);
+  context->executableStart = start;
   context->executableSize = total;
 
-  if (context->objectPool) {
-    object pool = allocate3(
-        t,
-        allocator,
-        Machine::ImmortalAllocation,
-        GcArray::FixedSize + ((context->objectPoolCount + 1) * BytesPerWord),
-        true);
-
-    context->executableSize = (allocator->memory.begin() + allocator->offset)
-                              - static_cast<uint8_t*>(context->executableStart);
-
-    initArray(
-        t, reinterpret_cast<GcArray*>(pool), context->objectPoolCount + 1);
-    mark(t, pool, 0);
-
-    setField(t, pool, ArrayBody, compileRoots(t)->objectPools());
-    compileRoots(t)->setObjectPools(t, pool);
-
-    unsigned i = 1;
-    for (PoolElement* p = context->objectPool; p; p = p->next) {
-      unsigned offset = ArrayBody + ((i++) * BytesPerWord);
-
-      p->address = reinterpret_cast<uintptr_t>(pool) + offset;
-
-      setField(t, pool, offset, p->target);
-    }
-  }
-
   {
-    Memory::JitWriteScope scope2;
-    c->write();
+    CodeMemory::Writer writer(codeMemory(t), start, total, &context->zone);
+    c->write(writer.buffer(), start);
+    writer.commit();
   }
 
   BootContext* bc = context->bootContext;
@@ -7275,8 +7324,11 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
         RUNTIME_ARRAY_BODY(elements)[index++] = p;
 
         if (p->target) {
-          insertCallNode(
-              t, makeCallNode(t, p->address->value(), p->target, p->flags, 0));
+          // Not linked into the call table yet: see publishCallNodes.
+          GcCallNode* node = makeCallNode(
+              t, p->address->value(), p->target, p->flags, context->callNodes);
+          context->callNodes = node;
+          ++context->callNodeCount;
         }
       }
     }
@@ -7292,15 +7344,6 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
     context->method->code()->setStackMap(t, map);
   }
 
-  logCompile(
-      t,
-      start,
-      codeSize,
-      reinterpret_cast<const char*>(
-          context->method->class_()->name()->body().begin()),
-      reinterpret_cast<const char*>(context->method->name()->body().begin()),
-      reinterpret_cast<const char*>(context->method->spec()->body().begin()));
-
   // for debugging:
   if (false
       and ::strcmp(reinterpret_cast<const char*>(
@@ -7311,7 +7354,6 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
                    "<clinit>") == 0) {
     trap();
   }
-  syncInstructionCache(start, codeSize);
 }
 
 void compile(MyThread* t, Context* context)
@@ -7461,7 +7503,12 @@ void updateCall(MyThread* t,
                 void* returnAddress,
                 void* target)
 {
-  t->arch->updateCall(op, returnAddress, target);
+  avian::codegen::CodePatch patch
+      = t->arch->callPatch(op, returnAddress, target);
+
+  assertT(t, codeMemory(t)->contains(patch.address));
+
+  codeMemory(t)->patch(patch.address, patch.bytes, patch.size);
 }
 
 void* compileMethod2(MyThread* t, void* ip);
@@ -7501,7 +7548,7 @@ void* compileVirtualMethod2(MyThread* t, GcClass* class_, unsigned index)
   GcMethod* target = resolveTarget(t, class_, index);
   PROTECT(t, target);
 
-  compile(t, codeAllocator(t), 0, target);
+  compile(t, 0, target);
 
   void* address = reinterpret_cast<void*>(methodAddress(t, target));
   if (target->flags() & ACC_NATIVE) {
@@ -7542,7 +7589,7 @@ void* linkDynamicMethod2(MyThread* t, unsigned index)
     site = resolveDynamic(t, invocation);
     PROTECT(t, site);
 
-    compile(t, codeAllocator(t), 0, site->target()->method());
+    compile(t, 0, site->target()->method());
 
     ACQUIRE(t, t->m->classLock);
 
@@ -8192,7 +8239,7 @@ void callContinuation(MyThread* t,
 
           PROTECT(t, method);
 
-          compile(t, local::codeAllocator(t), 0, method);
+          compile(t, 0, method);
 
           compileRoots(t)->setRewindMethod(t, method);
         }
@@ -8270,7 +8317,7 @@ void callWithCurrentContinuation(MyThread* t, object receiver)
         t, compileRoots(t)->receiveMethod(), objectClass(t, receiver));
     PROTECT(t, method);
 
-    compile(t, local::codeAllocator(t), 0, method);
+    compile(t, 0, method);
 
     t->continuation = makeCurrentContinuation(t, &ip, &stack);
   }
@@ -8299,7 +8346,7 @@ void dynamicWind(MyThread* t, object before, object thunk, object after)
 
       if (method) {
         compileRoots(t)->setWindMethod(t, method);
-        compile(t, local::codeAllocator(t), 0, method);
+        compile(t, 0, method);
       }
     }
 
@@ -8521,7 +8568,6 @@ object invoke(Thread* thread, GcMethod* method, ArgumentList* arguments)
 
     compile(
         t,
-        local::codeAllocator(static_cast<MyThread*>(t)),
         0,
         resolveMethod(
             t, roots(t)->appLoader(), "foo/ClassName", "methodName", "()V"));
@@ -8692,12 +8738,14 @@ bool isThunkUnsafeStack(MyThread* t, void* ip);
 
 void boot(MyThread* t, BootImage* image, uint8_t* code);
 
+void registerBootImageCode(MyThread* t);
+
 class MyProcessor;
 
 MyProcessor* processor(MyThread* t);
 
 #ifndef AVIAN_AOT_ONLY
-void compileThunks(MyThread* t, FixedAllocator* allocator);
+void compileThunks(MyThread* t);
 #endif
 
 class CompilationHandlerList {
@@ -8784,7 +8832,8 @@ class MyProcessor : public Processor {
         divideByZeroHandler(GcArithmeticException::Type,
                             &GcRoots::arithmeticException,
                             GcArithmeticException::FixedSize),
-        codeAllocator(s, Slice<uint8_t>(0, 0)),
+        codeMemory(0),
+        jitDebug(0),
         callTableSize(0),
         dynamicIndex(0),
         useNativeFeatures(useNativeFeatures),
@@ -9110,10 +9159,7 @@ class MyProcessor : public Processor {
 
     method = findMethod(t, method, this_);
 
-    compile(static_cast<MyThread*>(t),
-            local::codeAllocator(static_cast<MyThread*>(t)),
-            0,
-            method);
+    compile(static_cast<MyThread*>(t), 0, method);
 
     return local::invoke(t, method, &list);
   }
@@ -9148,10 +9194,7 @@ class MyProcessor : public Processor {
 
     method = findMethod(t, method, this_);
 
-    compile(static_cast<MyThread*>(t),
-            local::codeAllocator(static_cast<MyThread*>(t)),
-            0,
-            method);
+    compile(static_cast<MyThread*>(t), 0, method);
 
     return local::invoke(t, method, &list);
   }
@@ -9188,10 +9231,7 @@ class MyProcessor : public Processor {
 
     method = findMethod(t, method, this_);
 
-    compile(static_cast<MyThread*>(t),
-            local::codeAllocator(static_cast<MyThread*>(t)),
-            0,
-            method);
+    compile(static_cast<MyThread*>(t), 0, method);
 
     return local::invoke(t, method, &list);
   }
@@ -9229,10 +9269,7 @@ class MyProcessor : public Processor {
 
     PROTECT(t, method);
 
-    compile(static_cast<MyThread*>(t),
-            local::codeAllocator(static_cast<MyThread*>(t)),
-            0,
-            method);
+    compile(static_cast<MyThread*>(t), 0, method);
 
     return local::invoke(t, method, &list);
   }
@@ -9252,10 +9289,13 @@ class MyProcessor : public Processor {
 
   virtual void dispose()
   {
-    if (codeAllocator.memory.begin()) {
-#ifndef AVIAN_AOT_ONLY
-      Memory::free(codeAllocator.memory);
-#endif
+    // Before the code goes away.
+    if (jitDebug) {
+      jitDebug->dispose();
+    }
+
+    if (codeMemory) {
+      codeMemory->dispose();
     }
 
     if(compilationHandlers) {
@@ -9364,7 +9404,7 @@ class MyProcessor : public Processor {
   virtual void initialize(BootImage* image, Slice<uint8_t> code)
   {
     bootImage = image;
-    codeAllocator.memory = code;
+    codeMemory = makeImageCodeMemory(allocator, code);
   }
 
   virtual void addCompilationHandler(CompilationHandler* handler)
@@ -9387,7 +9427,7 @@ class MyProcessor : public Processor {
     BootContext bootContext(
         t, *constants, *calls, *addresses, zone, resolver, hostVM);
 
-    compile(t, &codeAllocator, &bootContext, method);
+    compile(t, &bootContext, method);
 
     *constants = bootContext.constants;
     *calls = bootContext.calls;
@@ -9408,14 +9448,14 @@ class MyProcessor : public Processor {
     for (unsigned i = 0; i < a->length(); i += 2) {
       if (a->body()[i]) {
         a->body()[i]
-            -= reinterpret_cast<uintptr_t>(codeAllocator.memory.begin());
+            -= reinterpret_cast<uintptr_t>(codeMemory->region().begin());
       }
     }
   }
 
   virtual unsigned* makeCallTable(Thread* t, HeapWalker* w)
   {
-    bootImage->codeSize = codeAllocator.offset;
+    bootImage->codeSize = codeMemory->used();
     bootImage->callCount = callTableSize;
 
     unsigned* table = static_cast<unsigned*>(
@@ -9428,7 +9468,7 @@ class MyProcessor : public Processor {
            p = p->next()) {
         table[index++]
             = targetVW(p->address() - reinterpret_cast<uintptr_t>(
-                                          codeAllocator.memory.begin()));
+                                          codeMemory->region().begin()));
         table[index++] = targetVW(
             w->map()->find(p->target())
             | (static_cast<unsigned>(p->flags()) << TargetBootShift));
@@ -9441,16 +9481,24 @@ class MyProcessor : public Processor {
   virtual void boot(Thread* t, BootImage* image, uint8_t* code)
   {
 #ifndef AVIAN_AOT_ONLY
-    if (codeAllocator.memory.begin() == 0) {
-      codeAllocator.memory = Memory::allocate(ExecutableAreaSizeInBytes,
-                                              Memory::ReadWriteExecute);
+    if (codeMemory == 0) {
+      codeMemory = makeExecutableCodeMemory(allocator,
+                                            ExecutableAreaSizeInBytes);
 
-      expect(t, codeAllocator.memory.begin());
+      expect(t, codeMemory);
+
+      // Only code that runs in this process is worth telling a debugger
+      // about, so not while generating a boot image.
+      jitDebug = avian::codegen::makeJitDebugInfo(allocator);
     }
 #endif
 
     if (image and code) {
       local::boot(static_cast<MyThread*>(t), image, code);
+
+      if (jitDebug) {
+        local::registerBootImageCode(static_cast<MyThread*>(t));
+      }
     } else {
       roots = makeCompileRoots(t, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
@@ -9470,7 +9518,7 @@ class MyProcessor : public Processor {
 #ifdef AVIAN_AOT_ONLY
     thunks = bootThunks;
 #else
-    local::compileThunks(static_cast<MyThread*>(t), &codeAllocator);
+    local::compileThunks(static_cast<MyThread*>(t));
 
     if (not(image and code)) {
       bootThunks = thunks;
@@ -9551,7 +9599,12 @@ class MyProcessor : public Processor {
   unsigned codeImageSize;
   SignalHandler segFaultHandler;
   SignalHandler divideByZeroHandler;
-  FixedAllocator codeAllocator;
+  // Where all JIT code (and, while building a boot image, the image's
+  // code section) goes; see avian/system/code-memory.h.
+  CodeMemory* codeMemory;
+  // Registers published code with debuggers, or null; see
+  // avian/codegen/jit-debug.h.
+  avian::codegen::JitDebugInfo* jitDebug;
   ThunkCollection thunks;
   ThunkCollection bootThunks;
   unsigned callTableSize;
@@ -9592,12 +9645,18 @@ size_t stringOrNullSize(const char* str)
   return strlen(stringOrNull(str));
 }
 
+// Announces a newly published piece of code: to the JIT log, to
+// debuggers (see avian/codegen/jit-debug.h) and to compilation
+// handlers.  `class_` is null for thunks.  `prologueSize` and
+// `frameSize` describe its frame as in JitSymbol.
 void logCompile(MyThread* t,
                 const void* code,
                 unsigned size,
                 const char* class_,
                 const char* name,
-                const char* spec)
+                const char* spec,
+                unsigned prologueSize,
+                unsigned frameSize)
 {
   static bool open = false;
   if (not open) {
@@ -9632,9 +9691,44 @@ void logCompile(MyThread* t,
           stringOrNull(spec));
 
   MyProcessor* p = static_cast<MyProcessor*>(t->m->processor);
+
+  if (p->jitDebug) {
+    THREAD_RUNTIME_ARRAY(t, char, debugName, nameLength + 16);
+    if (class_) {
+      strcpy(RUNTIME_ARRAY_BODY(debugName), RUNTIME_ARRAY_BODY(completeName));
+    } else {
+      sprintf(RUNTIME_ARRAY_BODY(debugName), "avian_thunk_%s", name);
+    }
+
+    avian::codegen::JitSymbol symbol;
+    symbol.name = RUNTIME_ARRAY_BODY(debugName);
+    symbol.start = static_cast<const uint8_t*>(code);
+    symbol.size = size;
+    symbol.prologueSize = prologueSize;
+    symbol.frameSize = frameSize;
+    p->jitDebug->add(&symbol, 1);
+  }
+
   for (CompilationHandlerList* h = p->compilationHandlers; h; h = h->next) {
     h->handler->compiled(code, 0, 0, RUNTIME_ARRAY_BODY(completeName));
   }
+}
+
+// Distance in bytes from the stack pointer to the canonical frame
+// address once Assembler::allocateFrame(footprint) has run: the frame
+// itself plus the frame header (return address, and saved frame pointer
+// if used), whether the call pushed it (x86) or the prologue stored it
+// (ARM).
+unsigned frameSizeInBytes(MyThread* t, unsigned footprint)
+{
+  return (footprint + t->arch->frameHeaderSize()) * TargetBytesPerWord;
+}
+
+// The frame of the thunks that call into the VM (pushFrame with the
+// thread as the only argument).
+unsigned thunkFrameSize(MyThread* t)
+{
+  return frameSizeInBytes(t, t->arch->alignFrameSize(1));
 }
 
 void* compileMethod2(MyThread* t, void* ip)
@@ -9649,7 +9743,7 @@ void* compileMethod2(MyThread* t, void* ip)
 
   THREAD_RESOURCE0(t, static_cast<MyThread*>(t)->trace->targetMethod = 0);
 
-  compile(t, codeAllocator(t), 0, target);
+  compile(t, 0, target);
 
   uint8_t* updateIp = static_cast<uint8_t*>(ip);
 
@@ -9827,10 +9921,31 @@ GcArray* resizeTable(MyThread* t, GcArray* oldTable, unsigned newLength)
   return newTable;
 }
 
-GcArray* insertCallNode(MyThread* t,
-                        GcArray* table,
-                        unsigned* size,
-                        GcCallNode* node)
+// Returns `table`, or a larger copy of it, with room for `count` more
+// nodes than the `size` it holds, so that they can then be linked in
+// with linkCallNode, which cannot fail.  May allocate.
+GcArray* reserveCallTable(MyThread* t,
+                          GcArray* table,
+                          unsigned size,
+                          unsigned count)
+{
+  unsigned length = table->length();
+  while (size + count >= length * 2) {
+    length *= 2;
+  }
+
+  if (length != table->length()) {
+    table = resizeTable(t, table, length);
+  }
+
+  return table;
+}
+
+// Links `node` into `table`, which must have room for it (see
+// reserveCallTable).  Doesn't allocate, so it can't fail.  findCallNode
+// walks buckets without locking, so the node is complete before it
+// becomes reachable.
+void linkCallNode(MyThread* t, GcArray* table, unsigned* size, GcCallNode* node)
 {
   if (DebugCallTable) {
     fprintf(stderr,
@@ -9838,20 +9953,26 @@ GcArray* insertCallNode(MyThread* t,
             reinterpret_cast<void*>(node->address()));
   }
 
-  PROTECT(t, table);
-  PROTECT(t, node);
-
+  assertT(t, *size + 1 < table->length() * 2);
   ++(*size);
-
-  if (*size >= table->length() * 2) {
-    table = resizeTable(t, table, table->length() * 2);
-  }
 
   intptr_t key = node->address();
   unsigned index = static_cast<uintptr_t>(key) & (table->length() - 1);
 
   node->setNext(t, cast<GcCallNode>(t, table->body()[index]));
+  storeStoreMemoryBarrier();
   table->setBodyElement(t, index, node);
+}
+
+GcArray* insertCallNode(MyThread* t,
+                        GcArray* table,
+                        unsigned* size,
+                        GcCallNode* node)
+{
+  PROTECT(t, node);
+
+  table = reserveCallTable(t, table, *size, 1);
+  linkCallNode(t, table, size, node);
 
   return table;
 }
@@ -10234,6 +10355,112 @@ void boot(MyThread* t, BootImage* image, uint8_t* code)
   roots(t)->setBootstrapClassMap(t, map);
 }
 
+// Tells debuggers about the code of a boot image, in one object: every
+// method in the method tree, and the boot thunks.  Unlike JIT code, the
+// image doesn't record where each method's prologue ends, so the frame
+// is described as set up from the first instruction; a debugger stopped
+// inside a prologue may unwind that frame wrongly.
+void countMethods(MyThread* t, GcTreeNode* node, GcTreeNode* sentinal,
+                  unsigned* count)
+{
+  if (node != sentinal) {
+    ++(*count);
+    countMethods(t, node->left(), sentinal, count);
+    countMethods(t, node->right(), sentinal, count);
+  }
+}
+
+void describeMethods(MyThread* t,
+                     Zone* zone,
+                     GcTreeNode* node,
+                     GcTreeNode* sentinal,
+                     avian::codegen::JitSymbol* symbols,
+                     unsigned* index)
+{
+  if (node == sentinal) {
+    return;
+  }
+
+  GcMethod* method = cast<GcMethod>(t, node->value());
+  const char* class_ = reinterpret_cast<const char*>(
+      method->class_()->name()->body().begin());
+  const char* name
+      = reinterpret_cast<const char*>(method->name()->body().begin());
+  const char* spec
+      = reinterpret_cast<const char*>(method->spec()->body().begin());
+
+  size_t length = strlen(class_) + strlen(name) + strlen(spec) + 2;
+  char* fullName = static_cast<char*>(zone->allocate(length));
+  sprintf(fullName, "%s.%s%s", class_, name, spec);
+
+  avian::codegen::JitSymbol* s = symbols + (*index)++;
+  s->name = fullName;
+  s->start = reinterpret_cast<const uint8_t*>(methodCompiled(t, method));
+  s->size = methodCompiledSize(t, method);
+  s->prologueSize = 0;
+  s->frameSize = frameSizeInBytes(t, alignedFrameSize(t, method));
+
+  describeMethods(t, zone, node->left(), sentinal, symbols, index);
+  describeMethods(t, zone, node->right(), sentinal, symbols, index);
+}
+
+void registerBootImageCode(MyThread* t)
+{
+  MyProcessor* p = processor(t);
+  GcTreeNode* sentinal = compileRoots(t)->methodTreeSentinal();
+
+  unsigned methodCount = 0;
+  countMethods(t, compileRoots(t)->methodTree(), sentinal, &methodCount);
+
+  struct NamedThunk {
+    const char* name;
+    MyProcessor::Thunk* thunk;
+    bool framed;
+  } thunks[] = {{"avian_boot_thunk_default", &p->bootThunks.default_, true},
+                {"avian_boot_thunk_defaultVirtual",
+                 &p->bootThunks.defaultVirtual,
+                 true},
+                {"avian_boot_thunk_defaultDynamic",
+                 &p->bootThunks.defaultDynamic,
+                 true},
+                {"avian_boot_thunk_native", &p->bootThunks.native, true},
+                {"avian_boot_thunk_aioob", &p->bootThunks.aioob, true},
+                {"avian_boot_thunk_stackOverflow",
+                 &p->bootThunks.stackOverflow,
+                 true},
+                {"avian_boot_thunk_table", &p->bootThunks.table, false}};
+  const unsigned thunkCount = sizeof(thunks) / sizeof(thunks[0]);
+
+  Zone zone(t->m->heap, 64 * 1024);
+  avian::codegen::JitSymbol* symbols
+      = static_cast<avian::codegen::JitSymbol*>(zone.allocate(
+          sizeof(avian::codegen::JitSymbol) * (methodCount + thunkCount)));
+
+  unsigned count = 0;
+  describeMethods(
+      t, &zone, compileRoots(t)->methodTree(), sentinal, symbols, &count);
+
+  for (unsigned i = 0; i < thunkCount; ++i) {
+    MyProcessor::Thunk* thunk = thunks[i].thunk;
+    if (thunk->start == 0) {
+      continue;
+    }
+
+    avian::codegen::JitSymbol* s = symbols + count++;
+    s->name = thunks[i].name;
+    s->start = thunk->start;
+    s->size = thunks[i].framed ? thunk->length
+                               : thunk->length * ThunkCount;
+    // The frame is pushed right after the thread's state is saved.
+    s->prologueSize = thunks[i].framed ? thunk->frameSavedOffset : 0;
+    s->frameSize = thunks[i].framed ? thunkFrameSize(t) : 0;
+  }
+
+  p->jitDebug->add(symbols, count);
+
+  zone.dispose();
+}
+
 intptr_t getThunk(MyThread* t, Thunk thunk)
 {
   MyProcessor* p = processor(t);
@@ -10243,12 +10470,38 @@ intptr_t getThunk(MyThread* t, Thunk thunk)
 }
 
 #ifndef AVIAN_AOT_ONLY
-void insertCallNode(MyThread* t, GcCallNode* node)
+// Makes sure the call table can take `count` more nodes without growing,
+// so that publishCallNodes can't fail.  May allocate.  The caller must
+// hold classLock until it has published them.
+void reserveCallNodes(MyThread* t, unsigned count)
 {
-  GcArray* newArray = insertCallNode(
-      t, compileRoots(t)->callTable(), &(processor(t)->callTableSize), node);
-  // sequence point, for gc (don't recombine statements)
-  compileRoots(t)->setCallTable(t, newArray);
+  GcArray* table = reserveCallTable(
+      t, compileRoots(t)->callTable(), processor(t)->callTableSize, count);
+
+  if (table != compileRoots(t)->callTable()) {
+    // The copy holds exactly the same nodes; make it complete before
+    // readers (see findCallNode) can see it.
+    storeStoreMemoryBarrier();
+    compileRoots(t)->setCallTable(t, table);
+  }
+}
+
+// Links the call nodes of a compiled method into the call table.  The
+// room must have been reserved with reserveCallNodes; this doesn't
+// allocate, so it can't fail.
+void publishCallNodes(MyThread* t, Context* context)
+{
+  GcArray* table = compileRoots(t)->callTable();
+  unsigned* size = &(processor(t)->callTableSize);
+
+  for (GcCallNode* node = context->callNodes; node;) {
+    GcCallNode* next = node->next();
+    linkCallNode(t, table, size, node);
+    node = next;
+  }
+
+  context->callNodes = 0;
+  context->callNodeCount = 0;
 }
 
 BootImage::Thunk thunkToThunk(const MyProcessor::Thunk& thunk, uint8_t* base)
@@ -10286,7 +10539,6 @@ void compileCall(MyThread* t, Context* c, ThunkIndex index, bool call = true)
 }
 
 void compileDefaultThunk(MyThread* t,
-                         FixedAllocator* allocator,
                          MyProcessor::Thunk* thunk,
                          const char* name,
                          ThunkIndex thunkIndex,
@@ -10332,6 +10584,7 @@ void compileDefaultThunk(MyThread* t,
 
   lir::RegisterPair thread(t->arch->thread());
   a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+  const unsigned prologueSize = a->length();
 
   compileCall(t, &context, thunkIndex);
 
@@ -10344,10 +10597,10 @@ void compileDefaultThunk(MyThread* t,
   thunk->length = a->endBlock(false)->resolve(0, 0);
 
   thunk->start = finish(
-      t, allocator, a, name, thunk->length);
+      t, &context, a, name, thunk->length, prologueSize, thunkFrameSize(t));
 }
 
-void compileThunks(MyThread* t, FixedAllocator* allocator)
+void compileThunks(MyThread* t)
 {
   MyProcessor* p = processor(t);
 
@@ -10361,6 +10614,7 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
 
     lir::RegisterPair thread(t->arch->thread());
     a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+    const unsigned prologueSize = a->length();
 
     compileCall(t, &context, compileMethodIndex);
 
@@ -10373,15 +10627,21 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
     p->thunks.default_.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.default_.start
-        = finish(t, allocator, a, "default", p->thunks.default_.length);
+        = finish(t,
+                 &context,
+                 a,
+                 "default",
+                 p->thunks.default_.length,
+                 prologueSize,
+                 thunkFrameSize(t));
   }
 
   compileDefaultThunk
-    (t, allocator, &(p->thunks.defaultVirtual), "defaultVirtual",
+    (t, &(p->thunks.defaultVirtual), "defaultVirtual",
      compileVirtualMethodIndex, true);
 
   compileDefaultThunk
-    (t, allocator, &(p->thunks.defaultDynamic), "defaultDynamic",
+    (t, &(p->thunks.defaultDynamic), "defaultDynamic",
      linkDynamicMethodIndex, false);
 
   {
@@ -10394,6 +10654,7 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
 
     lir::RegisterPair thread(t->arch->thread());
     a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+    const unsigned prologueSize = a->length();
 
     compileCall(t, &context, invokeNativeIndex);
 
@@ -10403,7 +10664,13 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
     p->thunks.native.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.native.start
-        = finish(t, allocator, a, "native", p->thunks.native.length);
+        = finish(t,
+                 &context,
+                 a,
+                 "native",
+                 p->thunks.native.length,
+                 prologueSize,
+                 thunkFrameSize(t));
   }
 
   {
@@ -10416,13 +10683,20 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
 
     lir::RegisterPair thread(t->arch->thread());
     a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+    const unsigned prologueSize = a->length();
 
     compileCall(t, &context, throwArrayIndexOutOfBoundsIndex);
 
     p->thunks.aioob.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.aioob.start
-        = finish(t, allocator, a, "aioob", p->thunks.aioob.length);
+        = finish(t,
+                 &context,
+                 a,
+                 "aioob",
+                 p->thunks.aioob.length,
+                 prologueSize,
+                 thunkFrameSize(t));
   }
 
   {
@@ -10435,13 +10709,19 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
 
     lir::RegisterPair thread(t->arch->thread());
     a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+    const unsigned prologueSize = a->length();
 
     compileCall(t, &context, throwStackOverflowIndex);
 
     p->thunks.stackOverflow.length = a->endBlock(false)->resolve(0, 0);
 
-    p->thunks.stackOverflow.start = finish(
-        t, allocator, a, "stackOverflow", p->thunks.stackOverflow.length);
+    p->thunks.stackOverflow.start = finish(t,
+                                           &context,
+                                           a,
+                                           "stackOverflow",
+                                           p->thunks.stackOverflow.length,
+                                           prologueSize,
+                                           thunkFrameSize(t));
   }
 
   {
@@ -10457,8 +10737,8 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
 
       p->thunks.table.length = a->endBlock(false)->resolve(0, 0);
 
-      p->thunks.table.start = static_cast<uint8_t*>(allocator->allocate(
-          p->thunks.table.length * ThunkCount, TargetBytesPerWord));
+      p->thunks.table.start
+          = allocateCode(t, p->thunks.table.length * ThunkCount);
     }
 
     uint8_t* start = p->thunks.table.start;
@@ -10474,13 +10754,10 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
                                                                             \
     compileCall(t, &context, s##Index, false);                              \
                                                                             \
-    expect(t, a->endBlock(false)->resolve(0, 0) <= p->thunks.table.length); \
+    unsigned length = a->endBlock(false)->resolve(0, 0);                    \
+    expect(t, length <= p->thunks.table.length);                            \
                                                                             \
-    a->setDestination(start);                                               \
-    {                                                                       \
-      Memory::JitWriteScope scope;                                          \
-      a->write();                                                           \
-    }                                                                       \
+    emitCode(t, &context.zone, a, start, length);                           \
                                                                             \
     logCompile(t, start, p->thunks.table.length, 0, #s, 0);                 \
                                                                             \
@@ -10493,7 +10770,7 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
   BootImage* image = p->bootImage;
 
   if (image) {
-    uint8_t* imageBase = p->codeAllocator.memory.begin();
+    uint8_t* imageBase = p->codeMemory->region().begin();
 
     image->thunks.default_ = thunkToThunk(p->thunks.default_, imageBase);
     image->thunks.defaultVirtual
@@ -10582,14 +10859,9 @@ uintptr_t compileVirtualThunk(MyThread* t,
 
   *size = a->endBlock(false)->resolve(0, 0);
 
-  uint8_t* start = static_cast<uint8_t*>(
-      codeAllocator(t)->allocate(*size, TargetBytesPerWord));
+  uint8_t* start = allocateCode(t, *size);
 
-  a->setDestination(start);
-  {
-    Memory::JitWriteScope scope;
-    a->write();
-  }
+  emitCode(t, &context.zone, a, start, *size);
 
   const size_t virtualThunkBaseNameLength = strlen(baseName);
   const size_t maxIntStringLength = 10;
@@ -10616,7 +10888,9 @@ uintptr_t virtualThunk(MyThread* t, unsigned index)
   GcWordArray* oldArray = compileRoots(t)->virtualThunks();
   if (oldArray == 0 or oldArray->length() <= index * 2) {
     GcWordArray* newArray = makeWordArray(t, nextPowerOfTwo((index + 1) * 2));
-    if (compileRoots(t)->virtualThunks()) {
+    // makeWordArray may have collected and moved the old array.
+    oldArray = compileRoots(t)->virtualThunks();
+    if (oldArray) {
       memcpy(newArray->body().begin(),
              oldArray->body().begin(),
              oldArray->length() * BytesPerWord);
@@ -10635,10 +10909,19 @@ uintptr_t virtualThunk(MyThread* t, unsigned index)
   return oldArray->body()[index * 2];
 }
 
-void compile(MyThread* t,
-             FixedAllocator* allocator UNUSED,
-             BootContext* bootContext,
-             GcMethod* method)
+void publishObjectPool(MyThread* t, Context* context)
+{
+  GcArray* pool = context->objectPoolArray;
+  if (pool) {
+    // Link the pool into the root list; this doesn't allocate, so it
+    // can't fail once the method itself has been published.
+    setField(t, pool, ArrayBody, compileRoots(t)->objectPools());
+    compileRoots(t)->setObjectPools(t, pool);
+    context->objectPoolArray = 0;
+  }
+}
+
+void compile(MyThread* t, BootContext* bootContext, GcMethod* method)
 {
   PROTECT(t, method);
 
@@ -10700,7 +10983,17 @@ void compile(MyThread* t,
     return;
   }
 
-  finish(t, allocator, &context);
+  finish(t, &context);
+
+  // Publication.  Everything up to the commit point below may allocate
+  // and therefore fail (collect, throw OutOfMemoryError); none of it is
+  // visible to other threads or to the rest of the VM.  If it fails,
+  // the context gives the code space back and the object pool and call
+  // nodes, never having been linked anywhere, are simply collected.
+  // From the commit point on nothing allocates, so the method is either
+  // published completely or not at all.
+
+  reserveCallNodes(t, context.callNodeCount);
 
   if (DebugMethodTree) {
     fprintf(stderr,
@@ -10725,7 +11018,13 @@ void compile(MyThread* t,
                                    clone,
                                    compileRoots(t)->methodTreeSentinal(),
                                    compareIpToMethodBounds);
-  // sequence point, for gc (don't recombine statements)
+
+  // ---- commit point: nothing below may allocate or throw ----
+
+  // Call nodes first: findCallNode must see them by the time any thread
+  // can be executing the method (see its loadMemoryBarrier).
+  publishCallNodes(t, &context);
+
   compileRoots(t)->setMethodTree(t, newTree);
 
   storeStoreMemoryBarrier();
@@ -10737,10 +11036,10 @@ void compile(MyThread* t,
         = reinterpret_cast<void*>(methodCompiled(t, clone));
   }
 
-  // we've compiled the method and inserted it into the tree without
-  // error, so we ensure that the executable area not be deallocated
-  // when we dispose of the context:
-  context.executableAllocator = 0;
+  // The method's object pool now belongs to the VM, and its code space
+  // must survive the context.
+  publishObjectPool(t, &context);
+  context.executableMemory = 0;
 
   treeUpdate(t,
              compileRoots(t)->methodTree(),
@@ -10748,6 +11047,20 @@ void compile(MyThread* t,
              method,
              compileRoots(t)->methodTreeSentinal(),
              compareIpToMethodBounds);
+
+  // ---- published ----
+
+  // Tell the JIT log and compilation handlers only now that the method
+  // really exists.
+  logCompile(t,
+             reinterpret_cast<const void*>(methodCompiled(t, clone)),
+             methodCompiledSize(t, clone),
+             reinterpret_cast<const char*>(
+                 clone->class_()->name()->body().begin()),
+             reinterpret_cast<const char*>(clone->name()->body().begin()),
+             reinterpret_cast<const char*>(clone->spec()->body().begin()),
+             context.compiler->prologueSize(),
+             frameSizeInBytes(t, alignedFrameSize(t, clone)));
 #endif // not AVIAN_AOT_ONLY
 }
 
@@ -10756,9 +11069,9 @@ GcCompileRoots* compileRoots(Thread* t)
   return processor(static_cast<MyThread*>(t))->roots;
 }
 
-avian::util::FixedAllocator* codeAllocator(MyThread* t)
+CodeMemory* codeMemory(MyThread* t)
 {
-  return &(processor(t)->codeAllocator);
+  return processor(t)->codeMemory;
 }
 
 Allocator* allocator(MyThread* t)

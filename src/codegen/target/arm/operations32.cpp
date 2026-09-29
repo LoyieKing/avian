@@ -1232,7 +1232,10 @@ void branchLong(Context* con,
   }
 
   if (next) {
+    // Patches the assembler's own (position independent) scratch code,
+    // so the instruction's buffer and link addresses coincide.
     updateOffset(con->s,
+                 con->code.data.begin() + next,
                  con->code.data.begin() + next,
                  reinterpret_cast<intptr_t>(con->code.data.begin()
                                             + con->code.length()));

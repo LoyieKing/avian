@@ -36,21 +36,34 @@ jobs:
             os: macos-26
             java-arch: aarch64
             make-args: platform=macosx arch=arm64 process=interpret mode=debug
-          # Linux x86_64 regression check (JIT write hooks are no-ops here).
+          # Boot image: code generated ahead of time into a plain buffer
+          # (CodeMemory "image" backend), plus JIT at run time.
+          - name: macos-26-arm64 (compile, fast, bootimage)
+            os: macos-26
+            java-arch: aarch64
+            make-args: platform=macosx arch=arm64 process=compile mode=fast bootimage=true
+          # Linux x86_64.  The default code memory backend there is the
+          # dual-mapped W^X one; the fast build runs on the RWX fallback
+          # so both stay covered.
           - name: linux-x86_64 (compile, debug)
             os: ubuntu-24.04
             java-arch: x64
             make-args: platform=linux arch=x86_64 process=compile mode=debug
-          - name: linux-x86_64 (compile, fast)
+          - name: linux-x86_64 (compile, fast, rwx)
             os: ubuntu-24.04
             java-arch: x64
             make-args: platform=linux arch=x86_64 process=compile mode=fast
+            code-memory: rwx
+          - name: linux-x86_64 (compile, debug, bootimage)
+            os: ubuntu-24.04
+            java-arch: x64
+            make-args: platform=linux arch=x86_64 process=compile mode=debug bootimage=true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 8
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: zulu
           java-version: '8'
@@ -84,6 +97,9 @@ jobs:
           done
 
       - name: Test
+        env:
+          # Empty means the platform default (see code-memory.h).
+          AVIAN_CODE_MEMORY: ${{ matrix.code-memory }}
         run: make ${{ matrix.make-args }} run-test
 
       - name: Show failed test output
@@ -95,7 +111,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-logs-${{ strategy.job-index }}
           path: build/*/log.txt

@@ -127,6 +127,9 @@ class Context {
   unsigned localFootprint;
   unsigned machineCodeSize;
   unsigned alignedFrameSize;
+  // Where the prologue ends, i.e. the frame is fully set up (see
+  // Compiler::prologueSize).
+  Promise* prologueEnd;
   unsigned availableGeneralRegisterCount;
   ir::TargetInfo targetInfo;
 };

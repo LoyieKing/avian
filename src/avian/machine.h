@@ -1013,8 +1013,7 @@ class Machine {
  public:
   enum AllocationType {
     MovableAllocation,
-    FixedAllocation,
-    ImmortalAllocation
+    FixedAllocation
   };
 
   Machine(System* system,
@@ -1635,7 +1634,6 @@ inline bool ensure(Thread* t, unsigned sizeInBytes)
 object allocate2(Thread* t, unsigned sizeInBytes, bool objectMask);
 
 object allocate3(Thread* t,
-                 Alloc* allocator,
                  Machine::AllocationType type,
                  unsigned sizeInBytes,
                  bool objectMask);

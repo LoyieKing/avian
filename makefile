@@ -1281,6 +1281,7 @@ vm-depends := $(generated-code) \
 vm-sources = \
 	$(src)/system/$(system).cpp \
 	$(wildcard $(src)/system/$(system)/*.cpp) \
+	$(src)/system/code-memory.cpp \
 	$(src)/finder.cpp \
 	$(src)/machine.cpp \
 	$(src)/util.cpp \
@@ -1308,6 +1309,7 @@ embed-objects = $(call cpp-objects,$(embed-sources),$(src),$(build-embed))
 compiler-sources = \
 	$(src)/codegen/compiler.cpp \
 	$(wildcard $(src)/codegen/compiler/*.cpp) \
+	$(src)/codegen/jit-debug.cpp \
 	$(src)/debug-util.cpp \
 	$(src)/codegen/runtime.cpp \
 	$(src)/codegen/targets.cpp \
@@ -1417,6 +1419,7 @@ generator-sources = \
 	$(src)/tools/type-generator/main.cpp \
 	$(src)/system/$(build-system).cpp \
 	$(wildcard $(src)/system/$(build-system)/*.cpp) \
+	$(src)/system/code-memory.cpp \
 	$(src)/finder.cpp \
 	$(src)/util/arg-parser.cpp
 

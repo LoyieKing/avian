@@ -221,6 +221,118 @@ There's also a win64 repository for 64-bit builds:
       $ git clone git@github.com:ReadyTalk/win64.git
 
 
+JIT Code Memory
+---------------
+
+With `process=compile`, generated machine code lives in a region owned by
+`CodeMemory` (`include/avian/system/code-memory.h`), the only code in the
+VM that writes to executable memory.  Code is assembled into ordinary
+memory, linked against its final address, and then committed; call sites
+are later retargeted through the same interface.  How the region is made
+writable depends on the platform:
+
+  * macOS: a `MAP_JIT` mapping.  On Apple silicon it is switched between
+writable and executable per thread (`pthread_jit_write_protect_np`)
+inside the commit and patch operations only.  The `avian` executable must
+be signed with the `com.apple.security.cs.allow-jit` entitlement (the
+makefile does this).
+  * Linux: one memfd mapped twice, read+execute where the code runs and
+read+write where it is written, so no page is ever writable and
+executable at once.  If that isn't possible (no `memfd_create`,
+`vm.memfd_noexec=2`, restrictive security policy) the VM silently falls
+back to a single read/write/execute mapping.
+  * Elsewhere: a single read/write/execute mapping.
+
+The environment variable `AVIAN_CODE_MEMORY` forces a backend: `rwx`
+everywhere, `dual-map` on Linux, `map-jit` on macOS.
+
+**Debugging generated code on Linux:** debuggers set software
+breakpoints by writing an instruction into the target with `ptrace`, and
+the kernel refuses such a write to the dual-mapped executable view
+(`EFAULT`: it is a shared mapping that isn't writable, so there is no
+copy-on-write fallback).  Nothing is corrupted, but the breakpoint is not
+planted.  gdb reports this as
+`Cannot insert breakpoint N. Cannot access memory at address 0x...` for
+an address outside any known object; for an address inside a registered
+JIT method (see "Debugging JIT code" below) it instead shows the
+breakpoint as `<PENDING>` in `info breakpoints` without an error, and it
+never triggers.  So:
+
+  * If the VM is started under a debugger (`gdb --args avian ...`,
+`lldb -- avian ...`), it notices (`TracerPid` in `/proc/self/status`),
+prints `avian: debugger detected; using rwx code memory ...` and uses the
+read/write/execute backend, where software breakpoints work normally.
+  * If a debugger attaches later, use hardware breakpoints (`hbreak` in
+gdb, `breakpoint set -H` in lldb; a few are available), or restart the
+VM under the debugger or with `AVIAN_CODE_MEMORY=rwx`.
+  * `AVIAN_CODE_MEMORY` always takes precedence over the automatic choice.
+
+Breakpoints in the VM itself are not affected.
+
+Debugging JIT code
+------------------
+
+With `process=compile` the VM describes the code it generates to native
+debuggers through the standard GDB JIT interface
+(`__jit_debug_register_code` / `__jit_debug_descriptor`).  Each time a
+method or thunk is published it registers a small in-memory ELF object
+containing a symbol for it, named `Class.method(signature)` (for
+example `java/lang/String.valueOf(I)Ljava/lang/String;`) or
+`avian_thunk_<name>`, plus an `.eh_frame` describing its frame so that
+backtraces continue through Java frames into the VM and back.  Code
+loaded from a boot image is registered in one batch at startup.
+
+gdb supports this out of the box:
+
+    $ gdb --args build/linux-x86_64-debug/avian -cp classes Hello
+    (gdb) break 'Hello.greet(Ljava/lang/String;)V'   # quotes required
+    (gdb) run
+    (gdb) bt
+    #0  0x... in Hello.greet(Ljava/lang/String;)V ()
+    #1  0x... in Hello.main([Ljava/lang/String;)V ()
+    #2  0x... in vmInvoke ()
+    #3  0x... in (anonymous namespace)::local::invoke (...) at src/compile.cpp:...
+    (gdb) info symbol $pc
+    Hello.greet(Ljava/lang/String;)V in section .text of <in-memory@0x...>
+
+Breakpoints on methods that haven't been compiled yet are pending and
+resolve when the method is compiled.  When attaching to a running VM on
+Linux, use `hbreak` instead of `break` (see "Debugging generated code on
+Linux" above).
+
+lldb supports the same interface through its `jit-loader.gdb` plugin.
+It is enabled by default on Linux; on macOS it must be turned on (before
+`run` or attaching):
+
+    (lldb) settings set plugin.jit-loader.gdb.enable on
+    (lldb) breakpoint set -n 'Hello.greet(Ljava/lang/String;)V'
+    (lldb) run
+    (lldb) bt
+
+Registration is controlled by `AVIAN_JIT_DEBUG_INFO`: `1` turns it on,
+`0` off.  If unset, it is on in debug builds (`mode=debug`) and whenever
+a debugger is already attached when the VM starts, and off otherwise.
+Registration costs a few hundred bytes plus the name per compiled
+method and, only while a debugger is attached, a debugger stop per
+registration (roughly 0.5 ms each under gdb), which production runs
+shouldn't pay; set `AVIAN_JIT_DEBUG_INFO=1` to debug a release build
+you intend to attach to later.
+
+Limitations:
+
+  * There are no line tables or variable locations, only symbols and
+frame (unwind) information.  Epilogues aren't described, so a backtrace
+taken on a method's final instructions may be wrong.
+  * Boot-image methods are described as if their frame were set up from
+the first instruction, so a backtrace stopped inside the prologue of a
+boot-image method is wrong; stopping at the entry of a method compiled
+at run time is fine.  In boot-image builds those methods also appear a
+second time under the executable's own static symbols.
+  * Code is registered until the VM shuts down (compiled code is never
+freed once published).
+  * `__jit_debug_register_code` is a process-global symbol, so an
+embedding that also links another JIT defining it will see a clash.
+
 Building with the Microsoft Visual C++ Compiler
 -----------------------------------------------
 

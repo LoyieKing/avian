@@ -258,11 +258,6 @@ inline void loadMemoryBarrier()
   programOrderMemoryBarrier();
 }
 
-inline void syncInstructionCache(const void*, unsigned)
-{
-  programOrderMemoryBarrier();
-}
-
 #ifdef USE_ATOMIC_OPERATIONS
 inline bool atomicCompareAndSwap32(uint32_t* p, uint32_t old, uint32_t new_)
 {

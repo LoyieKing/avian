@@ -28,6 +28,37 @@ namespace codegen {
 
 class Assembler;
 
+// A store that retargets live code, e.g. a call site being pointed at
+// a freshly compiled method.  An Architecture computes it from the live
+// code (see Architecture::callPatch) but never performs it: applying it
+// is the job of the owner of code memory (avian::system::CodeMemory),
+// which knows how to make executable memory writable and how to make
+// the result visible to other threads' instruction fetch.
+class CodePatch {
+ public:
+  static const unsigned MaxSize = 8;
+
+  CodePatch() : address(0), size(0)
+  {
+  }
+
+  CodePatch(void* address, const void* src, unsigned size)
+      : address(address), size(size)
+  {
+    for (unsigned i = 0; i < size; ++i) {
+      bytes[i] = static_cast<const uint8_t*>(src)[i];
+    }
+  }
+
+  // Where the bytes go.
+  void* address;
+  // 4 or 8.  For call sites emitted as lir::Aligned* the store is
+  // naturally aligned, so it can be done atomically with respect to
+  // other threads executing the code.
+  unsigned size;
+  uint8_t bytes[MaxSize];
+};
+
 class OperandMask {
  public:
   uint8_t typeMask;
@@ -91,11 +122,12 @@ class Architecture {
 
   virtual bool matchCall(void* returnAddress, void* target) = 0;
 
-  virtual void updateCall(lir::UnaryOperation op,
-                          void* returnAddress,
-                          void* newTarget) = 0;
-
-  virtual void setConstant(void* dst, uint64_t constant) = 0;
+  // Describes the store that makes the call or jump `op` which returns
+  // to `returnAddress` go to `newTarget` instead.  This only reads the
+  // live code; it is up to the caller to apply the patch.
+  virtual CodePatch callPatch(lir::UnaryOperation op,
+                              void* returnAddress,
+                              void* newTarget) = 0;
 
   virtual unsigned alignFrameSize(unsigned sizeInWords) = 0;
 

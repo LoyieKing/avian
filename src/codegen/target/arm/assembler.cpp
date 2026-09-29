@@ -10,7 +10,6 @@
 
 #include <avian/util/runtime-array.h>
 
-#include <avian/arch.h>
 #include <avian/codegen/assembler.h>
 #include <avian/codegen/architecture.h>
 #include <avian/codegen/registers.h>
@@ -306,24 +305,30 @@ class MyArchitecture : public Architecture {
                                   - reinterpret_cast<uint8_t*>(instruction)));
   }
 
-  virtual void updateCall(lir::UnaryOperation op UNUSED,
-                          void* returnAddress,
-                          void* newTarget)
+  virtual CodePatch callPatch(lir::UnaryOperation op,
+                              void* returnAddress,
+                              void* newTarget)
   {
     switch (op) {
     case lir::Call:
     case lir::Jump:
     case lir::AlignedCall:
     case lir::AlignedJump: {
-      updateOffset(con.s,
-                   static_cast<uint8_t*>(returnAddress) - 4,
-                   reinterpret_cast<intptr_t>(newTarget));
-    } break;
+      uint8_t* instruction = static_cast<uint8_t*>(returnAddress) - 4;
+      uint32_t word = retargetBranch(
+          con.s,
+          *reinterpret_cast<uint32_t*>(instruction),
+          instruction,
+          reinterpret_cast<intptr_t>(newTarget));
+      return CodePatch(instruction, &word, 4);
+    }
 
     case lir::LongCall:
     case lir::LongJump:
     case lir::AlignedLongCall:
     case lir::AlignedLongJump: {
+      // The target lives in the constant pool entry the call loads it
+      // from; the instruction itself doesn't change.
       uint32_t* p = static_cast<uint32_t*>(returnAddress) - 2;
       void** targetSlot;
       if (TargetBytesPerWord == 8) {
@@ -334,23 +339,12 @@ class MyArchitecture : public Architecture {
             = reinterpret_cast<void**>(p + (((*p & PoolOffsetMask) + 8) / 4));
       }
 
-      *targetSlot = newTarget;
-      syncInstructionCache(targetSlot, sizeof(*targetSlot));
-    } break;
+      return CodePatch(targetSlot, &newTarget, TargetBytesPerWord);
+    }
 
     default:
       abort(&con);
     }
-  }
-
-  virtual unsigned constantCallSize()
-  {
-    return 4;
-  }
-
-  virtual void setConstant(void* dst, uint64_t constant)
-  {
-    *static_cast<target_uintptr_t*>(dst) = constant;
   }
 
   virtual unsigned alignFrameSize(unsigned sizeInWords)
@@ -984,14 +978,12 @@ class MyAssembler : public Assembler {
     }
   }
 
-  virtual void setDestination(uint8_t* dst)
+  virtual void write(uint8_t* buffer, uint8_t* address)
   {
-    con.result = dst;
-  }
+    con.buffer = buffer;
+    con.address = address;
 
-  virtual void write()
-  {
-    uint8_t* dst = con.result;
+    uint8_t* dst = buffer;
     unsigned dstOffset = 0;
     for (MyBlock* b = con.firstBlock; b; b = b->next) {
       if (DebugPool) {
@@ -1023,7 +1015,8 @@ class MyAssembler : public Assembler {
             entry += TargetBytesPerWord;
           }
 
-          o->entry->address = dst + entry;
+          o->entry->address = address + entry;
+          o->entry->slot = dst + entry;
 
           unsigned instruction = o->block->start + padding(o->block, o->offset)
                                  + o->offset;
@@ -1072,13 +1065,14 @@ class MyAssembler : public Assembler {
 
     for (ConstantPoolEntry* e = con.constantPool; e; e = e->next) {
       if (e->constant->resolved()) {
-        *static_cast<target_uintptr_t*>(e->address) = e->constant->value();
+        *static_cast<target_uintptr_t*>(e->slot) = e->constant->value();
       } else {
         new (e->constant->listen(sizeof(ConstantPoolListener)))
             ConstantPoolListener(
                 con.s,
-                static_cast<target_uintptr_t*>(e->address),
-                e->callOffset ? dst + e->callOffset->value() + 8 : 0);
+                static_cast<target_uintptr_t*>(e->slot),
+                e->address,
+                e->callOffset ? address + e->callOffset->value() + 8 : 0);
       }
       if (false) {
         fprintf(stderr,
@@ -1087,6 +1081,9 @@ class MyAssembler : public Assembler {
                 e->address);
       }
     }
+
+    con.buffer = 0;
+    con.address = 0;
   }
 
   virtual Promise* offset(bool forTrace)

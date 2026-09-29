@@ -15,8 +15,6 @@
 
 #include <avian/util/math.h>
 
-#include "avian/system/memory.h"
-
 using namespace vm;
 using namespace avian::util;
 
@@ -547,8 +545,8 @@ class Fixie {
   static const unsigned Dirty = 1 << 2;
   static const unsigned Dead = 1 << 3;
 
-  Fixie(Context* c, unsigned size, bool hasMask, Fixie** handle, bool immortal)
-      : age(immortal ? FixieTenureThreshold + 1 : 0),
+  Fixie(Context* c, unsigned size, bool hasMask, Fixie** handle)
+      : age(0),
         flags(hasMask ? HasMask : 0),
         size(size),
         next(0),
@@ -561,9 +559,10 @@ class Fixie {
     }
   }
 
+  // See ImmortalFixieAge: only boot image fixed objects are immortal.
   bool immortal()
   {
-    return age == FixieTenureThreshold + 1;
+    return age == ImmortalFixieAge;
   }
 
   void add(Context* c UNUSED, Fixie** handle)
@@ -1932,24 +1931,6 @@ void free_(Context* c, const void* p, size_t size)
   free(c, p, size);
 }
 
-// Immortal fixies (the per-method object pools allocated by
-// compile.cpp's finish() via Machine::ImmortalAllocation) live in the
-// JIT code area, which on Darwin/arm64 is MAP_JIT memory that is
-// either writable or executable per thread, never both.  Fixie
-// headers, masks and bodies are all written by the heap, and because
-// immortal and ordinary fixies share the same intrusive lists
-// (tenuredFixies, dirtyTenuredFixies, ...) even list surgery on an
-// ordinary fixie can write into an immortal neighbour's next/handle
-// field.  Rather than toggling per fixie, every public Heap entry point
-// that may touch fixie state opens one JitWriteScope for its whole
-// duration (see collect(), mark(), allocateFixed() and disposeFixies()).
-// The scope is thread-local and nestable, and a no-op on platforms
-// without MAP_JIT.  While it is open this thread must not execute JIT
-// code; nothing reachable from these entry points does (in particular
-// Heap::Client callbacks only visit/walk/copy objects, and finalizers
-// run after Heap::collect() returns, see doCollect() in machine.cpp).
-typedef avian::system::Memory::JitWriteScope FixieWriteScope;
-
 class MyHeap : public Heap {
  public:
   MyHeap(System* system, unsigned limit) : c(system, limit)
@@ -2006,7 +1987,6 @@ class MyHeap : public Heap {
     c.incomingFootprint = incomingFootprint;
     c.pendingAllocation = pendingAllocation;
 
-    FixieWriteScope fixieWriteScope;
     local::collect(&c);
   }
 
@@ -2015,38 +1995,18 @@ class MyHeap : public Heap {
     return Fixie::totalSize(sizeInWords, objectMask);
   }
 
-  void* allocateFixed(Alloc* allocator,
-                      unsigned sizeInWords,
-                      bool objectMask,
-                      Fixie** handle,
-                      bool immortal)
+  virtual void* allocateFixed(unsigned sizeInWords, bool objectMask)
   {
     expect(&c, not limitExceeded());
 
     unsigned total = Fixie::totalSize(sizeInWords, objectMask);
-    void* p = allocator->allocate(total);
+    // Fixed objects are freed by the collector with free_(), so they
+    // must come from this heap.
+    void* p = local::allocate(&c, total);
 
     expect(&c, not limitExceeded());
 
-    FixieWriteScope fixieWriteScope;
-    Fixie* fixie = new (p) Fixie(&c, sizeInWords, objectMask, handle, immortal);
-
-    return fixie->body();
-  }
-
-  virtual void* allocateFixed(Alloc* allocator,
-                              unsigned sizeInWords,
-                              bool objectMask)
-  {
-    return allocateFixed(
-        allocator, sizeInWords, objectMask, &(c.fixies), false);
-  }
-
-  virtual void* allocateImmortalFixed(Alloc* allocator,
-                                      unsigned sizeInWords,
-                                      bool objectMask)
-  {
-    return allocateFixed(allocator, sizeInWords, objectMask, 0, true);
+    return (new (p) Fixie(&c, sizeInWords, objectMask, &(c.fixies)))->body();
   }
 
   bool needsMark(void* p)
@@ -2077,7 +2037,6 @@ class MyHeap : public Heap {
 #endif
 
       if (c.client->isFixed(p)) {
-        FixieWriteScope fixieWriteScope;
         Fixie* f = fixie(p);
         assertT(&c, offset == 0 or f->hasMask());
 
@@ -2202,7 +2161,6 @@ class MyHeap : public Heap {
 
   virtual void disposeFixies()
   {
-    FixieWriteScope fixieWriteScope;
     c.disposeFixies();
   }
 

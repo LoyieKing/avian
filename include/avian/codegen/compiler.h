@@ -181,9 +181,20 @@ class Compiler {
 
   virtual void compile(uintptr_t stackOverflowHandler,
                        unsigned stackLimitOffset) = 0;
-  virtual unsigned resolve(uint8_t* dst) = 0;
+  // Lays out the machine code and returns its size in bytes.  The
+  // constant pool (poolSize() bytes) follows the code, padded to a
+  // word boundary.  Layout does not depend on where the code will go.
+  virtual unsigned resolve() = 0;
   virtual unsigned poolSize() = 0;
-  virtual void write() = 0;
+  // Offset from the start of the code of the first instruction after
+  // the prologue, where the frame (alignedFrameSize words plus the
+  // architecture's frame header) is fully set up.  Valid after
+  // resolve().
+  virtual unsigned prologueSize() = 0;
+  // Emits the code and its constant pool into `buffer`, linked to run
+  // at `address`; see Assembler::write.  Promises for code addresses
+  // (e.g. machineIp) resolve relative to `address` from here on.
+  virtual void write(uint8_t* buffer, uint8_t* address) = 0;
 
   virtual void dispose() = 0;
 };

@@ -60,19 +60,28 @@ class OffsetPromise : public Promise {
 
 Promise* offsetPromise(Context* c);
 
+// Stores the 32-bit displacement from the end of the instruction at
+// `instructionAddress` (its link address) to `value` into the last four
+// bytes of the copy of that instruction at `instruction` (in the write
+// buffer).  Returns the link address of the end of the instruction.
 void* resolveOffset(vm::System* s,
                     uint8_t* instruction,
+                    uint8_t* instructionAddress,
                     unsigned instructionSize,
                     int64_t value);
 
 class OffsetListener : public Promise::Listener {
  public:
-  OffsetListener(vm::System* s, uint8_t* instruction, unsigned instructionSize);
+  OffsetListener(vm::System* s,
+                 uint8_t* instruction,
+                 uint8_t* instructionAddress,
+                 unsigned instructionSize);
 
   virtual bool resolve(int64_t value, void** location);
 
   vm::System* s;
   uint8_t* instruction;
+  uint8_t* instructionAddress;
   unsigned instructionSize;
 };
 
@@ -97,12 +106,17 @@ void appendOffsetTask(Context* c,
 
 class ImmediateListener : public Promise::Listener {
  public:
-  ImmediateListener(vm::System* s, void* dst, unsigned size, unsigned offset);
+  ImmediateListener(vm::System* s,
+                    void* dst,
+                    void* dstAddress,
+                    unsigned size,
+                    unsigned offset);
 
   virtual bool resolve(int64_t value, void** location);
 
   vm::System* s;
   void* dst;
+  void* dstAddress;
   unsigned size;
   unsigned offset;
 };
