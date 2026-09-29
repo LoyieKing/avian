@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon, macOS 26 (the release that forbids RWX pages and
+          # requires MAP_JIT + pthread_jit_write_protect_np).
+          - name: macos-26-arm64 (compile, debug)
+            os: macos-26
+            java-arch: aarch64
+            make-args: platform=macosx arch=arm64 process=compile mode=debug
+          - name: macos-26-arm64 (compile, fast)
+            os: macos-26
+            java-arch: aarch64
+            make-args: platform=macosx arch=arm64 process=compile mode=fast
+          - name: macos-26-arm64 (interpret, debug)
+            os: macos-26
+            java-arch: aarch64
+            make-args: platform=macosx arch=arm64 process=interpret mode=debug
+          # Linux x86_64 regression check (JIT write hooks are no-ops here).
+          - name: linux-x86_64 (compile, debug)
+            os: ubuntu-24.04
+            java-arch: x64
+            make-args: platform=linux arch=x86_64 process=compile mode=debug
+          - name: linux-x86_64 (compile, fast)
+            os: ubuntu-24.04
+            java-arch: x64
+            make-args: platform=linux arch=x86_64 process=compile mode=fast
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '8'
+          architecture: ${{ matrix.java-arch }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y zlib1g-dev
+
+      - name: Environment info
+        run: |
+          uname -a
+          if [ "$(uname -s)" = "Darwin" ]; then sw_vers; xcodebuild -version || true; fi
+          c++ --version
+          "$JAVA_HOME/bin/java" -version
+
+      - name: Build
+        run: |
+          if [ "$(uname -s)" = "Darwin" ]; then jobs=$(sysctl -n hw.ncpu); else jobs=$(nproc); fi
+          # `make test` runs build-test and run-test as independent
+          # prerequisites, which races under -j, so build first.
+          make -j"$jobs" ${{ matrix.make-args }} build-test
+
+      - name: Verify code signature (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          for f in build/macosx-arm64*/avian build/macosx-arm64*/avian-unittest; do
+            echo "== $f"; codesign -d --entitlements - "$f" || true
+          done
+
+      - name: Test
+        run: make ${{ matrix.make-args }} run-test
+
+      - name: Show failed test output
+        if: failure()
+        run: |
+          for f in build/*/log.txt; do
+            echo "===== $f"; cat "$f"
+          done
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ strategy.job-index }}
+          path: build/*/log.txt
+          if-no-files-found: ignore
