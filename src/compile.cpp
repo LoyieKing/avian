@@ -958,6 +958,7 @@ class Context {
     virtual void visit(Heap::Visitor* v)
     {
       v->visit(&(c->method));
+      v->visit(&(c->objectPoolArray));
 
       for (PoolElement* p = c->objectPool; p; p = p->next) {
         v->visit(&(p->target));
@@ -1172,6 +1173,7 @@ class Context {
         method(method),
         bootContext(bootContext),
         objectPool(0),
+        objectPoolArray(0),
         subroutineCount(0),
         traceLog(0),
         visitTable(
@@ -1205,6 +1207,7 @@ class Context {
         method(0),
         bootContext(0),
         objectPool(0),
+        objectPoolArray(0),
         subroutineCount(0),
         traceLog(0),
         visitTable(0, 0),
@@ -1267,6 +1270,9 @@ class Context {
   GcMethod* method;
   BootContext* bootContext;
   PoolElement* objectPool;
+  // The materialized pool for objectPool (see makeObjectPool); owned by
+  // this context until publishObjectPool hands it to the VM.
+  GcArray* objectPoolArray;
   unsigned subroutineCount;
   TraceElement* traceLog;
   Slice<uint16_t> visitTable;
@@ -7142,9 +7148,41 @@ GcIntArray* makeSimpleFrameMapTable(MyThread* t,
 
 void insertCallNode(MyThread* t, GcCallNode* node);
 
+GcArray* makeObjectPool(MyThread* t, Context* context)
+{
+  // The pool is referenced by absolute address from the compiled code
+  // (see Frame::append), so it must never move: allocate it as a fixed
+  // object.  It lives in ordinary heap memory, not in the executable
+  // area, so the collector never has to write to code memory.
+  //
+  // Element 0 links the pool into compileRoots()->objectPools, which is
+  // what keeps it (and everything it references) alive once the method
+  // has been published; until then the Context's protector does.  See
+  // publishObjectPool.
+  const unsigned length = context->objectPoolCount + 1;
+  GcArray* pool = reinterpret_cast<GcArray*>(
+      allocate3(t,
+                t->m->heap,
+                Machine::FixedAllocation,
+                GcArray::FixedSize + (length * BytesPerWord),
+                true));
+
+  initArray(t, pool, length);
+
+  unsigned i = 1;
+  for (PoolElement* p = context->objectPool; p; p = p->next) {
+    unsigned offset = ArrayBody + ((i++) * BytesPerWord);
+
+    p->address = reinterpret_cast<uintptr_t>(pool) + offset;
+
+    setField(t, pool, offset, p->target);
+  }
+
+  return pool;
+}
+
 void finish(MyThread* t, FixedAllocator* allocator, Context* context)
 {
-  Memory::JitWriteScope scope;
   avian::codegen::Compiler* c = context->compiler;
 
   if (false) {
@@ -7179,6 +7217,13 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
 
   // we must acquire the class lock here at the latest
 
+  // Allocate the object pool before reserving any code space: this
+  // may trigger a collection or throw, and doing it first means there
+  // is nothing to roll back in the code area if it does.
+  if (context->objectPool) {
+    context->objectPoolArray = makeObjectPool(t, context);
+  }
+
   unsigned codeSize = c->resolve(allocator->memory.begin() + allocator->offset);
 
   unsigned total = pad(codeSize, TargetBytesPerWord)
@@ -7192,36 +7237,8 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
   context->executableStart = code;
   context->executableSize = total;
 
-  if (context->objectPool) {
-    object pool = allocate3(
-        t,
-        allocator,
-        Machine::ImmortalAllocation,
-        GcArray::FixedSize + ((context->objectPoolCount + 1) * BytesPerWord),
-        true);
-
-    context->executableSize = (allocator->memory.begin() + allocator->offset)
-                              - static_cast<uint8_t*>(context->executableStart);
-
-    initArray(
-        t, reinterpret_cast<GcArray*>(pool), context->objectPoolCount + 1);
-    mark(t, pool, 0);
-
-    setField(t, pool, ArrayBody, compileRoots(t)->objectPools());
-    compileRoots(t)->setObjectPools(t, pool);
-
-    unsigned i = 1;
-    for (PoolElement* p = context->objectPool; p; p = p->next) {
-      unsigned offset = ArrayBody + ((i++) * BytesPerWord);
-
-      p->address = reinterpret_cast<uintptr_t>(pool) + offset;
-
-      setField(t, pool, offset, p->target);
-    }
-  }
-
   {
-    Memory::JitWriteScope scope2;
+    Memory::JitWriteScope scope;
     c->write();
   }
 
@@ -10635,6 +10652,18 @@ uintptr_t virtualThunk(MyThread* t, unsigned index)
   return oldArray->body()[index * 2];
 }
 
+void publishObjectPool(MyThread* t, Context* context)
+{
+  GcArray* pool = context->objectPoolArray;
+  if (pool) {
+    // Link the pool into the root list; this doesn't allocate, so it
+    // can't fail once the method itself has been published.
+    setField(t, pool, ArrayBody, compileRoots(t)->objectPools());
+    compileRoots(t)->setObjectPools(t, pool);
+    context->objectPoolArray = 0;
+  }
+}
+
 void compile(MyThread* t,
              FixedAllocator* allocator UNUSED,
              BootContext* bootContext,
@@ -10738,8 +10767,13 @@ void compile(MyThread* t,
   }
 
   // we've compiled the method and inserted it into the tree without
-  // error, so we ensure that the executable area not be deallocated
-  // when we dispose of the context:
+  // error, so we hand its object pool over to the VM and ensure that
+  // the executable area not be deallocated when we dispose of the
+  // context.  Nothing above may be moved below this point: if
+  // anything throws before here, the context releases the code space
+  // and the pool, having never been linked anywhere, is simply
+  // collected.
+  publishObjectPool(t, &context);
   context.executableAllocator = 0;
 
   treeUpdate(t,
