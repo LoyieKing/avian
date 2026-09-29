@@ -165,8 +165,11 @@ class RwxCodeMemory final : public CodeMemory {
 // * Debuggers can't plant software breakpoints in the executable view:
 //   they write them with ptrace (or /proc/pid/mem), and the kernel
 //   refuses a forced write to a shared mapping that isn't writable
-//   (EFAULT; gdb reports "Cannot insert breakpoint ... Cannot access
-//   memory").  Nothing is corrupted, and hardware breakpoints work.
+//   (EFAULT; there is no copy-on-write for shared mappings).  gdb
+//   reports "Cannot insert breakpoint ... Cannot access memory", or,
+//   for an address inside a JIT-registered object, silently leaves the
+//   breakpoint <PENDING>.  Nothing is corrupted, and hardware
+//   breakpoints work.
 //   When a debugger is attached at startup, makeExecutableCodeMemory
 //   picks the rwx backend instead.
 // * Both views are MAP_SHARED, so a child created by fork() shares them

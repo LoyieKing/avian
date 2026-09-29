@@ -248,10 +248,15 @@ everywhere, `dual-map` on Linux, `map-jit` on macOS.
 
 **Debugging generated code on Linux:** debuggers set software
 breakpoints by writing an instruction into the target with `ptrace`, and
-the kernel refuses such a write to the dual-mapped executable view (it is
-a shared mapping that isn't writable).  gdb then reports
-`Cannot insert breakpoint N. Cannot access memory at address 0x...`;
-nothing is corrupted.  So:
+the kernel refuses such a write to the dual-mapped executable view
+(`EFAULT`: it is a shared mapping that isn't writable, so there is no
+copy-on-write fallback).  Nothing is corrupted, but the breakpoint is not
+planted.  gdb reports this as
+`Cannot insert breakpoint N. Cannot access memory at address 0x...` for
+an address outside any known object; for an address inside a registered
+JIT method (see "Debugging JIT code" below) it instead shows the
+breakpoint as `<PENDING>` in `info breakpoints` without an error, and it
+never triggers.  So:
 
   * If the VM is started under a debugger (`gdb --args avian ...`,
 `lldb -- avian ...`), it notices (`TracerPid` in `/proc/self/status`),
