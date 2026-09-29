@@ -158,11 +158,18 @@ class RwxCodeMemory : public CodeMemory {
 // pure instruction cache flush.  This is the scheme .NET uses by
 // default on Linux.
 //
-// Caveat: a debugger that inserts a software breakpoint into JIT code
-// through ptrace gets a private copy-on-write copy of that page in the
-// executable view, after which patches made through the alias are no
-// longer visible there.  Use AVIAN_CODE_MEMORY=rwx when debugging
-// generated code that way.
+// Caveats (also in README.md, "JIT Code Memory"):
+//
+// * A debugger that inserts a software breakpoint into JIT code through
+//   ptrace gets a private copy-on-write copy of that page in the
+//   executable view, after which patches made through the alias are no
+//   longer visible there.  Use AVIAN_CODE_MEMORY=rwx when debugging
+//   generated code that way.
+// * Both views are MAP_SHARED, so a child created by fork() shares them
+//   with the parent instead of getting a copy.  That is harmless for
+//   fork-then-exec (what Runtime.exec does: the child runs no Java code
+//   before exec, and the memfd is close-on-exec), but a forked child
+//   must not compile or patch code.
 
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U

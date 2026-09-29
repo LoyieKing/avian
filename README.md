@@ -221,6 +221,40 @@ There's also a win64 repository for 64-bit builds:
       $ git clone git@github.com:ReadyTalk/win64.git
 
 
+JIT Code Memory
+---------------
+
+With `process=compile`, generated machine code lives in a region owned by
+`CodeMemory` (`include/avian/system/code-memory.h`), the only code in the
+VM that writes to executable memory.  Code is assembled into ordinary
+memory, linked against its final address, and then committed; call sites
+are later retargeted through the same interface.  How the region is made
+writable depends on the platform:
+
+  * macOS: a `MAP_JIT` mapping.  On Apple silicon it is switched between
+writable and executable per thread (`pthread_jit_write_protect_np`)
+inside the commit and patch operations only.  The `avian` executable must
+be signed with the `com.apple.security.cs.allow-jit` entitlement (the
+makefile does this).
+  * Linux: one memfd mapped twice, read+execute where the code runs and
+read+write where it is written, so no page is ever writable and
+executable at once.  If that isn't possible (no `memfd_create`,
+`vm.memfd_noexec=2`, restrictive security policy) the VM silently falls
+back to a single read/write/execute mapping.
+  * Elsewhere: a single read/write/execute mapping.
+
+The environment variable `AVIAN_CODE_MEMORY` forces a backend: `rwx`
+everywhere, `dual-map` on Linux, `map-jit` on macOS.
+
+**Debugging generated code on Linux:** a debugger that plants a software
+breakpoint in JIT code (e.g. gdb `break *0x...`) writes it through
+`ptrace`, which gives that page of the executable view a private copy.
+From then on, patches the VM makes through the writable view are not seen
+by that page, and the program can misbehave.  Run with
+`AVIAN_CODE_MEMORY=rwx` when setting breakpoints in generated code.
+Hardware breakpoints and watchpoints, and breakpoints in the VM itself,
+are not affected.
+
 Building with the Microsoft Visual C++ Compiler
 -----------------------------------------------
 
