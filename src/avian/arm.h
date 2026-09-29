@@ -17,7 +17,6 @@
 
 #ifdef __APPLE__
 #include "libkern/OSAtomic.h"
-#include "libkern/OSCacheControl.h"
 #include "mach/mach_types.h"
 #include "mach/thread_act.h"
 #include "mach/thread_status.h"
@@ -138,28 +137,6 @@ inline void loadMemoryBarrier()
   memoryBarrier();
 #endif
 }
-
-#if !defined(AVIAN_AOT_ONLY)
-
-#if defined(__ANDROID__) || defined(__linux__)
-// http://code.google.com/p/android/issues/detail?id=1803
-extern "C" void __clear_cache(void* beg __attribute__((__unused__)),
-                              void* end __attribute__((__unused__)));
-#endif
-inline void syncInstructionCache(const void* start, unsigned size)
-{
-#ifdef __APPLE__
-  sys_icache_invalidate(const_cast<void*>(start), size);
-#elif(defined __QNX__)
-  msync(const_cast<void*>(start), size, MS_INVALIDATE_ICACHE);
-#else
-  __clear_cache(
-      const_cast<void*>(start),
-      const_cast<uint8_t*>(static_cast<const uint8_t*>(start) + size));
-#endif
-}
-
-#endif  // AVIAN_AOT_ONLY
 
 #ifndef __APPLE__
 typedef int(__kernel_cmpxchg_t)(int oldval, int newval, int* ptr);

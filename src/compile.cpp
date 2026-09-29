@@ -15,7 +15,7 @@
 #include "avian/target.h"
 #include "avian/arch.h"
 
-#include <avian/system/memory.h>
+#include <avian/system/code-memory.h>
 
 #include <avian/codegen/assembler.h>
 #include <avian/codegen/architecture.h>
@@ -27,7 +27,6 @@
 #include <avian/util/runtime-array.h>
 #include <avian/util/list.h>
 #include <avian/util/slice.h>
-#include <avian/util/fixed-allocator.h>
 
 #include "debug-util.h"
 
@@ -408,7 +407,7 @@ GcMethod* methodForIp(MyThread* t, void* ip)
 
   // we must use a version of the method tree at least as recent as the
   // compiled form of the method containing the specified address (see
-  // compile(MyThread*, FixedAllocator*, BootContext*, object)):
+  // compile(MyThread*, BootContext*, GcMethod*)):
   loadMemoryBarrier();
 
   return cast<GcMethod>(t,
@@ -1182,7 +1181,7 @@ class Context {
             &zone,
             method->code()->length() * frameMapSizeInWords(t, method),
             ~(uintptr_t)0)),
-        executableAllocator(0),
+        executableMemory(0),
         executableStart(0),
         executableSize(0),
         objectPoolCount(0),
@@ -1212,7 +1211,7 @@ class Context {
         traceLog(0),
         visitTable(0, 0),
         rootTable(0, 0),
-        executableAllocator(0),
+        executableMemory(0),
         executableStart(0),
         executableSize(0),
         objectPoolCount(0),
@@ -1239,8 +1238,8 @@ class Context {
 
     assembler->dispose();
 
-    if (executableAllocator) {
-      executableAllocator->free(executableStart, executableSize);
+    if (executableMemory) {
+      executableMemory->free(executableStart, executableSize);
     }
 
     eventLog.dispose();
@@ -1277,8 +1276,8 @@ class Context {
   TraceElement* traceLog;
   Slice<uint16_t> visitTable;
   Slice<uintptr_t> rootTable;
-  Alloc* executableAllocator;
-  void* executableStart;
+  CodeMemory* executableMemory;
+  uint8_t* executableStart;
   unsigned executableSize;
   unsigned objectPoolCount;
   unsigned traceLogCount;
@@ -1420,7 +1419,7 @@ void storeLocal(Context* context,
                                 translateLocalIndex(context, footprint, index));
 }
 
-avian::util::FixedAllocator* codeAllocator(MyThread* t);
+CodeMemory* codeMemory(MyThread* t);
 
 ir::Type operandTypeForFieldCode(Thread* t, unsigned code)
 {
@@ -1636,7 +1635,7 @@ class Frame {
                          new (&context->zone) avian::codegen::OffsetPromise(
                              p,
                              -reinterpret_cast<intptr_t>(
-                                 codeAllocator(t)->memory.begin())),
+                                 codeMemory(t)->region().begin())),
                          ir::Type::iptr()))
                : addressOperand(p);
   }
@@ -2414,10 +2413,7 @@ void tryInitClass(MyThread* t, GcClass* class_)
   initClass(t, class_);
 }
 
-void compile(MyThread* t,
-             FixedAllocator* allocator,
-             BootContext* bootContext,
-             GcMethod* method);
+void compile(MyThread* t, BootContext* bootContext, GcMethod* method);
 
 GcMethod* resolveMethod(Thread* t, GcPair* pair)
 {
@@ -2457,7 +2453,7 @@ int64_t prepareMethodForCall(MyThread* t, GcMethod* target)
     if (unresolved(t, methodAddress(t, target))) {
       PROTECT(t, target);
 
-      compile(t, codeAllocator(t), 0, target);
+      compile(t, 0, target);
     }
 
     if (target->flags() & ACC_NATIVE) {
@@ -3132,10 +3128,9 @@ void idleIfNecessary(MyThread* t)
 bool useLongJump(MyThread* t, uintptr_t target)
 {
   uintptr_t reach = t->arch->maximumImmediateJump();
-  FixedAllocator* a = codeAllocator(t);
-  uintptr_t start = reinterpret_cast<uintptr_t>(a->memory.begin());
-  uintptr_t end = reinterpret_cast<uintptr_t>(a->memory.begin())
-                  + a->memory.count;
+  Slice<uint8_t> code = codeMemory(t)->region();
+  uintptr_t start = reinterpret_cast<uintptr_t>(code.begin());
+  uintptr_t end = reinterpret_cast<uintptr_t>(code.begin()) + code.count;
   assertT(t, end - start < reach);
 
   return (target > end && (target - start) > reach)
@@ -7016,19 +7011,36 @@ int compareTraceElementPointers(const void* va, const void* vb)
   }
 }
 
+// Assembles the code `a` has laid out (`length` bytes) into `start`,
+// which must lie in code memory, and publishes it.  Scratch memory for
+// staging comes from `zone`.
+void emitCode(MyThread* t,
+              Zone* zone,
+              avian::codegen::Assembler* a,
+              uint8_t* start,
+              unsigned length)
+{
+  CodeMemory::Writer writer(codeMemory(t), start, length, zone);
+  a->write(writer.buffer(), start);
+  writer.commit();
+}
+
+uint8_t* allocateCode(MyThread* t, unsigned size)
+{
+  uint8_t* start = codeMemory(t)->allocate(size);
+  expect(t, start);
+  return start;
+}
+
 uint8_t* finish(MyThread* t,
-                FixedAllocator* allocator,
+                Context* context,
                 avian::codegen::Assembler* a,
                 const char* name,
                 unsigned length)
 {
-  uint8_t* start
-      = static_cast<uint8_t*>(allocator->allocate(length, TargetBytesPerWord));
+  uint8_t* start = allocateCode(t, length);
 
-  {
-    Memory::JitWriteScope scope;
-    a->write(start, start);
-  }
+  emitCode(t, &context->zone, a, start, length);
 
   logCompile(t, start, length, 0, name, 0);
 
@@ -7180,7 +7192,7 @@ GcArray* makeObjectPool(MyThread* t, Context* context)
   return pool;
 }
 
-void finish(MyThread* t, FixedAllocator* allocator, Context* context)
+void finish(MyThread* t, Context* context)
 {
   avian::codegen::Compiler* c = context->compiler;
 
@@ -7228,17 +7240,18 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
   unsigned total = pad(codeSize, TargetBytesPerWord)
                    + pad(c->poolSize(), TargetBytesPerWord);
 
-  target_uintptr_t* code = static_cast<target_uintptr_t*>(
-      allocator->allocate(total, TargetBytesPerWord));
-  uint8_t* start = reinterpret_cast<uint8_t*>(code);
+  uint8_t* start = allocateCode(t, total);
 
-  context->executableAllocator = allocator;
-  context->executableStart = code;
+  // Until compile() publishes the method, this space is ours to give
+  // back if anything below throws.
+  context->executableMemory = codeMemory(t);
+  context->executableStart = start;
   context->executableSize = total;
 
   {
-    Memory::JitWriteScope scope;
-    c->write(start, start);
+    CodeMemory::Writer writer(codeMemory(t), start, total, &context->zone);
+    c->write(writer.buffer(), start);
+    writer.commit();
   }
 
   BootContext* bc = context->bootContext;
@@ -7327,7 +7340,6 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
                    "<clinit>") == 0) {
     trap();
   }
-  syncInstructionCache(start, codeSize);
 }
 
 void compile(MyThread* t, Context* context)
@@ -7480,11 +7492,9 @@ void updateCall(MyThread* t,
   avian::codegen::CodePatch patch
       = t->arch->callPatch(op, returnAddress, target);
 
-  {
-    Memory::JitWriteScope scope;
-    memcpy(patch.address, patch.bytes, patch.size);
-  }
-  syncInstructionCache(patch.address, patch.size);
+  assertT(t, codeMemory(t)->contains(patch.address));
+
+  codeMemory(t)->patch(patch.address, patch.bytes, patch.size);
 }
 
 void* compileMethod2(MyThread* t, void* ip);
@@ -7524,7 +7534,7 @@ void* compileVirtualMethod2(MyThread* t, GcClass* class_, unsigned index)
   GcMethod* target = resolveTarget(t, class_, index);
   PROTECT(t, target);
 
-  compile(t, codeAllocator(t), 0, target);
+  compile(t, 0, target);
 
   void* address = reinterpret_cast<void*>(methodAddress(t, target));
   if (target->flags() & ACC_NATIVE) {
@@ -7565,7 +7575,7 @@ void* linkDynamicMethod2(MyThread* t, unsigned index)
     site = resolveDynamic(t, invocation);
     PROTECT(t, site);
 
-    compile(t, codeAllocator(t), 0, site->target()->method());
+    compile(t, 0, site->target()->method());
 
     ACQUIRE(t, t->m->classLock);
 
@@ -8215,7 +8225,7 @@ void callContinuation(MyThread* t,
 
           PROTECT(t, method);
 
-          compile(t, local::codeAllocator(t), 0, method);
+          compile(t, 0, method);
 
           compileRoots(t)->setRewindMethod(t, method);
         }
@@ -8293,7 +8303,7 @@ void callWithCurrentContinuation(MyThread* t, object receiver)
         t, compileRoots(t)->receiveMethod(), objectClass(t, receiver));
     PROTECT(t, method);
 
-    compile(t, local::codeAllocator(t), 0, method);
+    compile(t, 0, method);
 
     t->continuation = makeCurrentContinuation(t, &ip, &stack);
   }
@@ -8322,7 +8332,7 @@ void dynamicWind(MyThread* t, object before, object thunk, object after)
 
       if (method) {
         compileRoots(t)->setWindMethod(t, method);
-        compile(t, local::codeAllocator(t), 0, method);
+        compile(t, 0, method);
       }
     }
 
@@ -8544,7 +8554,6 @@ object invoke(Thread* thread, GcMethod* method, ArgumentList* arguments)
 
     compile(
         t,
-        local::codeAllocator(static_cast<MyThread*>(t)),
         0,
         resolveMethod(
             t, roots(t)->appLoader(), "foo/ClassName", "methodName", "()V"));
@@ -8720,7 +8729,7 @@ class MyProcessor;
 MyProcessor* processor(MyThread* t);
 
 #ifndef AVIAN_AOT_ONLY
-void compileThunks(MyThread* t, FixedAllocator* allocator);
+void compileThunks(MyThread* t);
 #endif
 
 class CompilationHandlerList {
@@ -8807,7 +8816,7 @@ class MyProcessor : public Processor {
         divideByZeroHandler(GcArithmeticException::Type,
                             &GcRoots::arithmeticException,
                             GcArithmeticException::FixedSize),
-        codeAllocator(s, Slice<uint8_t>(0, 0)),
+        codeMemory(0),
         callTableSize(0),
         dynamicIndex(0),
         useNativeFeatures(useNativeFeatures),
@@ -9133,10 +9142,7 @@ class MyProcessor : public Processor {
 
     method = findMethod(t, method, this_);
 
-    compile(static_cast<MyThread*>(t),
-            local::codeAllocator(static_cast<MyThread*>(t)),
-            0,
-            method);
+    compile(static_cast<MyThread*>(t), 0, method);
 
     return local::invoke(t, method, &list);
   }
@@ -9171,10 +9177,7 @@ class MyProcessor : public Processor {
 
     method = findMethod(t, method, this_);
 
-    compile(static_cast<MyThread*>(t),
-            local::codeAllocator(static_cast<MyThread*>(t)),
-            0,
-            method);
+    compile(static_cast<MyThread*>(t), 0, method);
 
     return local::invoke(t, method, &list);
   }
@@ -9211,10 +9214,7 @@ class MyProcessor : public Processor {
 
     method = findMethod(t, method, this_);
 
-    compile(static_cast<MyThread*>(t),
-            local::codeAllocator(static_cast<MyThread*>(t)),
-            0,
-            method);
+    compile(static_cast<MyThread*>(t), 0, method);
 
     return local::invoke(t, method, &list);
   }
@@ -9252,10 +9252,7 @@ class MyProcessor : public Processor {
 
     PROTECT(t, method);
 
-    compile(static_cast<MyThread*>(t),
-            local::codeAllocator(static_cast<MyThread*>(t)),
-            0,
-            method);
+    compile(static_cast<MyThread*>(t), 0, method);
 
     return local::invoke(t, method, &list);
   }
@@ -9275,10 +9272,8 @@ class MyProcessor : public Processor {
 
   virtual void dispose()
   {
-    if (codeAllocator.memory.begin()) {
-#ifndef AVIAN_AOT_ONLY
-      Memory::free(codeAllocator.memory);
-#endif
+    if (codeMemory) {
+      codeMemory->dispose();
     }
 
     if(compilationHandlers) {
@@ -9387,7 +9382,7 @@ class MyProcessor : public Processor {
   virtual void initialize(BootImage* image, Slice<uint8_t> code)
   {
     bootImage = image;
-    codeAllocator.memory = code;
+    codeMemory = makeImageCodeMemory(allocator, code);
   }
 
   virtual void addCompilationHandler(CompilationHandler* handler)
@@ -9410,7 +9405,7 @@ class MyProcessor : public Processor {
     BootContext bootContext(
         t, *constants, *calls, *addresses, zone, resolver, hostVM);
 
-    compile(t, &codeAllocator, &bootContext, method);
+    compile(t, &bootContext, method);
 
     *constants = bootContext.constants;
     *calls = bootContext.calls;
@@ -9431,14 +9426,14 @@ class MyProcessor : public Processor {
     for (unsigned i = 0; i < a->length(); i += 2) {
       if (a->body()[i]) {
         a->body()[i]
-            -= reinterpret_cast<uintptr_t>(codeAllocator.memory.begin());
+            -= reinterpret_cast<uintptr_t>(codeMemory->region().begin());
       }
     }
   }
 
   virtual unsigned* makeCallTable(Thread* t, HeapWalker* w)
   {
-    bootImage->codeSize = codeAllocator.offset;
+    bootImage->codeSize = codeMemory->used();
     bootImage->callCount = callTableSize;
 
     unsigned* table = static_cast<unsigned*>(
@@ -9451,7 +9446,7 @@ class MyProcessor : public Processor {
            p = p->next()) {
         table[index++]
             = targetVW(p->address() - reinterpret_cast<uintptr_t>(
-                                          codeAllocator.memory.begin()));
+                                          codeMemory->region().begin()));
         table[index++] = targetVW(
             w->map()->find(p->target())
             | (static_cast<unsigned>(p->flags()) << TargetBootShift));
@@ -9464,11 +9459,11 @@ class MyProcessor : public Processor {
   virtual void boot(Thread* t, BootImage* image, uint8_t* code)
   {
 #ifndef AVIAN_AOT_ONLY
-    if (codeAllocator.memory.begin() == 0) {
-      codeAllocator.memory = Memory::allocate(ExecutableAreaSizeInBytes,
-                                              Memory::ReadWriteExecute);
+    if (codeMemory == 0) {
+      codeMemory = makeExecutableCodeMemory(allocator,
+                                            ExecutableAreaSizeInBytes);
 
-      expect(t, codeAllocator.memory.begin());
+      expect(t, codeMemory);
     }
 #endif
 
@@ -9493,7 +9488,7 @@ class MyProcessor : public Processor {
 #ifdef AVIAN_AOT_ONLY
     thunks = bootThunks;
 #else
-    local::compileThunks(static_cast<MyThread*>(t), &codeAllocator);
+    local::compileThunks(static_cast<MyThread*>(t));
 
     if (not(image and code)) {
       bootThunks = thunks;
@@ -9574,7 +9569,9 @@ class MyProcessor : public Processor {
   unsigned codeImageSize;
   SignalHandler segFaultHandler;
   SignalHandler divideByZeroHandler;
-  FixedAllocator codeAllocator;
+  // Where all JIT code (and, while building a boot image, the image's
+  // code section) goes; see avian/system/code-memory.h.
+  CodeMemory* codeMemory;
   ThunkCollection thunks;
   ThunkCollection bootThunks;
   unsigned callTableSize;
@@ -9672,7 +9669,7 @@ void* compileMethod2(MyThread* t, void* ip)
 
   THREAD_RESOURCE0(t, static_cast<MyThread*>(t)->trace->targetMethod = 0);
 
-  compile(t, codeAllocator(t), 0, target);
+  compile(t, 0, target);
 
   uint8_t* updateIp = static_cast<uint8_t*>(ip);
 
@@ -10309,7 +10306,6 @@ void compileCall(MyThread* t, Context* c, ThunkIndex index, bool call = true)
 }
 
 void compileDefaultThunk(MyThread* t,
-                         FixedAllocator* allocator,
                          MyProcessor::Thunk* thunk,
                          const char* name,
                          ThunkIndex thunkIndex,
@@ -10366,11 +10362,10 @@ void compileDefaultThunk(MyThread* t,
 
   thunk->length = a->endBlock(false)->resolve(0, 0);
 
-  thunk->start = finish(
-      t, allocator, a, name, thunk->length);
+  thunk->start = finish(t, &context, a, name, thunk->length);
 }
 
-void compileThunks(MyThread* t, FixedAllocator* allocator)
+void compileThunks(MyThread* t)
 {
   MyProcessor* p = processor(t);
 
@@ -10396,15 +10391,15 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
     p->thunks.default_.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.default_.start
-        = finish(t, allocator, a, "default", p->thunks.default_.length);
+        = finish(t, &context, a, "default", p->thunks.default_.length);
   }
 
   compileDefaultThunk
-    (t, allocator, &(p->thunks.defaultVirtual), "defaultVirtual",
+    (t, &(p->thunks.defaultVirtual), "defaultVirtual",
      compileVirtualMethodIndex, true);
 
   compileDefaultThunk
-    (t, allocator, &(p->thunks.defaultDynamic), "defaultDynamic",
+    (t, &(p->thunks.defaultDynamic), "defaultDynamic",
      linkDynamicMethodIndex, false);
 
   {
@@ -10426,7 +10421,7 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
     p->thunks.native.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.native.start
-        = finish(t, allocator, a, "native", p->thunks.native.length);
+        = finish(t, &context, a, "native", p->thunks.native.length);
   }
 
   {
@@ -10445,7 +10440,7 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
     p->thunks.aioob.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.aioob.start
-        = finish(t, allocator, a, "aioob", p->thunks.aioob.length);
+        = finish(t, &context, a, "aioob", p->thunks.aioob.length);
   }
 
   {
@@ -10464,7 +10459,7 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
     p->thunks.stackOverflow.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.stackOverflow.start = finish(
-        t, allocator, a, "stackOverflow", p->thunks.stackOverflow.length);
+        t, &context, a, "stackOverflow", p->thunks.stackOverflow.length);
   }
 
   {
@@ -10480,8 +10475,8 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
 
       p->thunks.table.length = a->endBlock(false)->resolve(0, 0);
 
-      p->thunks.table.start = static_cast<uint8_t*>(allocator->allocate(
-          p->thunks.table.length * ThunkCount, TargetBytesPerWord));
+      p->thunks.table.start
+          = allocateCode(t, p->thunks.table.length * ThunkCount);
     }
 
     uint8_t* start = p->thunks.table.start;
@@ -10497,12 +10492,10 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
                                                                             \
     compileCall(t, &context, s##Index, false);                              \
                                                                             \
-    expect(t, a->endBlock(false)->resolve(0, 0) <= p->thunks.table.length); \
+    unsigned length = a->endBlock(false)->resolve(0, 0);                    \
+    expect(t, length <= p->thunks.table.length);                            \
                                                                             \
-    {                                                                       \
-      Memory::JitWriteScope scope;                                          \
-      a->write(start, start);                                               \
-    }                                                                       \
+    emitCode(t, &context.zone, a, start, length);                           \
                                                                             \
     logCompile(t, start, p->thunks.table.length, 0, #s, 0);                 \
                                                                             \
@@ -10515,7 +10508,7 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
   BootImage* image = p->bootImage;
 
   if (image) {
-    uint8_t* imageBase = p->codeAllocator.memory.begin();
+    uint8_t* imageBase = p->codeMemory->region().begin();
 
     image->thunks.default_ = thunkToThunk(p->thunks.default_, imageBase);
     image->thunks.defaultVirtual
@@ -10604,13 +10597,9 @@ uintptr_t compileVirtualThunk(MyThread* t,
 
   *size = a->endBlock(false)->resolve(0, 0);
 
-  uint8_t* start = static_cast<uint8_t*>(
-      codeAllocator(t)->allocate(*size, TargetBytesPerWord));
+  uint8_t* start = allocateCode(t, *size);
 
-  {
-    Memory::JitWriteScope scope;
-    a->write(start, start);
-  }
+  emitCode(t, &context.zone, a, start, *size);
 
   const size_t virtualThunkBaseNameLength = strlen(baseName);
   const size_t maxIntStringLength = 10;
@@ -10668,10 +10657,7 @@ void publishObjectPool(MyThread* t, Context* context)
   }
 }
 
-void compile(MyThread* t,
-             FixedAllocator* allocator UNUSED,
-             BootContext* bootContext,
-             GcMethod* method)
+void compile(MyThread* t, BootContext* bootContext, GcMethod* method)
 {
   PROTECT(t, method);
 
@@ -10733,7 +10719,7 @@ void compile(MyThread* t,
     return;
   }
 
-  finish(t, allocator, &context);
+  finish(t, &context);
 
   if (DebugMethodTree) {
     fprintf(stderr,
@@ -10778,7 +10764,7 @@ void compile(MyThread* t,
   // and the pool, having never been linked anywhere, is simply
   // collected.
   publishObjectPool(t, &context);
-  context.executableAllocator = 0;
+  context.executableMemory = 0;
 
   treeUpdate(t,
              compileRoots(t)->methodTree(),
@@ -10794,9 +10780,9 @@ GcCompileRoots* compileRoots(Thread* t)
   return processor(static_cast<MyThread*>(t))->roots;
 }
 
-avian::util::FixedAllocator* codeAllocator(MyThread* t)
+CodeMemory* codeMemory(MyThread* t)
 {
-  return &(processor(t)->codeAllocator);
+  return processor(t)->codeMemory;
 }
 
 Allocator* allocator(MyThread* t)

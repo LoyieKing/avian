@@ -51,13 +51,5 @@ void Memory::free(util::Slice<uint8_t> pages)
   ASSERT(r);
 }
 
-void Memory::beginJitWrite()
-{
-}
-
-void Memory::endJitWrite()
-{
-}
-
 }  // namespace system
 }  // namespace avian

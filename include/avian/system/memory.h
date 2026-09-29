@@ -39,27 +39,6 @@ class Memory {
   // Free a contiguous range of pages.
   static void free(util::Slice<uint8_t> pages);
 
-  // Temporarily enable writes to JIT memory on platforms which require
-  // write/execute transitions instead of permanently writable executable pages.
-  static void beginJitWrite();
-  static void endJitWrite();
-
-  class JitWriteScope {
-   public:
-    JitWriteScope()
-    {
-      Memory::beginJitWrite();
-    }
-
-    ~JitWriteScope()
-    {
-      Memory::endJitWrite();
-    }
-
-    JitWriteScope(const JitWriteScope&) = delete;
-    JitWriteScope& operator=(const JitWriteScope&) = delete;
-  };
-
   // TODO: In the future:
   // static void setPermissions(util::Slice<uint8_t> pages, Permissions perms);
 };
