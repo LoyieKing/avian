@@ -787,6 +787,28 @@ object interpret3(Thread* t, const int base)
 loop:
   if (UNLIKELY(vm::debug::enabled())) {
     vm::debug::checkpoint(t, static_cast<int32_t>(ip), 0, frameMethod(t, frame));
+    if (UNLIKELY(vm::debug::takePop(t))) {
+      GcMethod* popped = frameMethod(t, frame);
+      unsigned rc = popped->returnCode();
+      popFrame(t);
+      if (frame < base)
+        return 0;
+      switch (rc) {
+      case LongField:
+      case DoubleField:
+        pushLong(t, 0);
+        break;
+      case ObjectField:
+        pushObject(t, 0);
+        break;
+      case VoidField:
+        break;
+      default:
+        pushInt(t, 0);
+        break;
+      }
+      goto loop;
+    }
   }
 
   instruction = code->body()[ip++];
@@ -1571,6 +1593,12 @@ loop:
 
       PROTECT(t, field);
 
+      if (UNLIKELY(vm::debug::watchingFields())) {
+        vm::debug::onField(t, field, peekObject(t, sp - 1), 0, 0, 0,
+                           frameMethod(t, frame),
+                           static_cast<int32_t>(ip >= 3 ? ip - 3 : 0));
+      }
+
       ACQUIRE_FIELD_FOR_READ(t, field);
 
       pushField(t, popObject(t), field);
@@ -1591,6 +1619,11 @@ loop:
     PROTECT(t, field);
 
     initClass(t, field->class_());
+
+    if (UNLIKELY(vm::debug::watchingFields())) {
+      vm::debug::onField(t, field, 0, 0, 0, 0, frameMethod(t, frame),
+                         static_cast<int32_t>(ip >= 3 ? ip - 3 : 0));
+    }
 
     ACQUIRE_FIELD_FOR_READ(t, field);
 
@@ -2684,6 +2717,29 @@ loop:
     assertT(t, (field->flags() & ACC_STATIC) == 0);
     PROTECT(t, field);
 
+    if (UNLIKELY(vm::debug::watchingFields())) {
+      uint64_t bits = 0;
+      object value = 0;
+      object inst = 0;
+      switch (field->code()) {
+      case DoubleField:
+      case LongField:
+        bits = peekLong(t, sp - 2);
+        inst = peekObject(t, sp - 3);
+        break;
+      case ObjectField:
+        value = peekObject(t, sp - 1);
+        inst = peekObject(t, sp - 2);
+        break;
+      default:
+        bits = peekInt(t, sp - 1);
+        inst = peekObject(t, sp - 2);
+        break;
+      }
+      vm::debug::onField(t, field, inst, 1, bits, value, frameMethod(t, frame),
+                         static_cast<int32_t>(ip >= 3 ? ip - 3 : 0));
+    }
+
     {
       ACQUIRE_FIELD_FOR_WRITE(t, field);
 
@@ -2758,6 +2814,25 @@ loop:
     assertT(t, field->flags() & ACC_STATIC);
 
     PROTECT(t, field);
+
+    if (UNLIKELY(vm::debug::watchingFields())) {
+      uint64_t bits = 0;
+      object value = 0;
+      switch (field->code()) {
+      case DoubleField:
+      case LongField:
+        bits = peekLong(t, sp - 2);
+        break;
+      case ObjectField:
+        value = peekObject(t, sp - 1);
+        break;
+      default:
+        bits = peekInt(t, sp - 1);
+        break;
+      }
+      vm::debug::onField(t, field, 0, 1, bits, value, frameMethod(t, frame),
+                         static_cast<int32_t>(ip >= 3 ? ip - 3 : 0));
+    }
 
     ACQUIRE_FIELD_FOR_WRITE(t, field);
 
@@ -3008,6 +3083,23 @@ throw_:
   }
 
   pokeInt(t, t->frame + FrameIpOffset, t->ip);
+  if (UNLIKELY(vm::debug::enabled() and exception)) {
+    int caught = 0;
+    int catchBci = 0;
+    GcMethod* catchMethod = 0;
+    for (int f = frame; f >= base; f = frameNext(t, f)) {
+      uint64_t eh = findExceptionHandler(t, f);
+      if (eh) {
+        caught = 1;
+        catchBci = static_cast<int>(exceptionHandlerIp(eh));
+        catchMethod = frameMethod(t, f);
+        break;
+      }
+    }
+    vm::debug::onException(t, exception, caught, frameMethod(t, frame),
+                           ip ? static_cast<int32_t>(ip - 1) : 0, catchMethod,
+                           catchBci);
+  }
   for (; frame >= base; popFrame(t)) {
     uint64_t eh = findExceptionHandler(t, frame);
     if (eh) {
@@ -3044,6 +3136,8 @@ object interpret(Thread* t)
     uint64_t r = run(t, interpret2, arguments);
     if (success) {
       if (t->exception) {
+        if (vm::debug::suppressThrow(t))
+          return 0;
         GcThrowable* exception = t->exception;
         t->exception = 0;
         throw_(t, exception);
@@ -3221,6 +3315,8 @@ object invoke(Thread* t, GcMethod* method)
 
     if (LIKELY(t->exception == 0)) {
       popFrame(t);
+    } else if (vm::debug::suppressThrow(t)) {
+      return 0;
     } else {
       GcThrowable* exception = t->exception;
       t->exception = 0;
@@ -3255,6 +3351,83 @@ int captureDebugFrames(vm::Thread* thread, vm::debug::WalkerFrame* out, int max)
     ++n;
   }
   return n;
+}
+
+
+int debugFrameOp(vm::Thread* thread, int op, int frameIndex, int slot, vm::debug::SlotIO* io)
+{
+  Thread* t = static_cast<Thread*>(thread);
+  int f = t->frame;
+  for (int i = 0; i < frameIndex; ++i) {
+    if (f < 0) {
+      io->status = 30;
+      return 30;
+    }
+    f = frameNext(t, f);
+  }
+  if (f < 0) {
+    io->status = 30;
+    return 30;
+  }
+  GcMethod* method = frameMethod(t, f);
+  if (op == 4) {
+    if (frameIndex != 0) {
+      io->status = 30;
+      return 30;
+    }
+    vm::debug::requestPop(t);
+    io->status = 0;
+    return 0;
+  }
+  if (op == 3) {
+    io->tag = 'L';
+    io->status = 0;
+    if (method->flags() & ACC_STATIC) {
+      io->ref = 0;
+      return 0;
+    }
+    slot = 0;
+    io->tag = 'L';
+  }
+  unsigned base = frameBase(t, f);
+  unsigned index = base + static_cast<unsigned>(slot);
+  bool objectSlot = io->tag == 'L' or io->tag == '[' or io->tag == 's'
+                    or io->tag == 't' or io->tag == 'g' or io->tag == 'l'
+                    or io->tag == 'c';
+  bool wide = io->tag == 'J' or io->tag == 'D';
+  if (op == 2) {
+    if (objectSlot)
+      pokeObject(t, index, static_cast<object>(io->ref));
+    else if (wide)
+      pokeLong(t, index, io->bits);
+    else
+      pokeInt(t, index, static_cast<uint32_t>(io->bits));
+    io->status = 0;
+    return 0;
+  }
+  uintptr_t tagWord = t->stack[index * 2];
+  if (objectSlot or op == 3) {
+    if (tagWord != ObjectTag) {
+      io->status = 35;
+      return 35;
+    }
+    io->ref = peekObject(t, index);
+    io->tag = 'L';
+  } else if (wide) {
+    if (tagWord != IntTag) {
+      io->status = 35;
+      return 35;
+    }
+    io->bits = peekLong(t, index);
+  } else {
+    if (tagWord != IntTag) {
+      io->status = 35;
+      return 35;
+    }
+    io->bits = peekInt(t, index);
+  }
+  io->status = 0;
+  return 0;
 }
 
 class MyProcessor : public Processor {
@@ -3570,6 +3743,7 @@ class MyProcessor : public Processor {
   {
     expect(s, image == 0 and code == 0);
     vm::debug::registerWalker(captureDebugFrames);
+    vm::debug::registerFrameFn(debugFrameOp);
   }
 
   virtual void callWithCurrentContinuation(vm::Thread*, object)

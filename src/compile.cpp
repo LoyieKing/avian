@@ -916,7 +916,7 @@ enum Thunk {
 #undef THUNK
 };
 
-const unsigned ThunkCount = debugCheckpointThunk + 1;
+const unsigned ThunkCount = fieldWatchThunk + 1;
 
 intptr_t getThunk(MyThread* t, Thunk thunk);
 
@@ -2238,14 +2238,56 @@ void findUnwindTarget(MyThread* t,
 
   GcMethod* target = t->trace->targetMethod;
   bool mostRecent = true;
+  GcMethod* throwMethod = 0;
+  void* throwIp = 0;
+  bool notedException = false;
 
   *targetIp = 0;
   while (*targetIp == 0) {
     GcMethod* method = methodForIp(t, ip);
     if (method) {
+      if (throwMethod == 0) {
+        throwMethod = method;
+        throwIp = ip;
+      }
       void* handler = findExceptionHandler(t, method, ip);
 
       if (handler) {
+        if (debug::enabled() and t->exception and not notedException
+            and not debug::suppressThrow(t)) {
+          notedException = true;
+          char cn[256], mn[256], spn[256];
+          cn[0] = mn[0] = spn[0] = 0;
+          if (throwMethod->class_() and throwMethod->class_()->name())
+            ::snprintf(cn, sizeof cn, "%s", reinterpret_cast<const char*>(throwMethod->class_()->name()->body().begin()));
+          if (throwMethod->name())
+            ::snprintf(mn, sizeof mn, "%s", reinterpret_cast<const char*>(throwMethod->name()->body().begin()));
+          if (throwMethod->spec())
+            ::snprintf(spn, sizeof spn, "%s", reinterpret_cast<const char*>(throwMethod->spec()->body().begin()));
+          uint8_t* compiled = reinterpret_cast<uint8_t*>(methodCompiled(t, throwMethod));
+          int off = difference(throwIp, compiled);
+          if (off > 0)
+            --off;
+          int throwBci = debug::machineOffsetToBci(cn, mn, spn, off);
+          if (throwBci < 0)
+            throwBci = 0;
+          char ccn[256], cmn[256], csp[256];
+          ccn[0] = cmn[0] = csp[0] = 0;
+          if (method->class_() and method->class_()->name())
+            ::snprintf(ccn, sizeof ccn, "%s", reinterpret_cast<const char*>(method->class_()->name()->body().begin()));
+          if (method->name())
+            ::snprintf(cmn, sizeof cmn, "%s", reinterpret_cast<const char*>(method->name()->body().begin()));
+          if (method->spec())
+            ::snprintf(csp, sizeof csp, "%s", reinterpret_cast<const char*>(method->spec()->body().begin()));
+          uint8_t* ch = reinterpret_cast<uint8_t*>(methodCompiled(t, method));
+          int coff = difference(handler, ch);
+          int catchBci = debug::machineOffsetToBci(ccn, cmn, csp, coff);
+          if (catchBci < 0)
+            catchBci = 0;
+          debug::setInhibitSuspend(true);
+          debug::onException(t, t->exception, 1, throwMethod, throwBci, method, catchBci);
+          debug::setInhibitSuspend(false);
+        }
         *targetIp = handler;
 
         nextFrame(t, &ip, &stack, method, target, mostRecent);
@@ -2271,6 +2313,13 @@ void findUnwindTarget(MyThread* t,
         target = method;
       }
     } else {
+      if (debug::enabled() and t->exception and throwMethod and not notedException
+          and not debug::suppressThrow(t)) {
+        notedException = true;
+        debug::setInhibitSuspend(true);
+        debug::onException(t, t->exception, 0, throwMethod, 0, 0, 0);
+        debug::setInhibitSuspend(false);
+      }
       expect(t, ip);
       *targetIp = ip;
       *targetFrame = 0;
@@ -3176,6 +3225,202 @@ void idleIfNecessary(MyThread* t)
 void debugCheckpoint(MyThread* t, uintptr_t bci, uintptr_t bits)
 {
   debug::checkpoint(t, static_cast<int32_t>(bci), bits, 0);
+}
+
+void fieldWatch(MyThread* t, uintptr_t field, uintptr_t instance, uintptr_t write,
+                uintptr_t bits, uintptr_t method, uintptr_t bci)
+{
+  if (not debug::watchingFields())
+    return;
+  object valueRef = 0;
+  GcField* f = reinterpret_cast<GcField*>(field);
+  if (write and f and f->code() == ObjectField)
+    valueRef = reinterpret_cast<object>(bits);
+  debug::onField(t, reinterpret_cast<void*>(field), reinterpret_cast<void*>(instance),
+                 write ? 1 : 0, static_cast<uint64_t>(bits), valueRef,
+                 reinterpret_cast<void*>(method), static_cast<int32_t>(bci));
+}
+
+// A watch may suspend and collect.  The instance and the stored value have
+// already been popped, so put them back in the Java frame map for the call
+// and reload them afterwards.  That restores the pre-pop depth, which fits
+// in maxStack.
+void compileFieldWatch(MyThread* t, Frame* frame, GcField* field,
+                       ir::Value*& table, ir::Value*& value, bool hasValue,
+                       bool isStatic, int write, int fieldCode,
+                       GcMethod* method, int bci)
+{
+  if (not debug::enabled())
+    return;
+  avian::codegen::Compiler* c = frame->c;
+  if (not isStatic)
+    frame->push(ir::Type::object(), table);
+  if (hasValue) {
+    switch (fieldCode) {
+    case LongField:
+      frame->pushLarge(ir::Type::i8(), value);
+      break;
+    case DoubleField:
+      frame->pushLarge(ir::Type::f8(), value);
+      break;
+    case ObjectField:
+      frame->push(ir::Type::object(), value);
+      break;
+    case FloatField:
+      frame->push(ir::Type::f4(), value);
+      break;
+    default:
+      frame->push(ir::Type::i4(), value);
+      break;
+    }
+  }
+  ir::Value* bitsArg = c->constant(0, ir::Type::iptr());
+  if (hasValue and write) {
+    switch (fieldCode) {
+    case ByteField:
+    case BooleanField:
+    case CharField:
+    case ShortField:
+    case IntField:
+      bitsArg = c->truncateThenExtend(
+          ir::ExtendMode::Signed, ir::Type::iptr(), ir::Type::i4(), value);
+      break;
+    case LongField:
+      if (TargetBytesPerWord == 8)
+        bitsArg = value;
+      break;
+    case ObjectField:
+      bitsArg = value;
+      break;
+    default:
+      break;
+    }
+  }
+  c->nativeCall(
+      c->constant(getThunk(t, fieldWatchThunk), ir::Type::iptr()),
+      0,
+      frame->trace(0, 0),
+      ir::Type::void_(),
+      args(c->threadRegister(),
+           frame->append(field),
+           isStatic ? c->constant(0, ir::Type::iptr()) : table,
+           c->constant(write ? 1 : 0, ir::Type::iptr()),
+           bitsArg,
+           frame->append(method),
+           c->constant(static_cast<intptr_t>(bci), ir::Type::iptr())));
+  if (hasValue) {
+    switch (fieldCode) {
+    case LongField:
+      value = frame->popLarge(ir::Type::i8());
+      break;
+    case DoubleField:
+      value = frame->popLarge(ir::Type::f8());
+      break;
+    case ObjectField:
+      value = frame->pop(ir::Type::object());
+      break;
+    case FloatField:
+      value = frame->pop(ir::Type::f4());
+      break;
+    default:
+      value = frame->pop(ir::Type::i4());
+      break;
+    }
+  }
+  if (not isStatic)
+    table = frame->pop(ir::Type::object());
+}
+
+int compilerLocalIndex(GcMethod* method, int slot, int footprint)
+{
+  int parameterFootprint = method->parameterFootprint();
+  if (slot < parameterFootprint)
+    return parameterFootprint - slot - footprint;
+  return slot;
+}
+
+int jitFrameOp(Thread* thread, int op, int frame, int slot, debug::SlotIO* io)
+{
+  MyThread* t = static_cast<MyThread*>(thread);
+  if (op == 4) {
+    io->status = 32;
+    return 32;
+  }
+  MyStackWalker walker(t);
+  int seen = -1;
+  GcMethod* method = 0;
+  void* fp = 0;
+  for (; walker.valid(); walker.next()) {
+    if (walker.state != MyStackWalker::Method)
+      continue;
+    ++seen;
+    if (seen == frame) {
+      method = walker.method();
+      fp = walker.stack;
+      break;
+    }
+  }
+  if (method == 0 or method->code() == 0) {
+    io->status = 32;
+    return 32;
+  }
+  if (op == 3) {
+    io->tag = 'L';
+    io->status = 0;
+    if (method->flags() & ACC_STATIC) {
+      io->ref = 0;
+      return 0;
+    }
+    slot = 0;
+  }
+  int footprint = (io->tag == 'J' or io->tag == 'D') ? 2 : 1;
+  int index = compilerLocalIndex(method, slot, footprint);
+  if (index < 0 or static_cast<unsigned>(index) >= method->code()->maxLocals()) {
+    io->status = 35;
+    return 35;
+  }
+  void* frameIp = walker.ip_;
+  void* frameStack = fp;
+  nextFrame(t, &frameIp, &frameStack, method, walker.target, walker.count_ == 0);
+  void* locals = stackForFrame(t, frameStack, method);
+  uintptr_t* cell = reinterpret_cast<uintptr_t*>(localObject(t, locals, method, static_cast<unsigned>(index)));
+  bool objectSlot = io->tag == 'L' or io->tag == '[' or io->tag == 's' or io->tag == 't'
+                    or io->tag == 'g' or io->tag == 'l' or io->tag == 'c' or op == 3;
+  if (op == 2) {
+    if (objectSlot)
+      *reinterpret_cast<object*>(cell) = static_cast<object>(io->ref);
+    else if (footprint == 2) {
+      cell[0] = static_cast<uintptr_t>(io->bits >> 32);
+      cell[1] = static_cast<uintptr_t>(io->bits & 0xFFFFFFFF);
+    } else {
+      cell[0] = static_cast<uintptr_t>(static_cast<uint32_t>(io->bits));
+    }
+    io->status = 0;
+    return 0;
+  }
+  if (objectSlot) {
+    io->ref = *reinterpret_cast<object*>(cell);
+    io->tag = 'L';
+  } else if (footprint == 2) {
+    io->bits = (static_cast<uint64_t>(cell[0]) << 32)
+               | (static_cast<uint64_t>(cell[1]) & 0xFFFFFFFF);
+  } else {
+    io->bits = static_cast<uint32_t>(cell[0]);
+  }
+  io->status = 0;
+  return 0;
+}
+
+void invalidateCompiled(Thread* t, void* method)
+{
+  GcMethod* m = static_cast<GcMethod*>(method);
+  if (m == 0 or m->code() == 0)
+    return;
+  m->code()->compiled() = local::defaultThunk(static_cast<MyThread*>(t));
+  if (methodVirtual(t, m)) {
+    uintptr_t thunk = virtualThunk(static_cast<MyThread*>(t), m->offset());
+    m->class_()->vtable()[m->offset()] = reinterpret_cast<void*>(thunk);
+  }
 }
 
 bool useLongJump(MyThread* t, uintptr_t target)
@@ -4719,6 +4964,7 @@ loop:
 
     case getfield:
     case getstatic: {
+      int fieldBci = static_cast<int>(ip - 1);
       uint16_t index = codeReadInt16(t, code, ip);
 
       object reference
@@ -4767,6 +5013,13 @@ loop:
             c->saveLocals();
             frame->trace(0, 0);
           }
+        }
+
+        {
+          ir::Value* ignored = 0;
+          compileFieldWatch(t, frame, field, table, ignored, false,
+                            instruction == getstatic, 0, field->code(),
+                            context->method, fieldBci);
         }
 
         switch (field->code()) {
@@ -6128,6 +6381,7 @@ loop:
 
     case putfield:
     case putstatic: {
+      int fieldBci = static_cast<int>(ip - 1);
       uint16_t index = codeReadInt16(t, code, ip);
 
       object reference
@@ -6193,6 +6447,10 @@ loop:
         } else {
           table = frame->pop(ir::Type::object());
         }
+
+        compileFieldWatch(t, frame, field, table, value, true,
+                          instruction == putstatic, 1, fieldCode,
+                          context->method, fieldBci);
 
         switch (fieldCode) {
         case ByteField:
@@ -9572,6 +9830,8 @@ class MyProcessor : public Processor {
       debug::setCodeMemory(codeMemory);
 #endif
     debug::registerWalker(captureDebugFrames);
+    debug::registerFrameFn(jitFrameOp);
+    debug::registerInvalidator(invalidateCompiled);
 
     if (image and code) {
       local::boot(static_cast<MyThread*>(t), image, code);

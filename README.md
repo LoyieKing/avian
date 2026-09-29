@@ -71,14 +71,54 @@ Single-step is at bytecode granularity (`size=min`) or, when a line
 table exists, line granularity. Breakpoints are bytecode indices (jdb's
 `stop in` / `stop at` both become a location).
 
-Not implemented, on purpose, so the event layer can grow under JDWP
-rather than the other way around: RedefineClasses, field watch, monitor
-events, heap walking, early return, PopFrames, invoking a method from
-the debugger, local-variable tables and StackFrame.GetValues, a real
-ThisObject, exception / thread-start / thread-death / class-unload
-events, source-debug extension, `server=n`, and 32-bit builds (the
-`TARGET_THREAD_*` offsets in `target-fields.h` were only shifted for
-LP64).
+On top of that, JDWP is still just a client of the same event layer:
+
+* `Method.VariableTable` comes from the class file `LocalVariableTable`
+  (javac `-g`). `StackFrame.GetValues` / `SetValues` read and write
+  locals that exist. The interpreter uses the operand stack. The JIT
+  uses the same slot map as GC, with parameters reversed by
+  `parameterFootprint`. A compiled frame that cannot be read returns
+  `OPAQUE_FRAME` (32) instead of a guessed value.
+* `StackFrame.ThisObject` is local 0 for an instance frame, and null
+  for a static or native frame.
+* Heap objects the debugger names get a stable id (id 0 is null). The
+  table is a GC root. `ObjectReference.ReferenceType` and `GetValues`
+  (instance fields) and `ReferenceType.GetValues` (statics) run on the
+  suspended thread. `DisposeObjects` drops ids.
+* Exception events (caught and uncaught) and `ThreadStart` /
+  `ThreadDeath`. The main thread does not pass through `Thread.start`,
+  so it often has no `ThreadStart`. A JIT throw is reported from the
+  unwinder without entering Idle there; the suspend itself happens at
+  the next checkpoint, which is the catch handler when the exception is
+  caught.
+* Field access and modification, in the interpreter and in methods
+  JIT-compiled after JDWP is enabled. Same checkpoint/patch idea as
+  breakpoints: the watch is a call, and the instance and the value stay
+  in the Java frame map so a collection during the suspend is safe.
+  Float and double modification events from compiled code carry a zero
+  value; ints, longs, and object references do not.
+* `RedefineClasses` for a bytecode-only swap. The new code object is
+  installed, and methods compiled after the redefine are invalidated
+  back to the default thunk (virtual methods included). Schema changes,
+  added or deleted methods, and verifier failures are rejected with the
+  JDWP redefine errors (62-69). A frame already running the old body
+  keeps it. A direct call already patched to the old address is not
+  rewritten. Boot-image classes are not re-parsed.
+* `PopFrames` (StackFrame command 4, top frame only). The interpreter
+  drops the frame and pushes a zero return so the caller stays
+  balanced; it does not re-execute the invoke, and the caller's pc is
+  the instruction after the call. A compiled frame returns
+  `OPAQUE_FRAME` (32): there is no edge back to the invoke bytecode.
+* `ClassType.InvokeMethod` and `ObjectReference.InvokeMethod` run on a
+  suspended thread, which is enough for jdb `print` / `eval` of a simple
+  call. The invoke does not hit nested breakpoints. An exception thrown
+  out of an interpreted invoke is returned in the reply. An exception
+  thrown out of a compiled invoke may still unwind the suspended frame.
+
+Not implemented: monitor events, heap walking, early return, class
+unload, source-debug extension, real generic signatures, `server=n`,
+Windows sockets, and 32-bit builds (the `TARGET_THREAD_*` offsets in
+`target-fields.h` were only shifted for LP64). CI is 64-bit only.
 
 
 

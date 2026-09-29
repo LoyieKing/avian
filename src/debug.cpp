@@ -47,6 +47,11 @@ const int kInvalidClass = 21;
 const int kInvalidMethod = 23;
 const int kInvalidEvent = 102;
 const int kIllegalArgument = 103;
+const int kOpaque = 32;
+const int kInvalidSlot = 35;
+const int kInvalidFrame = 30;
+const int kAddMethod = 63;
+const int kSchema = 64;
 
 const int kSuspendNone = 0;
 const int kSuspendEvent = 1;
@@ -67,6 +72,7 @@ struct FieldRec {
   char* name;
   char* spec;
   int32_t flags;
+  int32_t offset;
 };
 
 struct CompiledSite {
@@ -83,6 +89,14 @@ struct CompiledSite {
   CompiledSite* next;
 };
 
+struct VarRec {
+  int32_t start;
+  int32_t length;
+  int32_t slot;
+  char* name;
+  char* spec;
+};
+
 struct MethodRec {
   uint64_t id;
   char* name;
@@ -91,6 +105,9 @@ struct MethodRec {
   int32_t codeLength;  // -1 native or absent
   LineRec* lines;
   int lineCount;
+  VarRec* vars;
+  int varCount;
+  int argCount;
   CompiledSite* site;
 };
 
@@ -131,6 +148,13 @@ struct Request {
   uint64_t stepThread;
   int stepSize;
   int stepDepth;
+  bool hasException;
+  uint64_t exceptionClass;
+  int caught;
+  int uncaught;
+  bool hasField;
+  uint64_t fieldClass;
+  uint64_t fieldId;
   Request* next;
 };
 
@@ -812,6 +836,8 @@ int tagOf(GcClass* c, const char* name)
   return 1;
 }
 
+void loadVars(MethodRec* m, const char* cn, const char* mn, const char* spec);
+
 void readLines(Thread* t, GcMethod* method, MethodRec* mr)
 {
   mr->codeLength = -1;
@@ -883,6 +909,7 @@ ClassRec* ingest(Thread* t, GcClass* c)
       fields[n].name = dupBytes(f->name());
       fields[n].spec = dupBytes(f->spec());
       fields[n].flags = f->flags();
+      fields[n].offset = f->offset();
       ++n;
     }
     fieldCount = n;
@@ -908,8 +935,10 @@ ClassRec* ingest(Thread* t, GcClass* c)
       methods[n].name = dupBytes(m->name());
       methods[n].spec = dupBytes(m->spec());
       methods[n].flags = m->flags();
+      methods[n].argCount = m->parameterFootprint();
       methods[n].site = 0;
       readLines(t, m, &methods[n]);
+      loadVars(&methods[n], name, methods[n].name, methods[n].spec);
       ++n;
     }
     methodCount = n;
@@ -953,6 +982,13 @@ ClassRec* ingest(Thread* t, GcClass* c)
         free(methods[i].name);
         free(methods[i].spec);
         free(methods[i].lines);
+        if (methods[i].vars) {
+          for (int v = 0; v < methods[i].varCount; ++v) {
+            free(methods[i].vars[v].name);
+            free(methods[i].vars[v].spec);
+          }
+          free(methods[i].vars);
+        }
       }
       free(methods);
     }
@@ -1013,6 +1049,8 @@ void scanClasses(Thread* t)
 
 // ---- suspend -----------------------------------------------------------
 
+bool drainMail(Thread* t);
+
 void block(Thread* t)
 {
   if (t->debugInBlock)
@@ -1025,6 +1063,8 @@ void block(Thread* t)
     debugMonitor->acquire(t->systemThread);
     while (not disposed
            and (loadSuspend() > 0 or loadThreadSuspend(t) > 0)) {
+      if (drainMail(t))
+        continue;
       debugMonitor->wait(t->systemThread, 0);
     }
     debugMonitor->release(t->systemThread);
@@ -1347,8 +1387,11 @@ void checkpointImpl(Thread* t, int32_t bci, uintptr_t bits, GcMethod* method)
 
   if (bp or doStep)
     fire(t, bci, site, method, bp, doStep);
-  else if (sus)
+  else if (sus) {
+    if (site or method)
+      setSnap(t, makeSnap(t, bci, site, method));
     block(t);
+  }
 }
 
 void postClassPrepare(Thread* t, ClassRec* rec)
@@ -1458,8 +1501,16 @@ void cmdCapabilities(uint32_t id, int n)
 {
   Buf b;
   bufInit(&b);
-  for (int i = 0; i < n; ++i)
-    b1(&b, 0);
+  for (int i = 0; i < n; ++i) {
+    int bit = 0;
+    // Capabilities and CapabilitiesNew share a prefix. 1 means the
+    // VM can do it: field watch, redefine, pop frames.
+    if (i == 0 or i == 1)
+      bit = 1;
+    if (n > 7 and (i == 7 or i == 10))
+      bit = 1;
+    b1(&b, bit);
+  }
   sendReply(id, 0, &b);
   bufFree(&b);
 }
@@ -1606,6 +1657,15 @@ void writeFields(Buf* b, ClassRec* c, bool generic)
   }
 }
 
+void cmdStack(uint32_t id, unsigned cmd, Reader* r);
+void cmdStaticGet(uint32_t id, Reader* r, ClassRec* c);
+void cmdVariableTable(uint32_t id, Reader* r, bool generic);
+void cmdObjectRef(uint32_t id, unsigned cmd, Reader* r);
+void cmdInvoke(uint32_t id, Reader* r, bool instance);
+void cmdRedefine(uint32_t id, Reader* r);
+void noteWatch(Request* r, int delta);
+void disposeObject(uint64_t id);
+
 void cmdReference(uint32_t id, unsigned cmd, Reader* r)
 {
   uint64_t cid = r8(r);
@@ -1665,6 +1725,15 @@ void cmdReference(uint32_t id, unsigned cmd, Reader* r)
   case 15:
     writeMethods(&b, c, true);
     break;
+  case 6: {
+    uint64_t cid = c->id;
+    unlockReg();
+    bufFree(&b);
+    Reader rest = *r;
+    (void)cid;
+    cmdStaticGet(id, &rest, c);
+    return;
+  }
   default:
     unlockReg();
     bufFree(&b);
@@ -1938,14 +2007,16 @@ bool consumeModifier(Reader* r, Request* req)
   case 2:  // Conditional (obsolete): exprID
     r4(r);
     return true;
-  case 8:  // ExceptionOnly: type, caught, uncaught. Not delivered.
-    r8(r);
-    r1(r);
-    r1(r);
+  case 8:  // ExceptionOnly
+    req->hasException = true;
+    req->exceptionClass = r8(r);
+    req->caught = static_cast<int>(r1(r));
+    req->uncaught = static_cast<int>(r1(r));
     return true;
-  case 9:  // FieldOnly: declaring type, field. Not delivered.
-    r8(r);
-    r8(r);
+  case 9:  // FieldOnly
+    req->hasField = true;
+    req->fieldClass = r8(r);
+    req->fieldId = r8(r);
     return true;
   case 10:  // Step
     req->hasStep = true;
@@ -2016,6 +2087,7 @@ void cmdEventSet(uint32_t id, Reader* r)
     patchMethodBits(m);
     __atomic_fetch_add(&breakpointCount, 1, __ATOMIC_RELEASE);
   }
+  noteWatch(req, +1);
   unlockReg();
   if (req->kind == 1)
     armStep(req);
@@ -2041,6 +2113,7 @@ void cmdEventClear(uint32_t id, Reader* r)
         patchMethodBits(findMethodGlobal(dead->locMethod, 0));
         __atomic_fetch_sub(&breakpointCount, 1, __ATOMIC_RELEASE);
       }
+      noteWatch(dead, -1);
       if (dead->kind == 1) {
         Thread* t = findThread(dead->stepThread);
         if (t)
@@ -2079,27 +2152,6 @@ void cmdClearBreakpoints(uint32_t id)
   sendReply(id, 0, 0);
 }
 
-void cmdStack(uint32_t id, unsigned cmd, Reader* r)
-{
-  uint64_t tid = r8(r);
-  r8(r);  // frame id, ignored: we don't have locals
-  Thread* t = findThread(tid);
-  if (t == 0) {
-    sendReply(id, kInvalidThread, 0);
-    return;
-  }
-  if (cmd == 3) {
-    // ThisObject.  Real receiver identity is not tracked.
-    Buf b;
-    bufInit(&b);
-    b1(&b, 'L');
-    b8(&b, 0);
-    sendReply(id, 0, &b);
-    bufFree(&b);
-    return;
-  }
-  sendReply(id, kAbsent, 0);
-}
 
 void dispatch(uint32_t id, unsigned set, unsigned cmd, Reader* r)
 {
@@ -2152,9 +2204,16 @@ void dispatch(uint32_t id, unsigned set, unsigned cmd, Reader* r)
     case 13:
       cmdClassPaths(id);
       return;
-    case 14:
+    case 14: {
+      int n = static_cast<int>(r4(r));
+      for (int i = 0; i < n; ++i) {
+        uint64_t oid = r8(r);
+        r4(r);
+        disposeObject(oid);
+      }
       sendReply(id, 0, 0);
       return;
+    }
     case 15:
       holdEvents = true;
       sendReply(id, 0, 0);
@@ -2165,6 +2224,9 @@ void dispatch(uint32_t id, unsigned set, unsigned cmd, Reader* r)
       return;
     case 17:
       cmdCapabilities(id, 32);
+      return;
+    case 18:
+      cmdRedefine(id, r);
       return;
     case 20:
       cmdAllClasses(id, true);
@@ -2181,6 +2243,10 @@ void dispatch(uint32_t id, unsigned set, unsigned cmd, Reader* r)
       cmdSuper(id, r);
       return;
     }
+    if (cmd == 3) {
+      cmdInvoke(id, r, false);
+      return;
+    }
     break;
   case 6:
     if (cmd == 1) {
@@ -2188,7 +2254,17 @@ void dispatch(uint32_t id, unsigned set, unsigned cmd, Reader* r)
       return;
     }
     if (cmd == 2 or cmd == 5) {
-      sendReply(id, kAbsent, 0);
+      cmdVariableTable(id, r, cmd == 5);
+      return;
+    }
+    break;
+  case 9:
+    if (cmd == 1 or cmd == 2) {
+      cmdObjectRef(id, cmd, r);
+      return;
+    }
+    if (cmd == 6) {
+      cmdInvoke(id, r, true);
       return;
     }
     break;
@@ -2437,6 +2513,1689 @@ bool parseOptions(const char* options)
     transportOk = strstr(options ? options : "", "dt_socket") != 0;
   return transportOk and serverOk;
 }
+
+// ---- locals, objects, mailbox -----------------------------------------
+
+const int kInvalidObject = 20;
+const int kInvalidField = 25;
+const int kNamesDontMatch = 69;
+
+struct LocalKey {
+  char* cn;
+  char* mn;
+  char* spec;
+  uint8_t* packed;
+  unsigned length;
+  LocalKey* next;
+};
+
+LocalKey* localKeys = 0;
+uint8_t* pendingLocals = 0;
+unsigned pendingLocalsLen = 0;
+
+struct ObjSlot {
+  object target;
+  uint64_t id;
+};
+
+ObjSlot* objects = 0;
+int objectCount = 0;
+int objectCap = 0;
+uint64_t nextObjectId = 1;
+
+FrameFn frameFn = 0;
+Invalidator invalidatorFn = 0;
+volatile int fieldWatchCount = 0;
+volatile int inhibitSuspend = 0;
+
+struct PopNote {
+  Thread* thread;
+  int armed;
+};
+PopNote pops[32];
+
+struct SuppressNote {
+  Thread* thread;
+  int on;
+};
+SuppressNote suppressed[32];
+
+const int kMailSlots = 16;
+
+struct Mail {
+  Thread* thread;
+  int op;
+  int frame;
+  int slot;
+  int tag;
+  uint64_t bits;
+  void* ref;
+  int n;
+  int tags[kMailSlots];
+  uint64_t vals[kMailSlots];
+  uint64_t methodId;
+  uint64_t classId;
+  uint64_t objectId;
+  int options;
+  uint8_t* bytes;
+  int byteCount;
+  int outTag;
+  uint64_t outBits;
+  uint64_t outEx;
+  int error;
+  int done;
+  Mail* next;
+};
+
+Mail* mailHead = 0;
+
+void setPendingLocalsImpl(uint8_t* packed, unsigned length)
+{
+  free(pendingLocals);
+  pendingLocals = packed;
+  pendingLocalsLen = length;
+}
+
+void bindPendingLocalsImpl(const char* className, const char* methodName,
+                           const char* spec)
+{
+  LocalKey** pp = &localKeys;
+  while (*pp) {
+    LocalKey* k = *pp;
+    if (::strcmp(k->cn, className) == 0 and ::strcmp(k->mn, methodName) == 0
+        and ::strcmp(k->spec, spec) == 0) {
+      free(k->packed);
+      k->packed = pendingLocals;
+      k->length = pendingLocalsLen;
+      pendingLocals = 0;
+      pendingLocalsLen = 0;
+      return;
+    }
+    pp = &k->next;
+  }
+  if (pendingLocals == 0)
+    return;
+  LocalKey* k = static_cast<LocalKey*>(calloc(1, sizeof(LocalKey)));
+  if (k == 0) {
+    free(pendingLocals);
+    pendingLocals = 0;
+    pendingLocalsLen = 0;
+    return;
+  }
+  k->cn = dupZ(className);
+  k->mn = dupZ(methodName);
+  k->spec = dupZ(spec);
+  k->packed = pendingLocals;
+  k->length = pendingLocalsLen;
+  k->next = localKeys;
+  localKeys = k;
+  pendingLocals = 0;
+  pendingLocalsLen = 0;
+}
+
+uint16_t rd16(const uint8_t* p)
+{
+  return static_cast<uint16_t>((p[0] << 8) | p[1]);
+}
+
+void loadVars(MethodRec* m, const char* cn, const char* mn, const char* spec)
+{
+  m->vars = 0;
+  m->varCount = 0;
+  LocalKey* found = 0;
+  for (LocalKey* k = localKeys; k; k = k->next) {
+    if (::strcmp(k->cn, cn) == 0 and ::strcmp(k->mn, mn) == 0
+        and ::strcmp(k->spec, spec) == 0) {
+      found = k;
+      break;
+    }
+  }
+  if (found == 0 or found->packed == 0 or found->length < 2)
+    return;
+  const uint8_t* p = found->packed;
+  const uint8_t* end = p + found->length;
+  int count = rd16(p);
+  p += 2;
+  if (count <= 0)
+    return;
+  VarRec* vars = static_cast<VarRec*>(calloc(count, sizeof(VarRec)));
+  if (vars == 0)
+    return;
+  int n = 0;
+  for (int i = 0; i < count and p + 8 <= end; ++i) {
+    int start = rd16(p);
+    p += 2;
+    int length = rd16(p);
+    p += 2;
+    int slot = rd16(p);
+    p += 2;
+    int nameLen = rd16(p);
+    p += 2;
+    if (p + nameLen > end)
+      break;
+    char* name = dupN(reinterpret_cast<const char*>(p), nameLen);
+    p += nameLen;
+    if (p + 2 > end)
+      break;
+    int specLen = rd16(p);
+    p += 2;
+    if (p + specLen > end)
+      break;
+    char* vs = dupN(reinterpret_cast<const char*>(p), specLen);
+    p += specLen;
+    vars[n].start = start;
+    vars[n].length = length;
+    vars[n].slot = slot;
+    vars[n].name = name;
+    vars[n].spec = vs;
+    ++n;
+  }
+  m->vars = vars;
+  m->varCount = n;
+}
+
+void refreshMethodRec(Thread* t, GcMethod* method)
+{
+  char cn[256], mn[256], sp[256];
+  cn[0] = mn[0] = sp[0] = 0;
+  fillNames(method, cn, mn, sp, 256);
+  lockReg();
+  MethodRec* mr = findMethodByName(cn, mn, sp);
+  if (mr) {
+    free(mr->lines);
+    mr->lines = 0;
+    mr->lineCount = 0;
+    if (mr->vars) {
+      for (int v = 0; v < mr->varCount; ++v) {
+        free(mr->vars[v].name);
+        free(mr->vars[v].spec);
+      }
+      free(mr->vars);
+    }
+    mr->vars = 0;
+    mr->varCount = 0;
+    mr->site = 0;
+    mr->argCount = method->parameterFootprint();
+  }
+  unlockReg();
+  if (mr == 0)
+    return;
+  readLines(t, method, mr);
+  loadVars(mr, cn, mn, sp);
+  lockReg();
+  linkSite(mr, cn);
+  unlockReg();
+}
+
+uint64_t internObject(object o)
+{
+  if (o == 0)
+    return 0;
+  for (int i = 0; i < objectCount; ++i) {
+    if (objects[i].id and objects[i].target == o)
+      return objects[i].id;
+  }
+  int slot = -1;
+  for (int i = 0; i < objectCount; ++i) {
+    if (objects[i].id == 0) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    if (objectCount == objectCap) {
+      int nc = objectCap ? objectCap * 2 : 32;
+      if (nc > 4096)
+        nc = 4096;
+      if (objectCount >= nc)
+        return 0;
+      ObjSlot* n = static_cast<ObjSlot*>(realloc(objects, nc * sizeof(ObjSlot)));
+      if (n == 0)
+        return 0;
+      objects = n;
+      objectCap = nc;
+    }
+    slot = objectCount++;
+  }
+  objects[slot].target = o;
+  objects[slot].id = nextObjectId++;
+  return objects[slot].id;
+}
+
+object objectFor(uint64_t id)
+{
+  if (id == 0)
+    return 0;
+  for (int i = 0; i < objectCount; ++i)
+    if (objects[i].id == id)
+      return objects[i].target;
+  return 0;
+}
+
+jobject objectRef(uint64_t id)
+{
+  if (id == 0)
+    return 0;
+  for (int i = 0; i < objectCount; ++i)
+    if (objects[i].id == id)
+      return &objects[i].target;
+  return 0;
+}
+
+void disposeObject(uint64_t id)
+{
+  for (int i = 0; i < objectCount; ++i) {
+    if (objects[i].id == id) {
+      objects[i].id = 0;
+      objects[i].target = 0;
+    }
+  }
+}
+
+int tagOfObject(Thread* t, object o)
+{
+  if (o == 0)
+    return 'L';
+  GcClass* c = objectClass(t, o);
+  if (c and c->name() and c->name()->body()[0] == '[')
+    return '[';
+  if (c and c->name()
+      and ::strcmp(reinterpret_cast<const char*>(c->name()->body().begin()),
+                   "java/lang/String") == 0)
+    return 's';
+  if (c and c->name()
+      and ::strcmp(reinterpret_cast<const char*>(c->name()->body().begin()),
+                   "java/lang/Thread") == 0)
+    return 't';
+  if (c and c->name()
+      and ::strcmp(reinterpret_cast<const char*>(c->name()->body().begin()),
+                   "java/lang/ThreadGroup") == 0)
+    return 'g';
+  if (c and c->name()
+      and ::strcmp(reinterpret_cast<const char*>(c->name()->body().begin()),
+                   "java/lang/ClassLoader") == 0)
+    return 'l';
+  if (c and c->name()
+      and ::strcmp(reinterpret_cast<const char*>(c->name()->body().begin()),
+                   "java/lang/Class") == 0)
+    return 'c';
+  return 'L';
+}
+
+void visitObjects(Heap::Visitor* v)
+{
+  for (int i = 0; i < objectCount; ++i) {
+    if (objects[i].id and objects[i].target)
+      v->visit(&objects[i].target);
+  }
+}
+
+bool threadSuspended(Thread* t)
+{
+  return loadSuspend() > 0 or loadThreadSuspend(t) > 0 or t->debugInBlock;
+}
+
+void requestPopImpl(Thread* t)
+{
+  for (int i = 0; i < 32; ++i) {
+    if (pops[i].thread == t) {
+      pops[i].armed = 1;
+      return;
+    }
+  }
+  for (int i = 0; i < 32; ++i) {
+    if (pops[i].thread == 0) {
+      pops[i].thread = t;
+      pops[i].armed = 1;
+      return;
+    }
+  }
+}
+
+bool takePopImpl(Thread* t)
+{
+  for (int i = 0; i < 32; ++i) {
+    if (pops[i].thread == t and pops[i].armed) {
+      pops[i].armed = 0;
+      return true;
+    }
+  }
+  return false;
+}
+
+void setSuppressImpl(Thread* t, bool on)
+{
+  for (int i = 0; i < 32; ++i) {
+    if (suppressed[i].thread == t) {
+      suppressed[i].on = on ? 1 : 0;
+      return;
+    }
+  }
+  if (not on)
+    return;
+  for (int i = 0; i < 32; ++i) {
+    if (suppressed[i].thread == 0) {
+      suppressed[i].thread = t;
+      suppressed[i].on = 1;
+      return;
+    }
+  }
+}
+
+bool suppressImpl(Thread* t)
+{
+  for (int i = 0; i < 32; ++i)
+    if (suppressed[i].thread == t and suppressed[i].on)
+      return true;
+  return false;
+}
+
+int postMail(Mail* m)
+{
+  if (debugMonitor == 0 or serverSystemThread == 0 or m->thread == 0
+      or m->thread->systemThread == 0)
+    return kOpaque;
+  m->done = 0;
+  m->error = 0;
+  debugMonitor->acquire(serverSystemThread);
+  m->next = mailHead;
+  mailHead = m;
+  debugMonitor->notifyAll(serverSystemThread);
+  while (not m->done and not disposed)
+    debugMonitor->wait(serverSystemThread, 0);
+  debugMonitor->release(serverSystemThread);
+  return m->done ? m->error : kOpaque;
+}
+
+bool nameEquals(GcByteArray* a, const char* b)
+{
+  if (a == 0 or b == 0)
+    return false;
+  return ::strcmp(reinterpret_cast<const char*>(a->body().begin()), b) == 0;
+}
+
+GcClass* findLiveClass(Thread* t, const char* internal)
+{
+  GcByteArray* nm = makeByteArray(t, static_cast<unsigned>(strlen(internal) + 1));
+  memcpy(nm->body().begin(), internal, strlen(internal) + 1);
+  GcClass* c = findLoadedClass(t, roots(t)->bootLoader(), nm);
+  if (c)
+    return c;
+  GcClassLoader* loader = roots(t)->appLoader();
+  if (loader)
+    c = findLoadedClass(t, loader, nm);
+  return c;
+}
+
+FieldRec* findFieldGlobal(uint64_t id, ClassRec** outClass)
+{
+  for (ClassRec* c = classes; c; c = c->next) {
+    for (int i = 0; i < c->fieldCount; ++i) {
+      if (c->fields[i].id == id) {
+        if (outClass)
+          *outClass = c;
+        return &c->fields[i];
+      }
+    }
+  }
+  return 0;
+}
+
+GcField* findGcField(Thread* t, GcClass* c, const char* name, const char* spec)
+{
+  GcArray* table = cast<GcArray>(t, c->fieldTable());
+  if (table == 0)
+    return 0;
+  for (unsigned i = 0; i < table->length(); ++i) {
+    if (table->body()[i] == 0)
+      continue;
+    GcField* f = cast<GcField>(t, table->body()[i]);
+    if (nameEquals(f->name(), name) and nameEquals(f->spec(), spec))
+      return f;
+  }
+  return 0;
+}
+
+GcMethod* findGcMethod(Thread* t, uint64_t id)
+{
+  char cn[256], mn[256], sp[256];
+  cn[0] = mn[0] = sp[0] = 0;
+  lockReg();
+  ClassRec* cc = 0;
+  MethodRec* mr = findMethodGlobal(id, &cc);
+  if (mr and cc) {
+    ::snprintf(cn, sizeof cn, "%s", cc->name);
+    ::snprintf(mn, sizeof mn, "%s", mr->name);
+    ::snprintf(sp, sizeof sp, "%s", mr->spec);
+  }
+  unlockReg();
+  if (cn[0] == 0)
+    return 0;
+  GcClass* c = findLiveClass(t, cn);
+  if (c == 0)
+    return 0;
+  GcArray* table = cast<GcArray>(t, c->methodTable());
+  if (table == 0)
+    return 0;
+  unsigned count = table->length();
+  GcClassAddendum* add = c->addendum();
+  if (add and add->declaredMethodCount() < count)
+    count = add->declaredMethodCount();
+  for (unsigned i = 0; i < count; ++i) {
+    if (table->body()[i] == 0)
+      continue;
+    GcMethod* m = cast<GcMethod>(t, table->body()[i]);
+    if (nameEquals(m->name(), mn) and nameEquals(m->spec(), sp))
+      return m;
+  }
+  return 0;
+}
+
+int readFieldValue(Thread* t, object target, GcField* f, int* tag, uint64_t* bits)
+{
+  if (target == 0 or f == 0)
+    return kInvalidField;
+  switch (f->code()) {
+  case ByteField:
+  case BooleanField:
+    *tag = f->code() == BooleanField ? 'Z' : 'B';
+    *bits = fieldAtOffset<int8_t>(target, f->offset());
+    return 0;
+  case CharField:
+    *tag = 'C';
+    *bits = fieldAtOffset<uint16_t>(target, f->offset());
+    return 0;
+  case ShortField:
+    *tag = 'S';
+    *bits = fieldAtOffset<int16_t>(target, f->offset());
+    return 0;
+  case FloatField:
+    *tag = 'F';
+    *bits = fieldAtOffset<uint32_t>(target, f->offset());
+    return 0;
+  case IntField:
+    *tag = 'I';
+    *bits = fieldAtOffset<int32_t>(target, f->offset());
+    return 0;
+  case DoubleField:
+    *tag = 'D';
+    *bits = fieldAtOffset<uint64_t>(target, f->offset());
+    return 0;
+  case LongField:
+    *tag = 'J';
+    *bits = fieldAtOffset<int64_t>(target, f->offset());
+    return 0;
+  case ObjectField: {
+    object v = fieldAtOffset<object>(target, f->offset());
+    *tag = tagOfObject(t, v);
+    *bits = internObject(v);
+    return 0;
+  }
+  default:
+    return kOpaque;
+  }
+}
+
+int writeFieldValue(Thread* t, object target, GcField* f, int tag, uint64_t bits)
+{
+  if (target == 0 or f == 0)
+    return kInvalidField;
+  switch (f->code()) {
+  case ByteField:
+  case BooleanField:
+    fieldAtOffset<int8_t>(target, f->offset()) = static_cast<int8_t>(bits);
+    return 0;
+  case CharField:
+  case ShortField:
+    fieldAtOffset<int16_t>(target, f->offset()) = static_cast<int16_t>(bits);
+    return 0;
+  case FloatField:
+  case IntField:
+    fieldAtOffset<int32_t>(target, f->offset()) = static_cast<int32_t>(bits);
+    return 0;
+  case DoubleField:
+  case LongField:
+    fieldAtOffset<int64_t>(target, f->offset()) = static_cast<int64_t>(bits);
+    return 0;
+  case ObjectField:
+    setField(t, target, f->offset(), objectFor(bits));
+    (void)tag;
+    return 0;
+  default:
+    return kOpaque;
+  }
+}
+
+void writeLocation(Buf* b, int tag, uint64_t cid, uint64_t mid, int64_t index)
+{
+  b1(b, tag ? tag : 1);
+  b8(b, cid);
+  b8(b, mid);
+  b8(b, static_cast<uint64_t>(index));
+}
+
+bool classIsOrSubtype(ClassRec* type, ClassRec* filter)
+{
+  for (ClassRec* c = type; c; ) {
+    if (c == filter or c->id == filter->id)
+      return true;
+    if (c->superName == 0 or c->superName[0] == 0)
+      break;
+    ClassRec* next = findClassByName(c->superName);
+    if (next == c)
+      break;
+    c = next;
+  }
+  return false;
+}
+
+bool filtersOk(Request* r, Thread* t, ClassRec* loc)
+{
+  uint64_t tid = reinterpret_cast<uint64_t>(t);
+  if (r->hasThread and r->thread != tid)
+    return false;
+  if (r->hasClass and (loc == 0 or r->classId != loc->id))
+    return false;
+  if (r->classMatch and (loc == 0 or not classMatch(r->classMatch, loc)))
+    return false;
+  if (r->classExclude and loc and classMatch(r->classExclude, loc))
+    return false;
+  return true;
+}
+
+void noteWatch(Request* r, int delta)
+{
+  if (r and (r->kind == 20 or r->kind == 21))
+    __atomic_fetch_add(&fieldWatchCount, delta, __ATOMIC_RELEASE);
+}
+
+struct EventHit {
+  int kind;
+  uint32_t id;
+  int policy;
+};
+
+int collect(Thread* t, int kind, ClassRec* loc, EventHit* hits, int cap,
+            bool (*extra)(Request*, void*), void* arg)
+{
+  int n = 0;
+  int policy = kSuspendNone;
+  uint64_t tid = reinterpret_cast<uint64_t>(t);
+  for (Request* r = requests; r and n < cap; r = r->next) {
+    if (r->kind != kind)
+      continue;
+    if (not filtersOk(r, t, loc))
+      continue;
+    if (extra and not extra(r, arg))
+      continue;
+    if (r->hasCount) {
+      if (r->count <= 0)
+        continue;
+      r->count -= 1;
+    }
+    hits[n].kind = r->kind;
+    hits[n].id = r->id;
+    hits[n].policy = r->policy;
+    ++n;
+    if (r->policy == kSuspendAll)
+      policy = kSuspendAll;
+    else if (r->policy == kSuspendEvent and policy == kSuspendNone)
+      policy = kSuspendEvent;
+  }
+  Request** pp = &requests;
+  while (*pp) {
+    Request* r = *pp;
+    if (r->hasCount and r->count <= 0 and r->kind == kind) {
+      *pp = r->next;
+      noteWatch(r, -1);
+      free(r->classMatch);
+      free(r->classExclude);
+      free(r);
+      continue;
+    }
+    pp = &r->next;
+  }
+  (void)tid;
+  (void)policy;
+  return n;
+}
+
+void finishSuspend(Thread* t)
+{
+  if (t->debugInBlock)
+    return;
+  if (loadSuspend() > 0 or loadThreadSuspend(t) > 0)
+    block(t);
+}
+
+void deliverField(Thread* t, GcField* field, object instance, int write,
+                  uint64_t bits, object valueRef, GcMethod* method, int32_t bci)
+{
+  if (field == 0)
+    return;
+  char cn[256], fn[256], fs[256];
+  cn[0] = fn[0] = fs[0] = 0;
+  if (field->class_())
+    copyBytes(cn, 256, field->class_()->name());
+  copyBytes(fn, 256, field->name());
+  copyBytes(fs, 256, field->spec());
+  int ftag = 'I';
+  uint64_t fbits = bits;
+  if (valueRef) {
+    ftag = tagOfObject(t, valueRef);
+    fbits = internObject(valueRef);
+  } else if (field->code() == ObjectField) {
+    ftag = 'L';
+  } else if (field->code() == LongField or field->code() == DoubleField) {
+    ftag = field->code() == LongField ? 'J' : 'D';
+  } else if (field->code() == BooleanField) {
+    ftag = 'Z';
+  } else if (field->code() == ByteField) {
+    ftag = 'B';
+  } else if (field->code() == CharField) {
+    ftag = 'C';
+  } else if (field->code() == ShortField) {
+    ftag = 'S';
+  } else if (field->code() == FloatField) {
+    ftag = 'F';
+  }
+  uint64_t instId = internObject(instance);
+  int instTag = tagOfObject(t, instance);
+  lockReg();
+  ClassRec* decl = findClassByName(cn);
+  FieldRec* fr = 0;
+  if (decl) {
+    for (int i = 0; i < decl->fieldCount; ++i) {
+      if (::strcmp(decl->fields[i].name, fn) == 0
+          and ::strcmp(decl->fields[i].spec, fs) == 0)
+        fr = &decl->fields[i];
+    }
+  }
+  if (fr == 0) {
+    unlockReg();
+    return;
+  }
+  struct Arg {
+    uint64_t fieldId;
+    int write;
+  } arg;
+  arg.fieldId = fr->id;
+  arg.write = write;
+  struct Local {
+    static bool extra(Request* r, void* p)
+    {
+      Arg* a = static_cast<Arg*>(p);
+      if (r->hasField and r->fieldId != a->fieldId)
+        return false;
+      return true;
+    }
+  };
+  char mcn[256], mmn[256], msp[256];
+  mcn[0] = mmn[0] = msp[0] = 0;
+  if (method)
+    fillNames(method, mcn, mmn, msp, 256);
+  ClassRec* loc = findClassByName(mcn);
+  int ltag = loc ? loc->typeTag : 1;
+  uint64_t cid = loc ? loc->id : 0;
+  MethodRec* mr = findMethodByName(mcn, mmn, msp);
+  uint64_t mid = mr ? mr->id : 0;
+  int dtag = decl->typeTag;
+  uint64_t did = decl->id;
+  uint64_t fid = fr->id;
+  EventHit hits[8];
+  int kind = write ? 21 : 20;
+  int n = collect(t, kind, loc, hits, 8, Local::extra, &arg);
+  int policy = kSuspendNone;
+  for (int i = 0; i < n; ++i)
+    if (hits[i].policy > policy)
+      policy = hits[i].policy;
+  unlockReg();
+  if (n == 0)
+    return;
+  Buf b;
+  bufInit(&b);
+  b1(&b, policy);
+  b4(&b, n);
+  for (int i = 0; i < n; ++i) {
+    b1(&b, kind);
+    b4(&b, hits[i].id);
+    b8(&b, reinterpret_cast<uint64_t>(t));
+    writeLocation(&b, ltag, cid, mid, bci);
+    b1(&b, dtag);
+    b8(&b, did);
+    b8(&b, fid);
+    b1(&b, instTag);
+    b8(&b, instId);
+    if (write) {
+      b1(&b, ftag);
+      if (ftag == 'J' or ftag == 'D')
+        b8(&b, fbits);
+      else if (ftag == 'L' or ftag == '[' or ftag == 's' or ftag == 't'
+               or ftag == 'g' or ftag == 'l' or ftag == 'c')
+        b8(&b, fbits);
+      else if (ftag == 'C' or ftag == 'S')
+        b2(&b, static_cast<unsigned>(fbits));
+      else if (ftag == 'B' or ftag == 'Z')
+        b1(&b, static_cast<unsigned>(fbits));
+      else
+        b4(&b, static_cast<unsigned>(fbits));
+    }
+  }
+  if (method)
+    setSnap(t, makeSnap(t, bci, 0, method));
+  sendEvent(policy, &b);
+  bufFree(&b);
+  if (policy != kSuspendNone and not t->debugInBlock)
+    suspendFor(t, policy);
+  finishSuspend(t);
+}
+
+void deliverException(Thread* t, object ex, int caught, GcMethod* throwMethod,
+                      int32_t throwBci, GcMethod* catchMethod, int32_t catchBci)
+{
+  uint64_t eid = internObject(ex);
+  int etag = tagOfObject(t, ex);
+  char ecn[256];
+  ecn[0] = 0;
+  if (ex)
+    copyBytes(ecn, 256, objectClass(t, ex)->name());
+  char tcn[256], tmn[256], tsp[256];
+  tcn[0] = tmn[0] = tsp[0] = 0;
+  if (throwMethod)
+    fillNames(throwMethod, tcn, tmn, tsp, 256);
+  char ccn[256], cmn[256], csp[256];
+  ccn[0] = cmn[0] = csp[0] = 0;
+  if (catchMethod)
+    fillNames(catchMethod, ccn, cmn, csp, 256);
+  lockReg();
+  ClassRec* loc = findClassByName(tcn);
+  MethodRec* tm = findMethodByName(tcn, tmn, tsp);
+  ClassRec* cc = findClassByName(ccn);
+  MethodRec* cm = findMethodByName(ccn, cmn, csp);
+  ClassRec* et = findClassByName(ecn);
+  struct Arg {
+    int caught;
+    ClassRec* et;
+  } arg;
+  arg.caught = caught;
+  arg.et = et;
+  struct Local {
+    static bool extra(Request* r, void* p)
+    {
+      Arg* a = static_cast<Arg*>(p);
+      if (r->hasException) {
+        if (a->caught and not r->caught)
+          return false;
+        if (not a->caught and not r->uncaught)
+          return false;
+        if (r->exceptionClass) {
+          ClassRec* f = findClass(r->exceptionClass);
+          if (f and (a->et == 0 or not classIsOrSubtype(a->et, f)))
+            return false;
+        }
+      }
+      return true;
+    }
+  };
+  EventHit hits[8];
+  int n = collect(t, 4, loc, hits, 8, Local::extra, &arg);
+  int policy = kSuspendNone;
+  for (int i = 0; i < n; ++i)
+    if (hits[i].policy > policy)
+      policy = hits[i].policy;
+  int ltag = loc ? loc->typeTag : 1;
+  uint64_t cid = loc ? loc->id : 0;
+  uint64_t mid = tm ? tm->id : 0;
+  int ctag = cc ? cc->typeTag : 1;
+  uint64_t ccid = cc ? cc->id : 0;
+  uint64_t cmid = cm ? cm->id : 0;
+  unlockReg();
+  if (n == 0)
+    return;
+  Buf b;
+  bufInit(&b);
+  b1(&b, policy);
+  b4(&b, n);
+  for (int i = 0; i < n; ++i) {
+    b1(&b, 4);
+    b4(&b, hits[i].id);
+    b8(&b, reinterpret_cast<uint64_t>(t));
+    writeLocation(&b, ltag, cid, mid, throwBci);
+    b1(&b, etag);
+    b8(&b, eid);
+    if (caught)
+      writeLocation(&b, ctag, ccid, cmid, catchBci);
+    else
+      writeLocation(&b, 1, 0, 0, 0);
+  }
+  if (__atomic_load_n(&inhibitSuspend, __ATOMIC_ACQUIRE) == 0 and throwMethod)
+    setSnap(t, makeSnap(t, throwBci, 0, throwMethod));
+  sendEvent(policy, &b);
+  bufFree(&b);
+  // inhibitSuspend: the thread is inside the JIT unwinder.  Record the
+  // suspend so the next consistent checkpoint blocks, but do not Idle here.
+  if (policy != kSuspendNone and not t->debugInBlock)
+    suspendFor(t, policy);
+  if (__atomic_load_n(&inhibitSuspend, __ATOMIC_ACQUIRE) == 0)
+    finishSuspend(t);
+}
+
+void deliverThread(Thread* t, int kind)
+{
+  lockReg();
+  EventHit hits[8];
+  int n = collect(t, kind, 0, hits, 8, 0, 0);
+  int policy = kSuspendNone;
+  for (int i = 0; i < n; ++i)
+    if (hits[i].policy > policy)
+      policy = hits[i].policy;
+  unlockReg();
+  if (n == 0)
+    return;
+  Buf b;
+  bufInit(&b);
+  b1(&b, policy);
+  b4(&b, n);
+  for (int i = 0; i < n; ++i) {
+    b1(&b, kind);
+    b4(&b, hits[i].id);
+    b8(&b, reinterpret_cast<uint64_t>(t));
+  }
+  sendEvent(policy, &b);
+  bufFree(&b);
+  if (policy != kSuspendNone and not t->debugInBlock)
+    suspendFor(t, policy);
+  finishSuspend(t);
+}
+
+int returnTag(GcMethod* method)
+{
+  switch (method->returnCode()) {
+  case ByteField:
+    return 'B';
+  case BooleanField:
+    return 'Z';
+  case CharField:
+    return 'C';
+  case ShortField:
+    return 'S';
+  case FloatField:
+    return 'F';
+  case IntField:
+    return 'I';
+  case LongField:
+    return 'J';
+  case DoubleField:
+    return 'D';
+  case ObjectField:
+    return 'L';
+  default:
+    return 'V';
+  }
+}
+
+void handleInvoke(Thread* t, Mail* m)
+{
+  GcMethod* method = findGcMethod(t, m->methodId);
+  if (method == 0) {
+    m->error = kInvalidMethod;
+    return;
+  }
+  if ((method->flags() & ACC_STATIC) == 0 and m->objectId == 0) {
+    m->error = kInvalidObject;
+    return;
+  }
+  jvalue args[kMailSlots];
+  memset(args, 0, sizeof args);
+  const char* spec = reinterpret_cast<const char*>(method->spec()->body().begin());
+  int ai = 0;
+  for (const char* s = spec; *s and *s != ')'; ++s) {
+    if (*s == '(')
+      continue;
+    if (ai >= m->n or ai >= kMailSlots)
+      break;
+    int tag = m->tags[ai];
+    uint64_t bits = m->vals[ai];
+    if (*s == 'L' or *s == '[') {
+      args[ai].l = objectRef(bits);
+      while (*s == '[')
+        ++s;
+      if (*s == 'L') {
+        while (*s and *s != ';')
+          ++s;
+      }
+    } else if (*s == 'J') {
+      args[ai].j = static_cast<jlong>(bits);
+    } else if (*s == 'D') {
+      jlong raw = static_cast<jlong>(bits);
+      args[ai].d = *reinterpret_cast<jdouble*>(&raw);
+    } else if (*s == 'F') {
+      jint raw = static_cast<jint>(bits);
+      args[ai].f = *reinterpret_cast<jfloat*>(&raw);
+    } else {
+      args[ai].i = static_cast<jint>(bits);
+      (void)tag;
+    }
+    ++ai;
+  }
+  object self = (method->flags() & ACC_STATIC) ? 0 : objectFor(m->objectId);
+  setSuppressImpl(t, true);
+  t->exception = 0;
+  object result = t->m->processor->invokeArray(t, method, self, args);
+  object ex = t->exception;
+  t->exception = 0;
+  setSuppressImpl(t, false);
+  m->outEx = internObject(ex);
+  if (ex) {
+    m->outTag = 'V';
+    m->outBits = 0;
+    return;
+  }
+  int rt = returnTag(method);
+  m->outTag = rt;
+  m->outBits = 0;
+  if (result == 0)
+    return;
+  if (rt == 'L' or rt == '[') {
+    m->outTag = tagOfObject(t, result);
+    m->outBits = internObject(result);
+  } else if (rt == 'J' or rt == 'D') {
+    m->outBits = cast<GcLong>(t, result)->value();
+  } else if (rt != 'V') {
+    m->outBits = static_cast<uint32_t>(cast<GcInt>(t, result)->value());
+  }
+}
+
+int methodCountOf(Thread* t, GcClass* c)
+{
+  GcArray* table = cast<GcArray>(t, c->methodTable());
+  if (table == 0)
+    return 0;
+  unsigned count = table->length();
+  GcClassAddendum* add = c->addendum();
+  if (add and add->declaredMethodCount() < count)
+    count = add->declaredMethodCount();
+  return static_cast<int>(count);
+}
+
+GcMethod* methodAt(Thread* t, GcClass* c, int i)
+{
+  GcArray* table = cast<GcArray>(t, c->methodTable());
+  if (table == 0 or table->body()[i] == 0)
+    return 0;
+  return cast<GcMethod>(t, table->body()[i]);
+}
+
+int fieldCountOf(Thread* t, GcClass* c)
+{
+  GcArray* table = cast<GcArray>(t, c->fieldTable());
+  if (table == 0)
+    return 0;
+  int n = 0;
+  for (unsigned i = 0; i < table->length(); ++i)
+    if (table->body()[i])
+      ++n;
+  return n;
+}
+
+void handleRedefine(Thread* t, Mail* m)
+{
+  lockReg();
+  ClassRec* cr = findClass(m->classId);
+  char cn[256];
+  cn[0] = 0;
+  if (cr)
+    ::snprintf(cn, sizeof cn, "%s", cr->name);
+  unlockReg();
+  if (cn[0] == 0) {
+    m->error = kInvalidClass;
+    return;
+  }
+  GcClass* live = findLiveClass(t, cn);
+  if (live == 0) {
+    m->error = kInvalidClass;
+    return;
+  }
+  PROTECT(t, live);
+  GcClass* neu = parseClass(t, live->loader(), m->bytes, m->byteCount);
+  if (t->exception or neu == 0) {
+    t->exception = 0;
+    m->error = 62;
+    return;
+  }
+  PROTECT(t, neu);
+  if (not nameEquals(neu->name(), cn)) {
+    m->error = kNamesDontMatch;
+    return;
+  }
+  if (fieldCountOf(t, live) != fieldCountOf(t, neu)) {
+    m->error = kSchema;
+    return;
+  }
+  GcArray* oft = cast<GcArray>(t, live->fieldTable());
+  GcArray* nft = cast<GcArray>(t, neu->fieldTable());
+  if (oft and nft) {
+    for (unsigned i = 0; i < oft->length(); ++i) {
+      if (oft->body()[i] == 0)
+        continue;
+      GcField* a = cast<GcField>(t, oft->body()[i]);
+      bool found = false;
+      for (unsigned j = 0; j < nft->length(); ++j) {
+        if (nft->body()[j] == 0)
+          continue;
+        GcField* b = cast<GcField>(t, nft->body()[j]);
+        if (nameEquals(b->name(), reinterpret_cast<const char*>(a->name()->body().begin()))
+            and nameEquals(b->spec(), reinterpret_cast<const char*>(a->spec()->body().begin()))) {
+          if (a->flags() != b->flags() or a->code() != b->code()) {
+            m->error = kSchema;
+            return;
+          }
+          found = true;
+        }
+      }
+      if (not found) {
+        m->error = kSchema;
+        return;
+      }
+    }
+  }
+  int oc = methodCountOf(t, live);
+  int nc = methodCountOf(t, neu);
+  for (int i = 0; i < nc; ++i) {
+    GcMethod* b = methodAt(t, neu, i);
+    if (b == 0)
+      continue;
+    bool found = false;
+    for (int j = 0; j < oc; ++j) {
+      GcMethod* a = methodAt(t, live, j);
+      if (a and nameEquals(a->name(), reinterpret_cast<const char*>(b->name()->body().begin()))
+          and nameEquals(a->spec(), reinterpret_cast<const char*>(b->spec()->body().begin())))
+        found = true;
+    }
+    if (not found) {
+      m->error = kAddMethod;
+      return;
+    }
+  }
+  for (int i = 0; i < oc; ++i) {
+    GcMethod* a = methodAt(t, live, i);
+    if (a == 0)
+      continue;
+    GcMethod* b = 0;
+    for (int j = 0; j < nc; ++j) {
+      GcMethod* c = methodAt(t, neu, j);
+      if (c and nameEquals(c->name(), reinterpret_cast<const char*>(a->name()->body().begin()))
+          and nameEquals(c->spec(), reinterpret_cast<const char*>(a->spec()->body().begin())))
+        b = c;
+    }
+    if (b == 0) {
+      m->error = 67;
+      return;
+    }
+    if ((a->flags() & ACC_STATIC) != (b->flags() & ACC_STATIC)) {
+      m->error = 68;
+      return;
+    }
+    if (a->code() and b->code()) {
+      PROTECT(t, a);
+      PROTECT(t, b);
+      a->setCode(t, b->code());
+      if (invalidatorFn)
+        invalidatorFn(t, a);
+      refreshMethodRec(t, a);
+    }
+  }
+  lockReg();
+  Request** pp = &requests;
+  while (*pp) {
+    Request* r = *pp;
+    if (r->kind == 2 and r->hasLocation and r->locClass == m->classId) {
+      *pp = r->next;
+      ClassRec* cc = 0;
+      MethodRec* mr = findMethodGlobal(r->locMethod, &cc);
+      patchMethodBits(mr);
+      __atomic_fetch_sub(&breakpointCount, 1, __ATOMIC_RELEASE);
+      free(r->classMatch);
+      free(r->classExclude);
+      free(r);
+      continue;
+    }
+    pp = &r->next;
+  }
+  unlockReg();
+}
+
+void handleMail(Thread* t, Mail* m)
+{
+  m->error = 0;
+  if (m->op == 1 or m->op == 2 or m->op == 3 or m->op == 4) {
+    if (frameFn == 0) {
+      m->error = kOpaque;
+      return;
+    }
+    SlotIO io;
+    memset(&io, 0, sizeof io);
+    io.tag = m->tag;
+    io.bits = m->bits;
+    io.ref = m->op == 2 ? objectFor(m->bits) : 0;
+    if (m->tag == 'L' or m->tag == '[' or m->tag == 's' or m->tag == 't'
+        or m->tag == 'g' or m->tag == 'l' or m->tag == 'c') {
+      if (m->op == 2)
+        io.ref = objectFor(m->bits);
+    }
+    int st = frameFn(t, m->op, m->frame, m->slot, &io);
+    m->error = st ? st : io.status;
+    if (m->error)
+      return;
+    if (m->op == 1 or m->op == 3) {
+      if (io.tag == 'L' or io.tag == '[' or io.tag == 's' or io.tag == 't'
+          or io.tag == 'g' or io.tag == 'l' or io.tag == 'c'
+          or (m->op == 3)) {
+        object o = static_cast<object>(io.ref);
+        m->outTag = o ? tagOfObject(t, o) : 'L';
+        m->outBits = internObject(o);
+      } else {
+        m->outTag = io.tag ? io.tag : m->tag;
+        m->outBits = io.bits;
+      }
+    }
+    return;
+  }
+  if (m->op == 5) {
+    handleInvoke(t, m);
+    return;
+  }
+  if (m->op == 6) {
+    handleRedefine(t, m);
+    return;
+  }
+  if (m->op == 7 or m->op == 8) {
+    object inst = objectFor(m->objectId);
+    for (int i = 0; i < m->n; ++i) {
+      lockReg();
+      ClassRec* cc = 0;
+      FieldRec* fr = findFieldGlobal(m->vals[i], &cc);
+      char cn[256], fn[256], fs[256];
+      cn[0] = fn[0] = fs[0] = 0;
+      int flags = 0;
+      if (fr and cc) {
+        ::snprintf(cn, sizeof cn, "%s", cc->name);
+        ::snprintf(fn, sizeof fn, "%s", fr->name);
+        ::snprintf(fs, sizeof fs, "%s", fr->spec);
+        flags = fr->flags;
+      }
+      unlockReg();
+      if (fn[0] == 0) {
+        m->error = kInvalidField;
+        return;
+      }
+      GcClass* c = findLiveClass(t, cn);
+      GcField* f = c ? findGcField(t, c, fn, fs) : 0;
+      if (f == 0) {
+        m->error = kInvalidField;
+        return;
+      }
+      object target = (flags & ACC_STATIC) ? f->class_()->staticTable() : inst;
+      if (m->op == 7) {
+        int tag = 0;
+        uint64_t bits = 0;
+        int err = readFieldValue(t, target, f, &tag, &bits);
+        if (err) {
+          m->error = err;
+          return;
+        }
+        m->tags[i] = tag;
+        m->vals[i] = bits;
+      } else {
+        int err = writeFieldValue(t, target, f, m->tags[i], m->vals[i]);
+        if (err) {
+          m->error = err;
+          return;
+        }
+      }
+    }
+    return;
+  }
+  if (m->op == 9) {
+    object o = objectFor(m->objectId);
+    if (o == 0) {
+      m->error = kInvalidObject;
+      return;
+    }
+    GcClass* c = objectClass(t, o);
+    char name[256];
+    name[0] = 0;
+    copyBytes(name, 256, c->name());
+    lockReg();
+    ClassRec* cr = findClassByName(name);
+    m->outTag = cr ? cr->typeTag : 1;
+    m->outBits = cr ? cr->id : 0;
+    unlockReg();
+    if (cr == 0)
+      m->error = kInvalidObject;
+    return;
+  }
+  m->error = kNotImplemented;
+}
+
+bool drainMail(Thread* t)
+{
+  Mail* m = 0;
+  Mail** pp = &mailHead;
+  while (*pp) {
+    if ((*pp)->thread == t and not (*pp)->done) {
+      m = *pp;
+      *pp = m->next;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  if (m == 0)
+    return false;
+  debugMonitor->release(t->systemThread);
+  {
+    ENTER(t, Thread::ActiveState);
+    handleMail(t, m);
+  }
+  debugMonitor->acquire(t->systemThread);
+  m->done = 1;
+  debugMonitor->notifyAll(t->systemThread);
+  return true;
+}
+
+void writeTagged(Buf* b, int tag, uint64_t bits)
+{
+  b1(b, tag ? tag : 'V');
+  if (tag == 'V' or tag == 0)
+    return;
+  if (tag == 'J' or tag == 'D')
+    b8(b, bits);
+  else if (tag == 'L' or tag == '[' or tag == 's' or tag == 't' or tag == 'g'
+           or tag == 'l' or tag == 'c')
+    b8(b, bits);
+  else if (tag == 'C' or tag == 'S')
+    b2(b, static_cast<unsigned>(bits));
+  else if (tag == 'B' or tag == 'Z')
+    b1(b, static_cast<unsigned>(bits));
+  else
+    b4(b, static_cast<unsigned>(bits));
+}
+
+bool readTagged(Reader* r, int* tag, uint64_t* bits)
+{
+  *tag = static_cast<int>(r1(r));
+  *bits = 0;
+  if (*tag == 'J' or *tag == 'D')
+    *bits = r8(r);
+  else if (*tag == 'L' or *tag == '[' or *tag == 's' or *tag == 't' or *tag == 'g'
+           or *tag == 'l' or *tag == 'c')
+    *bits = r8(r);
+  else if (*tag == 'C' or *tag == 'S')
+    *bits = r2(r);
+  else if (*tag == 'B' or *tag == 'Z')
+    *bits = r1(r);
+  else if (*tag == 'V')
+    return true;
+  else
+    *bits = r4(r);
+  return not r->error;
+}
+
+void cmdVariableTable(uint32_t id, Reader* r, bool generic)
+{
+  unsigned remain = r->n - r->i;
+  uint64_t mid;
+  if (remain >= 16) {
+    r8(r);
+    mid = r8(r);
+  } else {
+    mid = r8(r);
+  }
+  lockReg();
+  ClassRec* cc = 0;
+  MethodRec* m = findMethodGlobal(mid, &cc);
+  if (m == 0) {
+    unlockReg();
+    sendReply(id, kInvalidMethod, 0);
+    return;
+  }
+  if (m->varCount <= 0) {
+    unlockReg();
+    sendReply(id, kAbsent, 0);
+    return;
+  }
+  Buf b;
+  bufInit(&b);
+  b4(&b, m->argCount);
+  b4(&b, m->varCount);
+  for (int i = 0; i < m->varCount; ++i) {
+    b8(&b, static_cast<uint64_t>(m->vars[i].start));
+    bstr(&b, m->vars[i].name);
+    bstr(&b, m->vars[i].spec);
+    if (generic)
+      bstr(&b, "");
+    b4(&b, m->vars[i].length);
+    b4(&b, m->vars[i].slot);
+  }
+  unlockReg();
+  sendReply(id, 0, &b);
+  bufFree(&b);
+}
+
+void cmdStack(uint32_t id, unsigned cmd, Reader* r)
+{
+  uint64_t tid = r8(r);
+  uint64_t fid = r8(r);
+  Thread* t = findThread(tid);
+  if (t == 0) {
+    sendReply(id, kInvalidThread, 0);
+    return;
+  }
+  if (not threadSuspended(t)) {
+    sendReply(id, kThreadNotSuspended, 0);
+    return;
+  }
+  int frame = static_cast<int>(fid) - 1;
+  if (frame < 0) {
+    sendReply(id, kInvalidFrame, 0);
+    return;
+  }
+  if (cmd == 4) {
+    Mail m;
+    memset(&m, 0, sizeof m);
+    m.thread = t;
+    m.op = 4;
+    m.frame = frame;
+    int err = postMail(&m);
+    sendReply(id, err, 0);
+    return;
+  }
+  if (cmd == 3) {
+    Mail m;
+    memset(&m, 0, sizeof m);
+    m.thread = t;
+    m.op = 3;
+    m.frame = frame;
+    m.tag = 'L';
+    int err = postMail(&m);
+    if (err) {
+      sendReply(id, err, 0);
+      return;
+    }
+    Buf b;
+    bufInit(&b);
+    b1(&b, 'L');
+    b8(&b, m.outBits);
+    sendReply(id, 0, &b);
+    bufFree(&b);
+    return;
+  }
+  if (cmd == 1) {
+    int n = static_cast<int>(r4(r));
+    if (n < 0 or n > kMailSlots) {
+      sendReply(id, kIllegalArgument, 0);
+      return;
+    }
+    int slots[kMailSlots];
+    int tags[kMailSlots];
+    for (int i = 0; i < n; ++i) {
+      slots[i] = static_cast<int>(r4(r));
+      tags[i] = static_cast<int>(r1(r));
+    }
+    Buf b;
+    bufInit(&b);
+    b4(&b, n);
+    for (int i = 0; i < n; ++i) {
+      Mail m;
+      memset(&m, 0, sizeof m);
+      m.thread = t;
+      m.op = 1;
+      m.frame = frame;
+      m.slot = slots[i];
+      m.tag = tags[i];
+      int err = postMail(&m);
+      if (err) {
+        bufFree(&b);
+        sendReply(id, err, 0);
+        return;
+      }
+      writeTagged(&b, m.outTag ? m.outTag : tags[i], m.outBits);
+    }
+    sendReply(id, 0, &b);
+    bufFree(&b);
+    return;
+  }
+  if (cmd == 2) {
+    int n = static_cast<int>(r4(r));
+    if (n < 0 or n > kMailSlots) {
+      sendReply(id, kIllegalArgument, 0);
+      return;
+    }
+    for (int i = 0; i < n; ++i) {
+      int slot = static_cast<int>(r4(r));
+      int tag = 0;
+      uint64_t bits = 0;
+      if (not readTagged(r, &tag, &bits)) {
+        sendReply(id, kIllegalArgument, 0);
+        return;
+      }
+      Mail m;
+      memset(&m, 0, sizeof m);
+      m.thread = t;
+      m.op = 2;
+      m.frame = frame;
+      m.slot = slot;
+      m.tag = tag;
+      m.bits = bits;
+      int err = postMail(&m);
+      if (err) {
+        sendReply(id, err, 0);
+        return;
+      }
+    }
+    sendReply(id, 0, 0);
+    return;
+  }
+  sendReply(id, kNotImplemented, 0);
+}
+
+
+void cmdObjectRef(uint32_t id, unsigned cmd, Reader* r)
+{
+  uint64_t oid = r8(r);
+  Thread* t = machine_ ? machine_->rootThread : 0;
+  if (t == 0 or not threadSuspended(t)) {
+    sendReply(id, kThreadNotSuspended, 0);
+    return;
+  }
+  if (cmd == 1) {
+    Mail m;
+    memset(&m, 0, sizeof m);
+    m.thread = t;
+    m.op = 9;
+    m.objectId = oid;
+    int err = postMail(&m);
+    if (err) {
+      sendReply(id, err, 0);
+      return;
+    }
+    Buf b;
+    bufInit(&b);
+    b1(&b, static_cast<unsigned>(m.outTag ? m.outTag : 1));
+    b8(&b, m.outBits);
+    sendReply(id, 0, &b);
+    bufFree(&b);
+    return;
+  }
+  if (cmd == 2) {
+    int n = static_cast<int>(r4(r));
+    if (n < 0 or n > kMailSlots) {
+      sendReply(id, kIllegalArgument, 0);
+      return;
+    }
+    Mail m;
+    memset(&m, 0, sizeof m);
+    m.thread = t;
+    m.op = 7;
+    m.objectId = oid;
+    m.n = n;
+    for (int i = 0; i < n; ++i)
+      m.vals[i] = r8(r);
+    int err = postMail(&m);
+    if (err) {
+      sendReply(id, err, 0);
+      return;
+    }
+    Buf b;
+    bufInit(&b);
+    b4(&b, n);
+    for (int i = 0; i < n; ++i)
+      writeTagged(&b, m.tags[i], m.vals[i]);
+    sendReply(id, 0, &b);
+    bufFree(&b);
+    return;
+  }
+  sendReply(id, kNotImplemented, 0);
+}
+
+void cmdStaticGet(uint32_t id, Reader* r, ClassRec* c)
+{
+  int n = static_cast<int>(r4(r));
+  if (n < 0 or n > kMailSlots) {
+    sendReply(id, kIllegalArgument, 0);
+    return;
+  }
+  Thread* t = machine_ ? machine_->rootThread : 0;
+  if (t == 0 or not threadSuspended(t)) {
+    sendReply(id, kThreadNotSuspended, 0);
+    return;
+  }
+  Mail m;
+  memset(&m, 0, sizeof m);
+  m.thread = t;
+  m.op = 7;
+  m.n = n;
+  m.classId = c->id;
+  for (int i = 0; i < n; ++i)
+    m.vals[i] = r8(r);
+  int err = postMail(&m);
+  if (err) {
+    sendReply(id, err, 0);
+    return;
+  }
+  Buf b;
+  bufInit(&b);
+  b4(&b, n);
+  for (int i = 0; i < n; ++i)
+    writeTagged(&b, m.tags[i], m.vals[i]);
+  sendReply(id, 0, &b);
+  bufFree(&b);
+}
+
+void cmdInvoke(uint32_t id, Reader* r, bool instance)
+{
+  uint64_t oid = 0;
+  uint64_t cid = 0;
+  uint64_t tid = 0;
+  if (instance) {
+    oid = r8(r);
+    tid = r8(r);
+    cid = r8(r);
+  } else {
+    cid = r8(r);
+    tid = r8(r);
+  }
+  uint64_t mid = r8(r);
+  int n = static_cast<int>(r4(r));
+  Thread* t = findThread(tid);
+  if (t == 0) {
+    sendReply(id, kInvalidThread, 0);
+    return;
+  }
+  if (not threadSuspended(t)) {
+    sendReply(id, kThreadNotSuspended, 0);
+    return;
+  }
+  if (n < 0 or n > kMailSlots) {
+    sendReply(id, kIllegalArgument, 0);
+    return;
+  }
+  Mail m;
+  memset(&m, 0, sizeof m);
+  m.thread = t;
+  m.op = 5;
+  m.objectId = oid;
+  m.classId = cid;
+  m.methodId = mid;
+  m.n = n;
+  for (int i = 0; i < n; ++i) {
+    if (not readTagged(r, &m.tags[i], &m.vals[i])) {
+      sendReply(id, kIllegalArgument, 0);
+      return;
+    }
+  }
+  m.options = static_cast<int>(r4(r));
+  (void)instance;
+  int err = postMail(&m);
+  if (err) {
+    sendReply(id, err, 0);
+    return;
+  }
+  Buf b;
+  bufInit(&b);
+  writeTagged(&b, m.outTag ? m.outTag : 'V', m.outBits);
+  b1(&b, 'L');
+  b8(&b, m.outEx);
+  sendReply(id, 0, &b);
+  bufFree(&b);
+}
+
+void cmdRedefine(uint32_t id, Reader* r)
+{
+  int n = static_cast<int>(r4(r));
+  if (n != 1) {
+    // One class per call keeps the mailbox bounded. jdb sends the
+    // classes it was given; the test sends one.
+    if (n < 1) {
+      sendReply(id, 0, 0);
+      return;
+    }
+  }
+  Thread* t = machine_ ? machine_->rootThread : 0;
+  if (t == 0 or not threadSuspended(t)) {
+    sendReply(id, kThreadNotSuspended, 0);
+    return;
+  }
+  int err = 0;
+  for (int i = 0; i < n; ++i) {
+    uint64_t cid = r8(r);
+    int len = static_cast<int>(r4(r));
+    if (len < 0 or r->i + static_cast<unsigned>(len) > r->n) {
+      sendReply(id, kIllegalArgument, 0);
+      return;
+    }
+    uint8_t* bytes = static_cast<uint8_t*>(malloc(len ? len : 1));
+    if (bytes == 0) {
+      sendReply(id, kIllegalArgument, 0);
+      return;
+    }
+    memcpy(bytes, r->p + r->i, len);
+    r->i += len;
+    Mail m;
+    memset(&m, 0, sizeof m);
+    m.thread = t;
+    m.op = 6;
+    m.classId = cid;
+    m.bytes = bytes;
+    m.byteCount = len;
+    err = postMail(&m);
+    free(bytes);
+    if (err)
+      break;
+  }
+  sendReply(id, err, 0);
+}
+
 
 }  // namespace
 
@@ -2736,6 +4495,101 @@ void shutdown(Thread* t)
   disposed = true;
   resumeAll();
   (void)t;
+}
+
+void setPendingLocals(uint8_t* packed, unsigned length)
+{
+  setPendingLocalsImpl(packed, length);
+}
+
+void bindPendingLocals(const char* className, const char* methodName,
+                       const char* spec)
+{
+  bindPendingLocalsImpl(className, methodName, spec);
+}
+
+void visit(Heap::Visitor* visitor)
+{
+  if (visitor)
+    visitObjects(visitor);
+}
+
+void registerFrameFn(FrameFn fn)
+{
+  frameFn = fn;
+}
+
+void registerInvalidator(Invalidator fn)
+{
+  invalidatorFn = fn;
+}
+
+bool watchingFields()
+{
+  return __atomic_load_n(&fieldWatchCount, __ATOMIC_ACQUIRE) > 0;
+}
+
+void onField(Thread* t, void* field, void* instance, int write, uint64_t bits,
+             void* valueRef, void* method, int32_t bci)
+{
+  if (not enabledFlag or t == 0)
+    return;
+  if (__atomic_load_n(&fieldWatchCount, __ATOMIC_ACQUIRE) <= 0)
+    return;
+  deliverField(t, static_cast<GcField*>(field), static_cast<object>(instance),
+               write, bits, static_cast<object>(valueRef),
+               static_cast<GcMethod*>(method), bci);
+}
+
+void onException(Thread* t, void* exception, int caught, void* throwMethod,
+                 int32_t throwBci, void* catchMethod, int32_t catchBci)
+{
+  if (not enabledFlag or t == 0 or exception == 0)
+    return;
+  deliverException(t, static_cast<object>(exception), caught,
+                   static_cast<GcMethod*>(throwMethod), throwBci,
+                   static_cast<GcMethod*>(catchMethod), catchBci);
+}
+
+void onThreadStart(Thread* t)
+{
+  if (not enabledFlag or t == 0)
+    return;
+  deliverThread(t, 6);
+}
+
+void onThreadDeath(Thread* t)
+{
+  if (not enabledFlag or t == 0)
+    return;
+  deliverThread(t, 7);
+}
+
+void requestPop(Thread* t)
+{
+  if (t)
+    requestPopImpl(t);
+}
+
+bool takePop(Thread* t)
+{
+  return t and takePopImpl(t);
+}
+
+bool suppressThrow(Thread* t)
+{
+  return t and suppressImpl(t);
+}
+
+void setSuppressThrow(Thread* t, bool on)
+{
+  if (t)
+    setSuppressImpl(t, on);
+}
+
+void setInhibitSuspend(bool on)
+{
+  __atomic_store_n(&inhibitSuspend, on ? 1 : 0, __ATOMIC_RELEASE);
 }
 
 }  // namespace debug

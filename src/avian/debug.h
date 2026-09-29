@@ -5,6 +5,7 @@
 #define AVIAN_DEBUG_H
 
 #include <stdint.h>
+#include <avian/heap/heap.h>
 
 // JDWP is a client of this layer.  The VM posts class-prepare,
 // breakpoint and single-step events here; the JDWP server (and, later,
@@ -101,6 +102,53 @@ class ClassPrepareNotifier {
 };
 
 void noteClassStatus(Thread* t, GcClass* c, bool initialized, bool error);
+
+// Packed LocalVariableTable captured while the class file is parsed.
+// `packed` is malloc'd and ownership moves to the debug layer.
+void setPendingLocals(uint8_t* packed, unsigned length);
+void bindPendingLocals(const char* className, const char* methodName,
+                       const char* spec);
+
+// Heap roots for debugger object ids.  Called from the VM root visitor.
+void visit(Heap::Visitor* visitor);
+
+struct SlotIO {
+  int tag;
+  uint64_t bits;
+  void* ref;
+  int status;
+};
+
+// op: 1 read local, 2 write local, 3 this, 4 request pop.
+// Implemented by the interpreter and the JIT.  status 32 means the
+// frame is compiled and the operation cannot see it.
+typedef int (*FrameFn)(Thread* t, int op, int frame, int slot, SlotIO* io);
+void registerFrameFn(FrameFn fn);
+
+// Drop the compiled body so the next invocation recompiles.  The
+// interpreter's version is a no-op.  Already-patched direct calls keep
+// the old address; see the README.
+typedef void (*Invalidator)(Thread* t, void* method);
+void registerInvalidator(Invalidator fn);
+
+bool watchingFields();
+// `method` is the bytecode method doing the access, or null for a JIT
+// hook that only has the field. `valueRef` is an object field's new
+// value when `write` is set and the field is a reference; otherwise null
+// and `bits` holds a primitive.
+void onField(Thread* t, void* field, void* instance, int write, uint64_t bits,
+             void* valueRef, void* method, int32_t bci);
+void onException(Thread* t, void* exception, int caught, void* throwMethod,
+                 int32_t throwBci, void* catchMethod, int32_t catchBci);
+void onThreadStart(Thread* t);
+void onThreadDeath(Thread* t);
+void requestPop(Thread* t);
+bool takePop(Thread* t);
+// While set, an exception that escapes a debugger invoke is captured on
+// the thread instead of unwinding the frame the debugger stopped in.
+bool suppressThrow(Thread* t);
+void setInhibitSuspend(bool on);
+void setSuppressThrow(Thread* t, bool on);
 
 }  // namespace debug
 }  // namespace vm

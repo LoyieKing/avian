@@ -1,7 +1,6 @@
 public class JdwpDebug {
   int n;
 
-  // Several bytecodes so a single-step leaves bci 0.
   static int marker(int x) {
     int y = x + 1;
     y = y + 0;
@@ -9,7 +8,7 @@ public class JdwpDebug {
   }
 
   static int plus(int x) {
-    return x + 1;
+    return x + 10;
   }
 
   void bump() {
@@ -20,7 +19,6 @@ public class JdwpDebug {
     try {
       throw new RuntimeException("boom");
     } catch (RuntimeException e) {
-      // caught
     }
   }
 

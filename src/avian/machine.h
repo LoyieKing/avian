@@ -20,6 +20,7 @@
 #include "avian/finder.h"
 #include "avian/processor.h"
 #include "avian/constants.h"
+#include "avian/debug.h"
 #include "avian/arch.h"
 
 using namespace avian::util;
@@ -1831,7 +1832,11 @@ inline uint64_t runThread(Thread* t, uintptr_t*)
   if (t == t->m->finalizeThread) {
     runFinalizeThread(t);
   } else if (t->javaThread) {
+    if (debug::enabled())
+      debug::onThreadStart(t);
     runJavaThread(t);
+    if (debug::enabled())
+      debug::onThreadDeath(t);
   }
 
   return 1;

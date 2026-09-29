@@ -1795,7 +1795,7 @@ $(build)/run-tests.sh: $(test-classes) makefile $(build)/extra-dir/multi-classpa
 	echo "$(call class-names,$(test-build),$(filter-out $(test-support-classes), $(test-classes))) \\" >> $(@)
 	echo "$(continuation-tests) $(tail-tests)" >> $(@)
 	echo 'st=$$?' >> $(@)
-	echo "python3 \"$(shell pwd)/test/jdwp-test.py\" ./$(notdir $(test-executable)) \"test$(target-path-separator)extra-dir\" || st=1" >> $(@)
+	echo "python3 \"$(shell pwd)/test/jdwp-test.py\" ./$(notdir $(test-executable)) \"test$(target-path-separator)extra-dir\" $(process) || st=1" >> $(@)
 	echo 'exit $$st' >> $(@)
 
 $(build)/jdk-run-tests.sh: $(test-classes) makefile $(build)/extra-dir/multi-classpath-test.txt $(build)/test/multi-classpath-test.txt
@@ -1901,7 +1901,7 @@ $(test-dep): $(test-sources) $(test-library)
 	@mkdir -p $(test-build)
 	files="$(shell $(MAKE) -s --no-print-directory build=$(build) $(test-classes))"; \
 	if test -n "$${files}"; then \
-		$(javac) -source 1.$(java-version) -target 1.$(java-version) \
+		$(javac) -g -source 1.$(java-version) -target 1.$(java-version) \
 			-classpath $(test-build) -d $(test-build) -bootclasspath $(boot-classpath) $${files}; \
 	fi
 	$(javac) -source 1.$(java-version) -target 1.$(java-version) -XDjsrlimit=0 -d $(test-build) \
