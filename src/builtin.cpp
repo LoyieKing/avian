@@ -848,7 +848,7 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
   PROTECT(t, address);
 
   GcArray* array = reinterpret_cast<GcArray*>(allocate3(
-      t, t->m->heap, Machine::FixedAllocation, ArrayBody + capacity, false));
+      t, Machine::FixedAllocation, ArrayBody + capacity, false));
 
   setObjectClass(
       t, reinterpret_cast<object>(array), type(t, GcByteArray::Type));

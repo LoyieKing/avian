@@ -545,8 +545,8 @@ class Fixie {
   static const unsigned Dirty = 1 << 2;
   static const unsigned Dead = 1 << 3;
 
-  Fixie(Context* c, unsigned size, bool hasMask, Fixie** handle, bool immortal)
-      : age(immortal ? FixieTenureThreshold + 1 : 0),
+  Fixie(Context* c, unsigned size, bool hasMask, Fixie** handle)
+      : age(0),
         flags(hasMask ? HasMask : 0),
         size(size),
         next(0),
@@ -559,9 +559,10 @@ class Fixie {
     }
   }
 
+  // See ImmortalFixieAge: only boot image fixed objects are immortal.
   bool immortal()
   {
-    return age == FixieTenureThreshold + 1;
+    return age == ImmortalFixieAge;
   }
 
   void add(Context* c UNUSED, Fixie** handle)
@@ -1994,36 +1995,18 @@ class MyHeap : public Heap {
     return Fixie::totalSize(sizeInWords, objectMask);
   }
 
-  void* allocateFixed(Alloc* allocator,
-                      unsigned sizeInWords,
-                      bool objectMask,
-                      Fixie** handle,
-                      bool immortal)
+  virtual void* allocateFixed(unsigned sizeInWords, bool objectMask)
   {
     expect(&c, not limitExceeded());
 
     unsigned total = Fixie::totalSize(sizeInWords, objectMask);
-    void* p = allocator->allocate(total);
+    // Fixed objects are freed by the collector with free_(), so they
+    // must come from this heap.
+    void* p = local::allocate(&c, total);
 
     expect(&c, not limitExceeded());
 
-    return (new (p) Fixie(&c, sizeInWords, objectMask, handle, immortal))
-        ->body();
-  }
-
-  virtual void* allocateFixed(Alloc* allocator,
-                              unsigned sizeInWords,
-                              bool objectMask)
-  {
-    return allocateFixed(
-        allocator, sizeInWords, objectMask, &(c.fixies), false);
-  }
-
-  virtual void* allocateImmortalFixed(Alloc* allocator,
-                                      unsigned sizeInWords,
-                                      bool objectMask)
-  {
-    return allocateFixed(allocator, sizeInWords, objectMask, 0, true);
+    return (new (p) Fixie(&c, sizeInWords, objectMask, &(c.fixies)))->body();
   }
 
   bool needsMark(void* p)

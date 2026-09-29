@@ -22,6 +22,15 @@ const unsigned TenureThreshold = 3;
 
 const unsigned FixieTenureThreshold = TenureThreshold + 2;
 
+// The age stored in the header of an immortal fixed object: one that
+// is never freed and never moves between generations, and is linked
+// into the collector's lists only while dirty.  The only such objects
+// are the fixed objects of a boot image (static tables, the system
+// class loader, addendums), which the boot image generator lays out
+// with this age and the heap adopts via setImmortalHeap; objects
+// allocated at run time are always mortal.
+const unsigned ImmortalFixieAge = FixieTenureThreshold + 1;
+
 class Heap : public avian::util::Allocator {
  public:
   enum CollectionType { MinorCollection, MajorCollection };
@@ -58,12 +67,8 @@ class Heap : public avian::util::Allocator {
                        unsigned footprint,
                        int pendingAllocation) = 0;
   virtual unsigned fixedFootprint(unsigned sizeInWords, bool objectMask) = 0;
-  virtual void* allocateFixed(avian::util::Alloc* allocator,
-                              unsigned sizeInWords,
-                              bool objectMask) = 0;
-  virtual void* allocateImmortalFixed(avian::util::Alloc* allocator,
-                                      unsigned sizeInWords,
-                                      bool objectMask) = 0;
+  // Allocates an object that never moves, from this heap.
+  virtual void* allocateFixed(unsigned sizeInWords, bool objectMask) = 0;
   virtual void mark(void* p, unsigned offset, unsigned count) = 0;
   virtual void pad(void* p) = 0;
   virtual void* follow(void* p) = 0;

@@ -1400,7 +1400,6 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
       == type(t, GcJbyte::Type)) {
     GcByteArray* array
         = reinterpret_cast<GcByteArray*>(allocate3(t,
-                                                   t->m->heap,
                                                    Machine::FixedAllocation,
                                                    ArrayBody + arguments[2],
                                                    false));

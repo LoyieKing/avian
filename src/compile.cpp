@@ -7173,7 +7173,6 @@ GcArray* makeObjectPool(MyThread* t, Context* context)
   const unsigned length = context->objectPoolCount + 1;
   GcArray* pool = reinterpret_cast<GcArray*>(
       allocate3(t,
-                t->m->heap,
                 Machine::FixedAllocation,
                 GcArray::FixedSize + (length * BytesPerWord),
                 true));

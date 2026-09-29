@@ -1376,7 +1376,7 @@ HeapWalker* makeHeapImage(Thread* t,
 
           memset(heap + position, 0, TargetFixieSizeInBytes);
 
-          uint16_t age = targetV2(FixieTenureThreshold + 1);
+          uint16_t age = targetV2(ImmortalFixieAge);
           memcpy(reinterpret_cast<uint8_t*>(heap + position) + TargetFixieAge,
                  &age,
                  2);

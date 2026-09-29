@@ -4237,7 +4237,6 @@ object allocate2(Thread* t, unsigned sizeInBytes, bool objectMask)
 {
   return allocate3(
       t,
-      t->m->heap,
       ceilingDivide(sizeInBytes, BytesPerWord) > ThreadHeapSizeInWords
           ? Machine::FixedAllocation
           : Machine::MovableAllocation,
@@ -4246,7 +4245,6 @@ object allocate2(Thread* t, unsigned sizeInBytes, bool objectMask)
 }
 
 object allocate3(Thread* t,
-                 Alloc* allocator,
                  Machine::AllocationType type,
                  unsigned sizeInBytes,
                  bool objectMask)
@@ -4309,8 +4307,6 @@ object allocate3(Thread* t,
       }
       break;
 
-    case Machine::ImmortalAllocation:
-      break;
     }
 
     int pendingAllocation = t->m->heap->fixedFootprint(
@@ -4336,7 +4332,7 @@ object allocate3(Thread* t,
 
   case Machine::FixedAllocation: {
     object o = static_cast<object>(t->m->heap->allocateFixed(
-        allocator, ceilingDivide(sizeInBytes, BytesPerWord), objectMask));
+        ceilingDivide(sizeInBytes, BytesPerWord), objectMask));
 
     memset(o, 0, sizeInBytes);
 
@@ -4344,17 +4340,6 @@ object allocate3(Thread* t,
 
     t->m->fixedFootprint += t->m->heap->fixedFootprint(
         ceilingDivide(sizeInBytes, BytesPerWord), objectMask);
-
-    return o;
-  }
-
-  case Machine::ImmortalAllocation: {
-    object o = static_cast<object>(t->m->heap->allocateImmortalFixed(
-        allocator, ceilingDivide(sizeInBytes, BytesPerWord), objectMask));
-
-    memset(o, 0, sizeInBytes);
-
-    alias(o, 0) = FixedMark;
 
     return o;
   }
