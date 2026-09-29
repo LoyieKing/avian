@@ -51,8 +51,8 @@ namespace system {
 //     read+write (where it is staged and patched), so no page is ever
 //     both writable and executable.  Falls back to RWX where that is
 //     not available.
-//   * Windows and other POSIX systems: a single read/write/execute
-//     mapping (code is still staged and committed, as everywhere).
+//   * Other systems: a single read/write/execute mapping (code is
+//     still staged and committed, as everywhere).
 //   * Boot image generation: a plain buffer that is never executed.
 //
 // Threading: allocate() and free() must be serialized by the caller
