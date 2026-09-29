@@ -114,9 +114,9 @@ void* mapAnonymous(size_t size, int prot, int extraFlags)
   return p == MAP_FAILED ? 0 : p;
 }
 
-// Map code near the executable and its libraries when we can, so calls
-// between them fit in a rel32 displacement (see useLongJump in
-// compile.cpp).  Darwin rejects MAP_32BIT for user mappings.
+// As upstream: place code in the low 2GB when possible, which keeps
+// more calls between it and the VM within rel32 reach (see useLongJump
+// in compile.cpp).  Darwin rejects MAP_32BIT for user mappings.
 #if defined(MAP_32BIT) && !defined(__APPLE__)
 const int LowMemoryFlag = MAP_32BIT;
 #else
@@ -202,8 +202,11 @@ class RwxCodeMemory : public CodeMemory {
 
   static CodeMemory* make(util::Alloc* allocator, size_t capacity)
   {
-    void* p = mapAnonymous(
-        capacity, PROT_READ | PROT_WRITE | PROT_EXEC, LowMemoryFlag);
+    const int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+    void* p = mapAnonymous(capacity, prot, LowMemoryFlag);
+    if (p == 0 and LowMemoryFlag) {
+      p = mapAnonymous(capacity, prot, 0);
+    }
     if (p == 0) {
       reportMapFailure("rwx", capacity);
       return 0;
