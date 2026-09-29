@@ -570,7 +570,6 @@ class Fixie {
   {
     assertT(c, this->handle == 0);
     assertT(c, next == 0);
-    avian::system::Memory::JitWriteScope scope;
 
     this->handle = handle;
     if (handle) {
@@ -585,8 +584,6 @@ class Fixie {
 
   void remove(Context* c UNUSED)
   {
-    avian::system::Memory::JitWriteScope scope;
-
     if (handle) {
       assertT(c, *handle == this);
       *handle = next;
@@ -962,7 +959,6 @@ void free(Context* c, Fixie** fixies, bool resetImmortal)
         if (DebugFixies) {
           fprintf(stderr, "reset immortal fixie %p\n", f);
         }
-        avian::system::Memory::JitWriteScope scope;
         *p = f->next;
         memset(f->mask(), 0, Fixie::maskSize(f->size, f->hasMask()));
         f->next = 0;
@@ -1018,9 +1014,6 @@ void sweepFixies(Context* c)
 
   while (c->visitedFixies) {
     Fixie* f = c->visitedFixies;
-    if (f->immortal()) {
-      avian::system::Memory::beginJitWrite();
-    }
     f->remove(c);
 
     if (not f->immortal()) {
@@ -1053,9 +1046,6 @@ void sweepFixies(Context* c)
     }
 
     f->marked(false);
-    if (f->immortal()) {
-      avian::system::Memory::endJitWrite();
-    }
   }
 
   c->tenuredFixieCeiling
@@ -1148,16 +1138,9 @@ void* update3(Context* c, void* o, bool* needsVisit)
       if (DebugFixies) {
         fprintf(stderr, "mark fixie %p\n", f);
       }
-      if (f->immortal()) {
-        avian::system::Memory::JitWriteScope scope;
-        f->marked(true);
-        f->dead(false);
-        f->move(c, &(c->markedFixies));
-      } else {
-        f->marked(true);
-        f->dead(false);
-        f->move(c, &(c->markedFixies));
-      }
+      f->marked(true);
+      f->dead(false);
+      f->move(c, &(c->markedFixies));
     }
     *needsVisit = false;
     return o;
@@ -1601,9 +1584,6 @@ void visitDirtyFixies(Context* c, Fixie** p)
 {
   while (*p) {
     Fixie* f = *p;
-    if (f->immortal()) {
-      avian::system::Memory::beginJitWrite();
-    }
 
     bool wasDirty UNUSED = false;
     bool clean = true;
@@ -1659,9 +1639,6 @@ void visitDirtyFixies(Context* c, Fixie** p)
     } else {
       p = &(f->next);
     }
-    if (f->immortal()) {
-      avian::system::Memory::endJitWrite();
-    }
   }
 }
 
@@ -1669,9 +1646,6 @@ void visitMarkedFixies(Context* c)
 {
   while (c->markedFixies) {
     Fixie* f = c->markedFixies;
-    if (f->immortal()) {
-      avian::system::Memory::beginJitWrite();
-    }
     f->remove(c);
 
     if (DebugFixies) {
@@ -1697,9 +1671,6 @@ void visitMarkedFixies(Context* c)
     c->client->walk(f->body(), &w);
 
     f->move(c, &(c->visitedFixies));
-    if (f->immortal()) {
-      avian::system::Memory::endJitWrite();
-    }
   }
 }
 
@@ -1961,6 +1932,24 @@ void free_(Context* c, const void* p, size_t size)
   free(c, p, size);
 }
 
+// Immortal fixies (the per-method object pools allocated by
+// compile.cpp's finish() via Machine::ImmortalAllocation) live in the
+// JIT code area, which on Darwin/arm64 is MAP_JIT memory that is
+// either writable or executable per thread, never both.  Fixie
+// headers, masks and bodies are all written by the heap, and because
+// immortal and ordinary fixies share the same intrusive lists
+// (tenuredFixies, dirtyTenuredFixies, ...) even list surgery on an
+// ordinary fixie can write into an immortal neighbour's next/handle
+// field.  Rather than toggling per fixie, every public Heap entry point
+// that may touch fixie state opens one JitWriteScope for its whole
+// duration (see collect(), mark(), allocateFixed() and disposeFixies()).
+// The scope is thread-local and nestable, and a no-op on platforms
+// without MAP_JIT.  While it is open this thread must not execute JIT
+// code; nothing reachable from these entry points does (in particular
+// Heap::Client callbacks only visit/walk/copy objects, and finalizers
+// run after Heap::collect() returns, see doCollect() in machine.cpp).
+typedef avian::system::Memory::JitWriteScope FixieWriteScope;
+
 class MyHeap : public Heap {
  public:
   MyHeap(System* system, unsigned limit) : c(system, limit)
@@ -2017,6 +2006,7 @@ class MyHeap : public Heap {
     c.incomingFootprint = incomingFootprint;
     c.pendingAllocation = pendingAllocation;
 
+    FixieWriteScope fixieWriteScope;
     local::collect(&c);
   }
 
@@ -2038,6 +2028,7 @@ class MyHeap : public Heap {
 
     expect(&c, not limitExceeded());
 
+    FixieWriteScope fixieWriteScope;
     Fixie* fixie = new (p) Fixie(&c, sizeInWords, objectMask, handle, immortal);
 
     return fixie->body();
@@ -2086,6 +2077,7 @@ class MyHeap : public Heap {
 #endif
 
       if (c.client->isFixed(p)) {
+        FixieWriteScope fixieWriteScope;
         Fixie* f = fixie(p);
         assertT(&c, offset == 0 or f->hasMask());
 
@@ -2210,6 +2202,7 @@ class MyHeap : public Heap {
 
   virtual void disposeFixies()
   {
+    FixieWriteScope fixieWriteScope;
     c.disposeFixies();
   }
 
