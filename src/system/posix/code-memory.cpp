@@ -91,7 +91,7 @@ void reportMapFailure(const char* backend, size_t size)
 // writes where it shouldn't fails everywhere, not just on Apple
 // silicon.  The copy is noise next to the cost of compiling.
 
-class RwxCodeMemory : public CodeMemory {
+class RwxCodeMemory final : public CodeMemory {
  public:
   RwxCodeMemory(util::Alloc* allocator, util::Slice<uint8_t> region)
       : CodeMemory(region), allocator(allocator)
@@ -195,7 +195,7 @@ int createMemfd(const char* name)
 #endif
 }
 
-class DualMapCodeMemory : public CodeMemory {
+class DualMapCodeMemory final : public CodeMemory {
  public:
   DualMapCodeMemory(util::Alloc* allocator,
                     util::Slice<uint8_t> region,
@@ -385,7 +385,7 @@ class DualMapCodeMemory : public CodeMemory {
 //
 // On Intel Macs pthread_jit_write_protect_supported_np() is false and
 // the mapping is plain RWX.
-class MapJitCodeMemory : public CodeMemory {
+class MapJitCodeMemory final : public CodeMemory {
  public:
   MapJitCodeMemory(util::Alloc* allocator,
                    util::Slice<uint8_t> region,

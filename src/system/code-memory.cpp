@@ -89,7 +89,7 @@ namespace {
 // ---------------------------------------------------------------------------
 // Boot image: memory that is written but never executed.
 
-class ImageCodeMemory : public CodeMemory {
+class ImageCodeMemory final : public CodeMemory {
  public:
   ImageCodeMemory(util::Alloc* allocator, util::Slice<uint8_t> image)
       : CodeMemory(image), allocator(allocator)
