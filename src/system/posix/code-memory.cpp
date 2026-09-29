@@ -8,13 +8,16 @@
    There is NO WARRANTY for this software.  See license.txt for
    details. */
 
-#include <avian/system/code-memory.h>
+// Executable CodeMemory backends for POSIX systems.  With the shared
+// code in ../code-memory.cpp this is the only code in the VM that stores
+// to executable memory.
+
+#include "../code-memory-backend.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <new>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -31,43 +34,10 @@
 namespace avian {
 namespace system {
 
-// ---------------------------------------------------------------------------
-// Allocation (shared by all backends)
-
-namespace {
-
-size_t padToAlignment(size_t n)
-{
-  return (n + CodeMemory::Alignment - 1) & ~(CodeMemory::Alignment - 1);
-}
-
-}  // namespace
-
-uint8_t* CodeMemory::allocate(size_t size)
-{
-  size_t end = used_ + padToAlignment(size);
-
-  if (end > region_.count or end < used_) {
-    return 0;
-  }
-
-  uint8_t* start = region_.begin() + used_;
-  used_ = end;
-  return start;
-}
-
-void CodeMemory::free(uint8_t* start, size_t size)
-{
-  if (start + padToAlignment(size) == region_.begin() + used_) {
-    used_ = start - region_.begin();
-  }
-}
-
 namespace {
 
 // ---------------------------------------------------------------------------
-// Low-level helpers.  These are the only stores to executable memory in
-// the VM.
+// Helpers
 
 // Makes [start, start + size) coherent between the data and instruction
 // side for every thread.
@@ -85,27 +55,6 @@ void flushInstructionCache(void* start, size_t size)
   __builtin___clear_cache(static_cast<char*>(start),
                           static_cast<char*>(start) + size);
 #endif
-}
-
-// Stores `size` bytes at `dst`, atomically when the store is naturally
-// aligned and word-sized, so that concurrently executing threads see
-// either the old or the new bytes (this is what makes retargeting a
-// call site safe while other threads may be running through it).
-void storeCode(void* dst, const void* src, unsigned size)
-{
-  uintptr_t address = reinterpret_cast<uintptr_t>(dst);
-
-  if (size == 4 and address % 4 == 0) {
-    uint32_t v;
-    memcpy(&v, src, 4);
-    __atomic_store_n(static_cast<uint32_t*>(dst), v, __ATOMIC_RELEASE);
-  } else if (sizeof(void*) == 8 and size == 8 and address % 8 == 0) {
-    uint64_t v;
-    memcpy(&v, src, 8);
-    __atomic_store_n(static_cast<uint64_t*>(dst), v, __ATOMIC_RELEASE);
-  } else {
-    memcpy(dst, src, size);
-  }
 }
 
 void* mapAnonymous(size_t size, int prot, int extraFlags)
@@ -132,57 +81,6 @@ void reportMapFailure(const char* backend, size_t size)
           backend,
           strerror(error));
 }
-
-template <class T>
-T* allocateInstance(util::Alloc* allocator)
-{
-  return static_cast<T*>(allocator->allocate(sizeof(T)));
-}
-
-// ---------------------------------------------------------------------------
-// Boot image: memory that is written but never executed.
-
-class ImageCodeMemory : public CodeMemory {
- public:
-  ImageCodeMemory(util::Alloc* allocator, util::Slice<uint8_t> image)
-      : CodeMemory(image), allocator(allocator)
-  {
-  }
-
-  virtual const char* name()
-  {
-    return "image";
-  }
-
-  virtual uint8_t* stagingBuffer(uint8_t* address, size_t)
-  {
-    // Assemble in place: boot image generation resolves some fixups
-    // after the fact (promise listeners), and those have to land in
-    // the image itself.
-    return address;
-  }
-
-  virtual void commit(uint8_t* address, const void* src, size_t size)
-  {
-    if (src != address) {
-      memcpy(address, src, size);
-    }
-  }
-
-  virtual void patch(void* address, const void* src, unsigned size)
-  {
-    memcpy(address, src, size);
-  }
-
-  virtual void dispose()
-  {
-    util::Alloc* a = allocator;
-    this->~ImageCodeMemory();
-    a->free(this, sizeof(*this));
-  }
-
-  util::Alloc* allocator;
-};
 
 // ---------------------------------------------------------------------------
 // A single mapping that is readable, writable and executable.
@@ -212,7 +110,7 @@ class RwxCodeMemory : public CodeMemory {
       return 0;
     }
 
-    return new (allocateInstance<RwxCodeMemory>(allocator)) RwxCodeMemory(
+    return code_memory::construct<RwxCodeMemory>(
         allocator, util::Slice<uint8_t>(static_cast<uint8_t*>(p), capacity));
   }
 
@@ -234,18 +132,17 @@ class RwxCodeMemory : public CodeMemory {
 
   virtual void patch(void* address, const void* src, unsigned size)
   {
-    storeCode(address, src, size);
+    code_memory::storeCode(address, src, size);
     flushInstructionCache(address, size);
   }
 
   virtual void dispose()
   {
     munmap(region().begin(), region().count);
-    util::Alloc* a = allocator;
-    this->~RwxCodeMemory();
-    a->free(this, sizeof(*this));
+    code_memory::destroy(this, allocator);
   }
 
+ private:
   util::Alloc* allocator;
 };
 
@@ -347,13 +244,10 @@ class DualMapCodeMemory : public CodeMemory {
       return 0;
     }
 
-    DualMapCodeMemory* memory
-        = new (allocateInstance<DualMapCodeMemory>(allocator))
-            DualMapCodeMemory(
-                allocator,
-                util::Slice<uint8_t>(static_cast<uint8_t*>(executable),
-                                     capacity),
-                static_cast<uint8_t*>(writable));
+    DualMapCodeMemory* memory = code_memory::construct<DualMapCodeMemory>(
+        allocator,
+        util::Slice<uint8_t>(static_cast<uint8_t*>(executable), capacity),
+        static_cast<uint8_t*>(writable));
 
     if (not memory->selfTest()) {
       if (report) {
@@ -389,7 +283,7 @@ class DualMapCodeMemory : public CodeMemory {
 
   virtual void patch(void* address, const void* src, unsigned size)
   {
-    storeCode(writableAlias(address), src, size);
+    code_memory::storeCode(writableAlias(address), src, size);
     flushInstructionCache(address, size);
   }
 
@@ -397,9 +291,7 @@ class DualMapCodeMemory : public CodeMemory {
   {
     munmap(region().begin(), region().count);
     munmap(region().begin() + delta, region().count);
-    util::Alloc* a = allocator;
-    this->~DualMapCodeMemory();
-    a->free(this, sizeof(*this));
+    code_memory::destroy(this, allocator);
   }
 
  private:
@@ -507,7 +399,7 @@ class MapJitCodeMemory : public CodeMemory {
       return 0;
     }
 
-    return new (allocateInstance<MapJitCodeMemory>(allocator)) MapJitCodeMemory(
+    return code_memory::construct<MapJitCodeMemory>(
         allocator,
         util::Slice<uint8_t>(static_cast<uint8_t*>(p), capacity),
         pthread_jit_write_protect_supported_np());
@@ -534,7 +426,7 @@ class MapJitCodeMemory : public CodeMemory {
   virtual void patch(void* address, const void* src, unsigned size)
   {
     beginWrite();
-    storeCode(address, src, size);
+    code_memory::storeCode(address, src, size);
     endWrite();
     flushInstructionCache(address, size);
   }
@@ -542,9 +434,7 @@ class MapJitCodeMemory : public CodeMemory {
   virtual void dispose()
   {
     munmap(region().begin(), region().count);
-    util::Alloc* a = allocator;
-    this->~MapJitCodeMemory();
-    a->free(this, sizeof(*this));
+    code_memory::destroy(this, allocator);
   }
 
  private:
@@ -609,13 +499,6 @@ CodeMemory* makeExecutableCodeMemory(util::Alloc* allocator, size_t capacity)
           "avian: AVIAN_CODE_MEMORY=%s is not supported on this platform\n",
           requested);
   return 0;
-}
-
-CodeMemory* makeImageCodeMemory(util::Alloc* allocator,
-                                util::Slice<uint8_t> image)
-{
-  return new (allocateInstance<ImageCodeMemory>(allocator))
-      ImageCodeMemory(allocator, image);
 }
 
 }  // namespace system
