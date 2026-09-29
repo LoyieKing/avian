@@ -46,6 +46,10 @@ namespace system {
 //   * Darwin: one MAP_JIT mapping; on Apple silicon, commit() and
 //     patch() flip the calling thread's pthread_jit_write_protect_np
 //     state around their store and back before returning.
+//   * Linux: a memfd mapped twice, read+execute (where code runs) and
+//     read+write (where it is staged and patched), so no page is ever
+//     both writable and executable.  Falls back to RWX where that is
+//     not available.
 //   * Elsewhere: a single read/write/execute mapping.
 //   * Boot image generation: a plain buffer that is never executed.
 //
@@ -188,8 +192,8 @@ class CodeMemory::Writer {
 
 // Maps `capacity` bytes of executable memory using the best backend
 // available on this platform; returns null on failure.  The environment
-// variable AVIAN_CODE_MEMORY may name a backend to use instead (see
-// code-memory.cpp), for diagnosis and testing.
+// variable AVIAN_CODE_MEMORY may name a backend to use instead: "rwx"
+// anywhere, "dual-map" on Linux, "map-jit" on Darwin.
 CodeMemory* makeExecutableCodeMemory(util::Alloc* allocator, size_t capacity);
 
 // Wraps `image`, memory that is written but never executed (the code

@@ -19,6 +19,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+
 #ifdef __APPLE__
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
@@ -242,6 +246,225 @@ class RwxCodeMemory : public CodeMemory {
   util::Alloc* allocator;
 };
 
+#if defined(__linux__)
+
+// ---------------------------------------------------------------------------
+// Linux: one memfd mapped twice.  The read+execute view is where code
+// lives and runs (all addresses the VM hands out are in it); the
+// read+write view, at a fixed distance, is where code is staged and
+// patched.  No page is ever writable and executable at the same time,
+// there is no permission switching (so no per-write syscalls and no
+// thread-local state), and assembling into the alias makes commit() a
+// pure instruction cache flush.  This is the scheme .NET uses by
+// default on Linux.
+//
+// Caveat: a debugger that inserts a software breakpoint into JIT code
+// through ptrace gets a private copy-on-write copy of that page in the
+// executable view, after which patches made through the alias are no
+// longer visible there.  Use AVIAN_CODE_MEMORY=rwx when debugging
+// generated code that way.
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+#ifndef MFD_EXEC
+#define MFD_EXEC 0x0010U
+#endif
+
+int createMemfd(const char* name)
+{
+#ifdef SYS_memfd_create
+  // Linux >= 6.3 (vm.memfd_noexec) wants executable memfds to say so;
+  // older kernels reject the flag, so retry without it.
+  int fd = syscall(SYS_memfd_create, name, MFD_CLOEXEC | MFD_EXEC);
+  if (fd < 0 and errno == EINVAL) {
+    fd = syscall(SYS_memfd_create, name, MFD_CLOEXEC);
+  }
+  return fd;
+#else
+  (void)name;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+class DualMapCodeMemory : public CodeMemory {
+ public:
+  DualMapCodeMemory(util::Alloc* allocator,
+                    util::Slice<uint8_t> region,
+                    uint8_t* writable)
+      : CodeMemory(region),
+        allocator(allocator),
+        delta(writable - region.begin())
+  {
+  }
+
+  static CodeMemory* make(util::Alloc* allocator, size_t capacity, bool report)
+  {
+    int fd = createMemfd("avian-code");
+    if (fd < 0) {
+      if (report) {
+        reportMapFailure("dual-map: memfd_create", capacity);
+      }
+      return 0;
+    }
+
+    void* executable = MAP_FAILED;
+    void* writable = MAP_FAILED;
+
+    if (ftruncate(fd, capacity) == 0) {
+      executable = mmap(0,
+                        capacity,
+                        PROT_READ | PROT_EXEC,
+                        MAP_SHARED | LowMemoryFlag,
+                        fd,
+                        0);
+      if (executable == MAP_FAILED and LowMemoryFlag) {
+        executable
+            = mmap(0, capacity, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+      }
+
+      if (executable != MAP_FAILED) {
+        writable
+            = mmap(0, capacity, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      }
+    }
+
+    int error = errno;
+    close(fd);
+
+    if (writable == MAP_FAILED) {
+      if (executable != MAP_FAILED) {
+        munmap(executable, capacity);
+      }
+      if (report) {
+        errno = error;
+        reportMapFailure("dual-map", capacity);
+      }
+      return 0;
+    }
+
+    DualMapCodeMemory* memory
+        = new (allocateInstance<DualMapCodeMemory>(allocator))
+            DualMapCodeMemory(
+                allocator,
+                util::Slice<uint8_t>(static_cast<uint8_t*>(executable),
+                                     capacity),
+                static_cast<uint8_t*>(writable));
+
+    if (not memory->selfTest()) {
+      if (report) {
+        fprintf(stderr,
+                "avian: dual-mapped code memory does not behave as "
+                "expected on this system\n");
+      }
+      memory->dispose();
+      return 0;
+    }
+
+    return memory;
+  }
+
+  virtual const char* name()
+  {
+    return "dual-map";
+  }
+
+  virtual uint8_t* stagingBuffer(uint8_t* address, size_t)
+  {
+    return writableAlias(address);
+  }
+
+  virtual void commit(uint8_t* address, const void* src, size_t size)
+  {
+    uint8_t* alias = writableAlias(address);
+    if (src != alias) {
+      memcpy(alias, src, size);
+    }
+    flushInstructionCache(address, size);
+  }
+
+  virtual void patch(void* address, const void* src, unsigned size)
+  {
+    storeCode(writableAlias(address), src, size);
+    flushInstructionCache(address, size);
+  }
+
+  virtual void dispose()
+  {
+    munmap(region().begin(), region().count);
+    munmap(region().begin() + delta, region().count);
+    util::Alloc* a = allocator;
+    this->~DualMapCodeMemory();
+    a->free(this, sizeof(*this));
+  }
+
+ private:
+  uint8_t* writableAlias(void* address)
+  {
+    return static_cast<uint8_t*>(address) + delta;
+  }
+
+  // Checks, before any real code goes in, that stores through the alias
+  // show up in the executable view and that code committed and patched
+  // there actually runs (emulators such as Rosetta may not track writes
+  // through a second mapping).  Uses the start of the region and leaves
+  // it zeroed.
+  bool selfTest()
+  {
+    uint8_t* code = region().begin();
+    bool ok;
+
+#if defined(__x86_64__) || defined(__i386__)
+    // mov eax, imm32; ret
+    uint8_t stub[] = {0xB8, 1, 0, 0, 0, 0xC3};
+    commit(code, stub, sizeof(stub));
+    ok = call(code) == 1;
+
+    uint32_t two = 2;
+    patch(code + 1, &two, 4);
+    ok = ok and call(code) == 2;
+
+    memset(stub, 0, sizeof(stub));
+    commit(code, stub, sizeof(stub));
+#elif defined(__aarch64__)
+    // movz w0, #imm; ret
+    uint32_t stub[] = {0x52800000 | (1 << 5), 0xD65F03C0};
+    commit(code, stub, sizeof(stub));
+    ok = call(code) == 1;
+
+    uint32_t two = 0x52800000 | (2 << 5);
+    patch(code, &two, 4);
+    ok = ok and call(code) == 2;
+
+    memset(stub, 0, sizeof(stub));
+    commit(code, stub, sizeof(stub));
+#else
+    // Can't easily run code here; at least check the views are shared.
+    uint32_t marker = 0x41564941;
+    commit(code, &marker, 4);
+    ok = memcmp(code, &marker, 4) == 0;
+    marker = 0;
+    commit(code, &marker, 4);
+#endif
+
+    return ok;
+  }
+
+  static int call(uint8_t* code)
+  {
+    int (*function)();
+    void* p = code;
+    memcpy(&function, &p, sizeof(function));
+    return function();
+  }
+
+  util::Alloc* allocator;
+  ptrdiff_t delta;
+};
+
+#endif  // __linux__
+
 #if defined(__APPLE__) && defined(MAP_JIT)
 
 // ---------------------------------------------------------------------------
@@ -361,6 +584,17 @@ CodeMemory* makeExecutableCodeMemory(util::Alloc* allocator, size_t capacity)
 #if defined(__APPLE__) && defined(MAP_JIT)
   if (requested == 0 or strcmp(requested, "map-jit") == 0) {
     return MapJitCodeMemory::make(allocator, capacity);
+  }
+#elif defined(__linux__)
+  if (requested and strcmp(requested, "dual-map") == 0) {
+    return DualMapCodeMemory::make(allocator, capacity, true);
+  }
+
+  if (requested == 0) {
+    // Prefer W^X; quietly fall back where memfds can't be executable
+    // (old kernels, vm.memfd_noexec=2, restrictive LSM policies, ...).
+    CodeMemory* memory = DualMapCodeMemory::make(allocator, capacity, false);
+    return memory ? memory : RwxCodeMemory::make(allocator, capacity);
   }
 #else
   if (requested == 0) {
