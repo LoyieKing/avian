@@ -16,6 +16,7 @@
 #include "avian/arch.h"
 
 #include <avian/system/code-memory.h>
+#include <avian/codegen/jit-debug.h>
 
 #include <avian/codegen/assembler.h>
 #include <avian/codegen/architecture.h>
@@ -3154,7 +3155,13 @@ void logCompile(MyThread* t,
                 unsigned size,
                 const char* class_,
                 const char* name,
-                const char* spec);
+                const char* spec,
+                unsigned prologueSize = 0,
+                unsigned frameSize = 0);
+
+unsigned frameSizeInBytes(MyThread* t, unsigned footprint);
+
+unsigned thunkFrameSize(MyThread* t);
 
 unsigned simpleFrameMapTableSize(MyThread* t, GcMethod* method, GcIntArray* map)
 {
@@ -7046,13 +7053,15 @@ uint8_t* finish(MyThread* t,
                 Context* context,
                 avian::codegen::Assembler* a,
                 const char* name,
-                unsigned length)
+                unsigned length,
+                unsigned prologueSize,
+                unsigned frameSize)
 {
   uint8_t* start = allocateCode(t, length);
 
   emitCode(t, &context->zone, a, start, length);
 
-  logCompile(t, start, length, 0, name, 0);
+  logCompile(t, start, length, 0, name, 0, prologueSize, frameSize);
 
   return start;
 }
@@ -8729,6 +8738,8 @@ bool isThunkUnsafeStack(MyThread* t, void* ip);
 
 void boot(MyThread* t, BootImage* image, uint8_t* code);
 
+void registerBootImageCode(MyThread* t);
+
 class MyProcessor;
 
 MyProcessor* processor(MyThread* t);
@@ -8822,6 +8833,7 @@ class MyProcessor : public Processor {
                             &GcRoots::arithmeticException,
                             GcArithmeticException::FixedSize),
         codeMemory(0),
+        jitDebug(0),
         callTableSize(0),
         dynamicIndex(0),
         useNativeFeatures(useNativeFeatures),
@@ -9277,6 +9289,11 @@ class MyProcessor : public Processor {
 
   virtual void dispose()
   {
+    // Before the code goes away.
+    if (jitDebug) {
+      jitDebug->dispose();
+    }
+
     if (codeMemory) {
       codeMemory->dispose();
     }
@@ -9469,11 +9486,19 @@ class MyProcessor : public Processor {
                                             ExecutableAreaSizeInBytes);
 
       expect(t, codeMemory);
+
+      // Only code that runs in this process is worth telling a debugger
+      // about, so not while generating a boot image.
+      jitDebug = avian::codegen::makeJitDebugInfo(allocator);
     }
 #endif
 
     if (image and code) {
       local::boot(static_cast<MyThread*>(t), image, code);
+
+      if (jitDebug) {
+        local::registerBootImageCode(static_cast<MyThread*>(t));
+      }
     } else {
       roots = makeCompileRoots(t, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
@@ -9577,6 +9602,9 @@ class MyProcessor : public Processor {
   // Where all JIT code (and, while building a boot image, the image's
   // code section) goes; see avian/system/code-memory.h.
   CodeMemory* codeMemory;
+  // Registers published code with debuggers, or null; see
+  // avian/codegen/jit-debug.h.
+  avian::codegen::JitDebugInfo* jitDebug;
   ThunkCollection thunks;
   ThunkCollection bootThunks;
   unsigned callTableSize;
@@ -9617,12 +9645,18 @@ size_t stringOrNullSize(const char* str)
   return strlen(stringOrNull(str));
 }
 
+// Announces a newly published piece of code: to the JIT log, to
+// debuggers (see avian/codegen/jit-debug.h) and to compilation
+// handlers.  `class_` is null for thunks.  `prologueSize` and
+// `frameSize` describe its frame as in JitSymbol.
 void logCompile(MyThread* t,
                 const void* code,
                 unsigned size,
                 const char* class_,
                 const char* name,
-                const char* spec)
+                const char* spec,
+                unsigned prologueSize,
+                unsigned frameSize)
 {
   static bool open = false;
   if (not open) {
@@ -9657,9 +9691,44 @@ void logCompile(MyThread* t,
           stringOrNull(spec));
 
   MyProcessor* p = static_cast<MyProcessor*>(t->m->processor);
+
+  if (p->jitDebug) {
+    THREAD_RUNTIME_ARRAY(t, char, debugName, nameLength + 16);
+    if (class_) {
+      strcpy(RUNTIME_ARRAY_BODY(debugName), RUNTIME_ARRAY_BODY(completeName));
+    } else {
+      sprintf(RUNTIME_ARRAY_BODY(debugName), "avian_thunk_%s", name);
+    }
+
+    avian::codegen::JitSymbol symbol;
+    symbol.name = RUNTIME_ARRAY_BODY(debugName);
+    symbol.start = static_cast<const uint8_t*>(code);
+    symbol.size = size;
+    symbol.prologueSize = prologueSize;
+    symbol.frameSize = frameSize;
+    p->jitDebug->add(&symbol, 1);
+  }
+
   for (CompilationHandlerList* h = p->compilationHandlers; h; h = h->next) {
     h->handler->compiled(code, 0, 0, RUNTIME_ARRAY_BODY(completeName));
   }
+}
+
+// Distance in bytes from the stack pointer to the canonical frame
+// address once Assembler::allocateFrame(footprint) has run: the frame
+// itself plus the frame header (return address, and saved frame pointer
+// if used), whether the call pushed it (x86) or the prologue stored it
+// (ARM).
+unsigned frameSizeInBytes(MyThread* t, unsigned footprint)
+{
+  return (footprint + t->arch->frameHeaderSize()) * TargetBytesPerWord;
+}
+
+// The frame of the thunks that call into the VM (pushFrame with the
+// thread as the only argument).
+unsigned thunkFrameSize(MyThread* t)
+{
+  return frameSizeInBytes(t, t->arch->alignFrameSize(1));
 }
 
 void* compileMethod2(MyThread* t, void* ip)
@@ -10286,6 +10355,112 @@ void boot(MyThread* t, BootImage* image, uint8_t* code)
   roots(t)->setBootstrapClassMap(t, map);
 }
 
+// Tells debuggers about the code of a boot image, in one object: every
+// method in the method tree, and the boot thunks.  Unlike JIT code, the
+// image doesn't record where each method's prologue ends, so the frame
+// is described as set up from the first instruction; a debugger stopped
+// inside a prologue may unwind that frame wrongly.
+void countMethods(MyThread* t, GcTreeNode* node, GcTreeNode* sentinal,
+                  unsigned* count)
+{
+  if (node != sentinal) {
+    ++(*count);
+    countMethods(t, node->left(), sentinal, count);
+    countMethods(t, node->right(), sentinal, count);
+  }
+}
+
+void describeMethods(MyThread* t,
+                     Zone* zone,
+                     GcTreeNode* node,
+                     GcTreeNode* sentinal,
+                     avian::codegen::JitSymbol* symbols,
+                     unsigned* index)
+{
+  if (node == sentinal) {
+    return;
+  }
+
+  GcMethod* method = cast<GcMethod>(t, node->value());
+  const char* class_ = reinterpret_cast<const char*>(
+      method->class_()->name()->body().begin());
+  const char* name
+      = reinterpret_cast<const char*>(method->name()->body().begin());
+  const char* spec
+      = reinterpret_cast<const char*>(method->spec()->body().begin());
+
+  size_t length = strlen(class_) + strlen(name) + strlen(spec) + 2;
+  char* fullName = static_cast<char*>(zone->allocate(length));
+  sprintf(fullName, "%s.%s%s", class_, name, spec);
+
+  avian::codegen::JitSymbol* s = symbols + (*index)++;
+  s->name = fullName;
+  s->start = reinterpret_cast<const uint8_t*>(methodCompiled(t, method));
+  s->size = methodCompiledSize(t, method);
+  s->prologueSize = 0;
+  s->frameSize = frameSizeInBytes(t, alignedFrameSize(t, method));
+
+  describeMethods(t, zone, node->left(), sentinal, symbols, index);
+  describeMethods(t, zone, node->right(), sentinal, symbols, index);
+}
+
+void registerBootImageCode(MyThread* t)
+{
+  MyProcessor* p = processor(t);
+  GcTreeNode* sentinal = compileRoots(t)->methodTreeSentinal();
+
+  unsigned methodCount = 0;
+  countMethods(t, compileRoots(t)->methodTree(), sentinal, &methodCount);
+
+  struct NamedThunk {
+    const char* name;
+    MyProcessor::Thunk* thunk;
+    bool framed;
+  } thunks[] = {{"avian_boot_thunk_default", &p->bootThunks.default_, true},
+                {"avian_boot_thunk_defaultVirtual",
+                 &p->bootThunks.defaultVirtual,
+                 true},
+                {"avian_boot_thunk_defaultDynamic",
+                 &p->bootThunks.defaultDynamic,
+                 true},
+                {"avian_boot_thunk_native", &p->bootThunks.native, true},
+                {"avian_boot_thunk_aioob", &p->bootThunks.aioob, true},
+                {"avian_boot_thunk_stackOverflow",
+                 &p->bootThunks.stackOverflow,
+                 true},
+                {"avian_boot_thunk_table", &p->bootThunks.table, false}};
+  const unsigned thunkCount = sizeof(thunks) / sizeof(thunks[0]);
+
+  Zone zone(t->m->heap, 64 * 1024);
+  avian::codegen::JitSymbol* symbols
+      = static_cast<avian::codegen::JitSymbol*>(zone.allocate(
+          sizeof(avian::codegen::JitSymbol) * (methodCount + thunkCount)));
+
+  unsigned count = 0;
+  describeMethods(
+      t, &zone, compileRoots(t)->methodTree(), sentinal, symbols, &count);
+
+  for (unsigned i = 0; i < thunkCount; ++i) {
+    MyProcessor::Thunk* thunk = thunks[i].thunk;
+    if (thunk->start == 0) {
+      continue;
+    }
+
+    avian::codegen::JitSymbol* s = symbols + count++;
+    s->name = thunks[i].name;
+    s->start = thunk->start;
+    s->size = thunks[i].framed ? thunk->length
+                               : thunk->length * ThunkCount;
+    // The frame is pushed right after the thread's state is saved.
+    s->prologueSize = thunks[i].framed ? thunk->frameSavedOffset : 0;
+    s->frameSize = thunks[i].framed ? thunkFrameSize(t) : 0;
+  }
+
+  p->jitDebug->add(symbols, count);
+
+  zone.dispose();
+}
+
 intptr_t getThunk(MyThread* t, Thunk thunk)
 {
   MyProcessor* p = processor(t);
@@ -10409,6 +10584,7 @@ void compileDefaultThunk(MyThread* t,
 
   lir::RegisterPair thread(t->arch->thread());
   a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+  const unsigned prologueSize = a->length();
 
   compileCall(t, &context, thunkIndex);
 
@@ -10420,7 +10596,8 @@ void compileDefaultThunk(MyThread* t,
 
   thunk->length = a->endBlock(false)->resolve(0, 0);
 
-  thunk->start = finish(t, &context, a, name, thunk->length);
+  thunk->start = finish(
+      t, &context, a, name, thunk->length, prologueSize, thunkFrameSize(t));
 }
 
 void compileThunks(MyThread* t)
@@ -10437,6 +10614,7 @@ void compileThunks(MyThread* t)
 
     lir::RegisterPair thread(t->arch->thread());
     a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+    const unsigned prologueSize = a->length();
 
     compileCall(t, &context, compileMethodIndex);
 
@@ -10449,7 +10627,13 @@ void compileThunks(MyThread* t)
     p->thunks.default_.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.default_.start
-        = finish(t, &context, a, "default", p->thunks.default_.length);
+        = finish(t,
+                 &context,
+                 a,
+                 "default",
+                 p->thunks.default_.length,
+                 prologueSize,
+                 thunkFrameSize(t));
   }
 
   compileDefaultThunk
@@ -10470,6 +10654,7 @@ void compileThunks(MyThread* t)
 
     lir::RegisterPair thread(t->arch->thread());
     a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+    const unsigned prologueSize = a->length();
 
     compileCall(t, &context, invokeNativeIndex);
 
@@ -10479,7 +10664,13 @@ void compileThunks(MyThread* t)
     p->thunks.native.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.native.start
-        = finish(t, &context, a, "native", p->thunks.native.length);
+        = finish(t,
+                 &context,
+                 a,
+                 "native",
+                 p->thunks.native.length,
+                 prologueSize,
+                 thunkFrameSize(t));
   }
 
   {
@@ -10492,13 +10683,20 @@ void compileThunks(MyThread* t)
 
     lir::RegisterPair thread(t->arch->thread());
     a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+    const unsigned prologueSize = a->length();
 
     compileCall(t, &context, throwArrayIndexOutOfBoundsIndex);
 
     p->thunks.aioob.length = a->endBlock(false)->resolve(0, 0);
 
     p->thunks.aioob.start
-        = finish(t, &context, a, "aioob", p->thunks.aioob.length);
+        = finish(t,
+                 &context,
+                 a,
+                 "aioob",
+                 p->thunks.aioob.length,
+                 prologueSize,
+                 thunkFrameSize(t));
   }
 
   {
@@ -10511,13 +10709,19 @@ void compileThunks(MyThread* t)
 
     lir::RegisterPair thread(t->arch->thread());
     a->pushFrame(1, TargetBytesPerWord, lir::Operand::Type::RegisterPair, &thread);
+    const unsigned prologueSize = a->length();
 
     compileCall(t, &context, throwStackOverflowIndex);
 
     p->thunks.stackOverflow.length = a->endBlock(false)->resolve(0, 0);
 
-    p->thunks.stackOverflow.start = finish(
-        t, &context, a, "stackOverflow", p->thunks.stackOverflow.length);
+    p->thunks.stackOverflow.start = finish(t,
+                                           &context,
+                                           a,
+                                           "stackOverflow",
+                                           p->thunks.stackOverflow.length,
+                                           prologueSize,
+                                           thunkFrameSize(t));
   }
 
   {
@@ -10854,7 +11058,9 @@ void compile(MyThread* t, BootContext* bootContext, GcMethod* method)
              reinterpret_cast<const char*>(
                  clone->class_()->name()->body().begin()),
              reinterpret_cast<const char*>(clone->name()->body().begin()),
-             reinterpret_cast<const char*>(clone->spec()->body().begin()));
+             reinterpret_cast<const char*>(clone->spec()->body().begin()),
+             context.compiler->prologueSize(),
+             frameSizeInBytes(t, alignedFrameSize(t, clone)));
 #endif // not AVIAN_AOT_ONLY
 }
 

@@ -269,6 +269,70 @@ VM under the debugger or with `AVIAN_CODE_MEMORY=rwx`.
 
 Breakpoints in the VM itself are not affected.
 
+Debugging JIT code
+------------------
+
+With `process=compile` the VM describes the code it generates to native
+debuggers through the standard GDB JIT interface
+(`__jit_debug_register_code` / `__jit_debug_descriptor`).  Each time a
+method or thunk is published it registers a small in-memory ELF object
+containing a symbol for it, named `Class.method(signature)` (for
+example `java/lang/String.valueOf(I)Ljava/lang/String;`) or
+`avian_thunk_<name>`, plus an `.eh_frame` describing its frame so that
+backtraces continue through Java frames into the VM and back.  Code
+loaded from a boot image is registered in one batch at startup.
+
+gdb supports this out of the box:
+
+    $ gdb --args build/linux-x86_64-debug/avian -cp classes Hello
+    (gdb) break 'Hello.greet(Ljava/lang/String;)V'   # quotes required
+    (gdb) run
+    (gdb) bt
+    #0  0x... in Hello.greet(Ljava/lang/String;)V ()
+    #1  0x... in Hello.main([Ljava/lang/String;)V ()
+    #2  0x... in vmInvoke ()
+    #3  0x... in (anonymous namespace)::local::invoke (...) at src/compile.cpp:...
+    (gdb) info symbol $pc
+    Hello.greet(Ljava/lang/String;)V in section .text of <in-memory@0x...>
+
+Breakpoints on methods that haven't been compiled yet are pending and
+resolve when the method is compiled.  When attaching to a running VM on
+Linux, use `hbreak` instead of `break` (see "Debugging generated code on
+Linux" above).
+
+lldb supports the same interface through its `jit-loader.gdb` plugin.
+It is enabled by default on Linux; on macOS it must be turned on (before
+`run` or attaching):
+
+    (lldb) settings set plugin.jit-loader.gdb.enable on
+    (lldb) breakpoint set -n 'Hello.greet(Ljava/lang/String;)V'
+    (lldb) run
+    (lldb) bt
+
+Registration is controlled by `AVIAN_JIT_DEBUG_INFO`: `1` turns it on,
+`0` off.  If unset, it is on in debug builds (`mode=debug`) and whenever
+a debugger is already attached when the VM starts, and off otherwise.
+Registration costs a few hundred bytes plus the name per compiled
+method and, only while a debugger is attached, a debugger stop per
+registration (roughly 0.5 ms each under gdb), which production runs
+shouldn't pay; set `AVIAN_JIT_DEBUG_INFO=1` to debug a release build
+you intend to attach to later.
+
+Limitations:
+
+  * There are no line tables or variable locations, only symbols and
+frame (unwind) information.  Epilogues aren't described, so a backtrace
+taken on a method's final instructions may be wrong.
+  * Boot-image methods are described as if their frame were set up from
+the first instruction, so a backtrace stopped inside the prologue of a
+boot-image method is wrong; stopping at the entry of a method compiled
+at run time is fine.  In boot-image builds those methods also appear a
+second time under the executable's own static symbols.
+  * Code is registered until the VM shuts down (compiled code is never
+freed once published).
+  * `__jit_debug_register_code` is a process-global symbol, so an
+embedding that also links another JIT defining it will see a clash.
+
 Building with the Microsoft Visual C++ Compiler
 -----------------------------------------------
 

@@ -1309,6 +1309,7 @@ embed-objects = $(call cpp-objects,$(embed-sources),$(src),$(build-embed))
 compiler-sources = \
 	$(src)/codegen/compiler.cpp \
 	$(wildcard $(src)/codegen/compiler/*.cpp) \
+	$(src)/codegen/jit-debug.cpp \
 	$(src)/debug-util.cpp \
 	$(src)/codegen/runtime.cpp \
 	$(src)/codegen/targets.cpp \
