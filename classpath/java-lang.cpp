@@ -59,7 +59,8 @@
 #include "signal.h"
 #include "sys/time.h"
 #include "sys/types.h"
-#ifndef __ANDROID__
+// glibc >= 2.32 removed <sys/sysctl.h>; nothing here needs it on Linux.
+#if !defined(__ANDROID__) && !defined(__linux__)
 #include "sys/sysctl.h"
 #endif
 #include "sys/utsname.h"
