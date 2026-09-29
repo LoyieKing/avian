@@ -58,12 +58,15 @@ Promise* offsetPromise(Context* con, bool forTrace = false);
 
 class OffsetListener : public Promise::Listener {
  public:
-  OffsetListener(vm::System* s, uint8_t* instruction);
+  OffsetListener(vm::System* s,
+                 uint8_t* instruction,
+                 uint8_t* instructionAddress);
 
   virtual bool resolve(int64_t value, void** location);
 
   vm::System* s;
   uint8_t* instruction;
+  uint8_t* instructionAddress;
 };
 
 class OffsetTask : public Task {
@@ -88,7 +91,13 @@ uint32_t retargetBranch(vm::System* s,
                         const uint8_t* address,
                         int64_t target);
 
-void* updateOffset(vm::System* s, uint8_t* instruction, int64_t value);
+// Retargets the branch at `instruction` (in the write buffer), whose
+// link address is `instructionAddress`, to `value`.  Returns the link
+// address just past the instruction.
+void* updateOffset(vm::System* s,
+                   uint8_t* instruction,
+                   uint8_t* instructionAddress,
+                   int64_t value);
 
 class ConstantPoolEntry : public Promise {
  public:
@@ -105,20 +114,25 @@ class ConstantPoolEntry : public Promise {
   Promise* constant;
   ConstantPoolEntry* next;
   Promise* callOffset;
+  // Link address of the entry (this promise's value) and the entry's
+  // copy in the write buffer; both are set by Assembler::write.
   void* address;
+  void* slot;
   unsigned constantPoolCount;
 };
 
 class ConstantPoolListener : public Promise::Listener {
  public:
   ConstantPoolListener(vm::System* s,
-                       vm::target_uintptr_t* address,
+                       vm::target_uintptr_t* slot,
+                       void* slotAddress,
                        uint8_t* returnAddress);
 
   virtual bool resolve(int64_t value, void** location);
 
   vm::System* s;
-  vm::target_uintptr_t* address;
+  vm::target_uintptr_t* slot;
+  void* slotAddress;
   uint8_t* returnAddress;
 };
 

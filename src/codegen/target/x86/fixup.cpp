@@ -66,29 +66,35 @@ Promise* offsetPromise(Context* c)
 
 void* resolveOffset(vm::System* s,
                     uint8_t* instruction,
+                    uint8_t* instructionAddress,
                     unsigned instructionSize,
                     int64_t value)
 {
-  intptr_t v = reinterpret_cast<uint8_t*>(value) - instruction
+  intptr_t v = reinterpret_cast<uint8_t*>(value) - instructionAddress
                - instructionSize;
 
   expect(s, vm::fitsInInt32(v));
 
   int32_t v4 = v;
   memcpy(instruction + instructionSize - 4, &v4, 4);
-  return instruction + instructionSize;
+  return instructionAddress + instructionSize;
 }
 
 OffsetListener::OffsetListener(vm::System* s,
                                uint8_t* instruction,
+                               uint8_t* instructionAddress,
                                unsigned instructionSize)
-    : s(s), instruction(instruction), instructionSize(instructionSize)
+    : s(s),
+      instruction(instruction),
+      instructionAddress(instructionAddress),
+      instructionSize(instructionSize)
 {
 }
 
 bool OffsetListener::resolve(int64_t value, void** location)
 {
-  void* p = resolveOffset(s, instruction, instructionSize, value);
+  void* p = resolveOffset(
+      s, instruction, instructionAddress, instructionSize, value);
   if (location)
     *location = p;
   return false;
@@ -107,14 +113,15 @@ OffsetTask::OffsetTask(Task* next,
 
 void OffsetTask::run(Context* c)
 {
+  uint8_t* instruction = c->buffer + instructionOffset->value();
+  uint8_t* instructionAddress = c->address + instructionOffset->value();
+
   if (promise->resolved()) {
-    resolveOffset(c->s,
-                  c->result + instructionOffset->value(),
-                  instructionSize,
-                  promise->value());
+    resolveOffset(
+        c->s, instruction, instructionAddress, instructionSize, promise->value());
   } else {
     new (promise->listen(sizeof(OffsetListener))) OffsetListener(
-        c->s, c->result + instructionOffset->value(), instructionSize);
+        c->s, instruction, instructionAddress, instructionSize);
   }
 }
 
@@ -131,9 +138,10 @@ void appendOffsetTask(Context* c,
 
 ImmediateListener::ImmediateListener(vm::System* s,
                                      void* dst,
+                                     void* dstAddress,
                                      unsigned size,
                                      unsigned offset)
-    : s(s), dst(dst), size(size), offset(offset)
+    : s(s), dst(dst), dstAddress(dstAddress), size(size), offset(offset)
 {
 }
 
@@ -159,7 +167,7 @@ bool ImmediateListener::resolve(int64_t value, void** location)
 {
   copy(s, dst, value, size);
   if (location)
-    *location = static_cast<uint8_t*>(dst) + offset;
+    *location = static_cast<uint8_t*>(dstAddress) + offset;
   return offset == 0;
 }
 
@@ -179,10 +187,14 @@ ImmediateTask::ImmediateTask(Task* next,
 void ImmediateTask::run(Context* c)
 {
   if (promise->resolved()) {
-    copy(c->s, c->result + offset->value(), promise->value(), size);
+    copy(c->s, c->buffer + offset->value(), promise->value(), size);
   } else {
-    new (promise->listen(sizeof(ImmediateListener))) ImmediateListener(
-        c->s, c->result + offset->value(), size, promiseOffset);
+    new (promise->listen(sizeof(ImmediateListener)))
+        ImmediateListener(c->s,
+                          c->buffer + offset->value(),
+                          c->address + offset->value(),
+                          size,
+                          promiseOffset);
   }
 }
 

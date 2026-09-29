@@ -7025,10 +7025,9 @@ uint8_t* finish(MyThread* t,
   uint8_t* start
       = static_cast<uint8_t*>(allocator->allocate(length, TargetBytesPerWord));
 
-  a->setDestination(start);
   {
     Memory::JitWriteScope scope;
-    a->write();
+    a->write(start, start);
   }
 
   logCompile(t, start, length, 0, name, 0);
@@ -7224,7 +7223,7 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
     context->objectPoolArray = makeObjectPool(t, context);
   }
 
-  unsigned codeSize = c->resolve(allocator->memory.begin() + allocator->offset);
+  unsigned codeSize = c->resolve();
 
   unsigned total = pad(codeSize, TargetBytesPerWord)
                    + pad(c->poolSize(), TargetBytesPerWord);
@@ -7239,7 +7238,7 @@ void finish(MyThread* t, FixedAllocator* allocator, Context* context)
 
   {
     Memory::JitWriteScope scope;
-    c->write();
+    c->write(start, start);
   }
 
   BootContext* bc = context->bootContext;
@@ -10500,10 +10499,9 @@ void compileThunks(MyThread* t, FixedAllocator* allocator)
                                                                             \
     expect(t, a->endBlock(false)->resolve(0, 0) <= p->thunks.table.length); \
                                                                             \
-    a->setDestination(start);                                               \
     {                                                                       \
       Memory::JitWriteScope scope;                                          \
-      a->write();                                                           \
+      a->write(start, start);                                               \
     }                                                                       \
                                                                             \
     logCompile(t, start, p->thunks.table.length, 0, #s, 0);                 \
@@ -10609,10 +10607,9 @@ uintptr_t compileVirtualThunk(MyThread* t,
   uint8_t* start = static_cast<uint8_t*>(
       codeAllocator(t)->allocate(*size, TargetBytesPerWord));
 
-  a->setDestination(start);
   {
     Memory::JitWriteScope scope;
-    a->write();
+    a->write(start, start);
   }
 
   const size_t virtualThunkBaseNameLength = strlen(baseName);

@@ -1162,14 +1162,12 @@ class MyAssembler : public Assembler {
     }
   }
 
-  virtual void setDestination(uint8_t* dst)
+  virtual void write(uint8_t* buffer, uint8_t* address)
   {
-    c.result = dst;
-  }
+    c.buffer = buffer;
+    c.address = address;
 
-  virtual void write()
-  {
-    uint8_t* dst = c.result;
+    uint8_t* dst = buffer;
     for (MyBlock* b = c.firstBlock; b; b = b->next) {
       unsigned index = 0;
       unsigned padding = 0;
@@ -1197,6 +1195,9 @@ class MyAssembler : public Assembler {
     for (Task* t = c.tasks; t; t = t->next) {
       t->run(&c);
     }
+
+    c.buffer = 0;
+    c.address = 0;
   }
 
   virtual Promise* offset(bool)

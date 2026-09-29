@@ -44,7 +44,12 @@ class Context {
   Assembler::Client* client;
   vm::Vector code;
   Task* tasks;
-  uint8_t* result;
+  // Only meaningful during Assembler::write(buffer, address): code is
+  // emitted into `buffer` but linked to run at `address`.  Anything
+  // PC-relative or naming a code location must be computed from
+  // `address`; only stores go to `buffer`.
+  uint8_t* buffer;
+  uint8_t* address;
   MyBlock* firstBlock;
   MyBlock* lastBlock;
   PoolOffset* poolOffsetHead;

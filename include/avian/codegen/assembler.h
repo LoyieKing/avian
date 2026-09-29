@@ -93,9 +93,21 @@ class Assembler {
                      OperandInfo b,
                      OperandInfo c) = 0;
 
-  virtual void setDestination(uint8_t* dst) = 0;
-
-  virtual void write() = 0;
+  // Emits the code laid out by the preceding Block::resolve calls into
+  // `buffer`, linked to run at `address`.
+  //
+  // Every PC-relative displacement and every absolute code address is
+  // computed from `address`; `buffer` is only ever stored to.  The two
+  // may coincide (assembling in place, e.g. into a boot image) or not
+  // (assembling into a staging buffer that the code memory subsystem
+  // later copies to `address`).  `buffer` must be ordinary writable
+  // memory: the assembler never writes to executable memory itself.
+  //
+  // Fixups whose values are not yet known register promise listeners
+  // that write into `buffer` later.  That only makes sense when
+  // `buffer` is the code's final storage, i.e. for boot image
+  // generation, which is the only producer of such promises.
+  virtual void write(uint8_t* buffer, uint8_t* address) = 0;
 
   virtual Promise* offset(bool forTrace = false) = 0;
 

@@ -12,9 +12,6 @@
 #include "fixup.h"
 #include "block.h"
 
-#include <avian/arch.h>
-#include <avian/system/memory.h>
-
 namespace {
 
 const unsigned InstructionSize = 4;
@@ -56,14 +53,16 @@ Promise* offsetPromise(Context* con, bool forTrace)
       OffsetPromise(con, con->lastBlock, con->code.length(), forTrace);
 }
 
-OffsetListener::OffsetListener(vm::System* s, uint8_t* instruction)
-    : s(s), instruction(instruction)
+OffsetListener::OffsetListener(vm::System* s,
+                               uint8_t* instruction,
+                               uint8_t* instructionAddress)
+    : s(s), instruction(instruction), instructionAddress(instructionAddress)
 {
 }
 
 bool OffsetListener::resolve(int64_t value, void** location)
 {
-  void* p = updateOffset(s, instruction, value);
+  void* p = updateOffset(s, instruction, instructionAddress, value);
   if (location)
     *location = p;
   return false;
@@ -76,12 +75,14 @@ OffsetTask::OffsetTask(Task* next, Promise* promise, Promise* instructionOffset)
 
 void OffsetTask::run(Context* con)
 {
+  uint8_t* instruction = con->buffer + instructionOffset->value();
+  uint8_t* instructionAddress = con->address + instructionOffset->value();
+
   if (promise->resolved()) {
-    updateOffset(
-        con->s, con->result + instructionOffset->value(), promise->value());
+    updateOffset(con->s, instruction, instructionAddress, promise->value());
   } else {
     new (promise->listen(sizeof(OffsetListener)))
-        OffsetListener(con->s, con->result + instructionOffset->value());
+        OffsetListener(con->s, instruction, instructionAddress);
   }
 }
 
@@ -129,18 +130,16 @@ uint32_t retargetBranch(vm::System* s,
   return static_cast<uint32_t>((v & mask) | ((~mask) & p));
 }
 
-void* updateOffset(vm::System* s, uint8_t* instruction, int64_t value)
+void* updateOffset(vm::System* s,
+                   uint8_t* instruction,
+                   uint8_t* instructionAddress,
+                   int64_t value)
 {
   uint32_t* p = reinterpret_cast<uint32_t*>(instruction);
 
-  {
-    avian::system::Memory::JitWriteScope scope;
-    *p = retargetBranch(s, *p, instruction, value);
-  }
+  *p = retargetBranch(s, *p, instructionAddress, value);
 
-  vm::syncInstructionCache(instruction, InstructionSize);
-
-  return instruction + InstructionSize;
+  return instructionAddress + InstructionSize;
 }
 
 ConstantPoolEntry::ConstantPoolEntry(Context* con,
@@ -151,7 +150,8 @@ ConstantPoolEntry::ConstantPoolEntry(Context* con,
       constant(constant),
       next(next),
       callOffset(callOffset),
-      address(0)
+      address(0),
+      slot(0)
 {
 }
 
@@ -168,19 +168,18 @@ bool ConstantPoolEntry::resolved()
 }
 
 ConstantPoolListener::ConstantPoolListener(vm::System* s,
-                                           vm::target_uintptr_t* address,
+                                           vm::target_uintptr_t* slot,
+                                           void* slotAddress,
                                            uint8_t* returnAddress)
-    : s(s), address(address), returnAddress(returnAddress)
+    : s(s), slot(slot), slotAddress(slotAddress), returnAddress(returnAddress)
 {
 }
 
 bool ConstantPoolListener::resolve(int64_t value, void** location)
 {
-  avian::system::Memory::JitWriteScope scope;
-  *address = value;
-  vm::syncInstructionCache(address, sizeof(*address));
+  *slot = value;
   if (location) {
-    *location = returnAddress ? static_cast<void*>(returnAddress) : address;
+    *location = returnAddress ? static_cast<void*>(returnAddress) : slotAddress;
   }
   return true;
 }

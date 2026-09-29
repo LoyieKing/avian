@@ -10,8 +10,6 @@
 
 #include "avian/target.h"
 
-#include <avian/system/memory.h>
-
 #include <avian/util/runtime-array.h>
 
 #include <avian/codegen/compiler.h>
@@ -2882,11 +2880,8 @@ class MyCompiler : public Compiler {
     compiler::compile(&c, stackOverflowHandler, stackLimitOffset);
   }
 
-  virtual unsigned resolve(uint8_t* dst)
+  virtual unsigned resolve()
   {
-    c.machineCode = dst;
-    c.assembler->setDestination(dst);
-
     Block* block = c.firstBlock;
     while (block->nextBlock or block->nextInstruction) {
       Block* next = block->nextBlock
@@ -2908,16 +2903,16 @@ class MyCompiler : public Compiler {
     return c.constantCount * TargetBytesPerWord;
   }
 
-  virtual void write()
+  virtual void write(uint8_t* buffer, uint8_t* address)
   {
-    avian::system::Memory::JitWriteScope scope;
+    c.machineCode = address;
 
-    c.assembler->write();
+    c.assembler->write(buffer, address);
 
     int i = 0;
     for (ConstantPoolNode* n = c.firstConstant; n; n = n->next) {
       target_intptr_t* target = reinterpret_cast<target_intptr_t*>(
-          c.machineCode + pad(c.machineCodeSize, TargetBytesPerWord) + i);
+          buffer + pad(c.machineCodeSize, TargetBytesPerWord) + i);
 
       if (n->promise->resolved()) {
         *target = targetVW(n->promise->value());
@@ -2930,7 +2925,6 @@ class MyCompiler : public Compiler {
 
           virtual bool resolve(int64_t value, void** location)
           {
-            avian::system::Memory::JitWriteScope scope;
             *target = targetVW(value);
             if (location)
               *location = target;

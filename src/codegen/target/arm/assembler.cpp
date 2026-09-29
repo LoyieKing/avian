@@ -10,7 +10,6 @@
 
 #include <avian/util/runtime-array.h>
 
-#include <avian/arch.h>
 #include <avian/codegen/assembler.h>
 #include <avian/codegen/architecture.h>
 #include <avian/codegen/registers.h>
@@ -979,14 +978,12 @@ class MyAssembler : public Assembler {
     }
   }
 
-  virtual void setDestination(uint8_t* dst)
+  virtual void write(uint8_t* buffer, uint8_t* address)
   {
-    con.result = dst;
-  }
+    con.buffer = buffer;
+    con.address = address;
 
-  virtual void write()
-  {
-    uint8_t* dst = con.result;
+    uint8_t* dst = buffer;
     unsigned dstOffset = 0;
     for (MyBlock* b = con.firstBlock; b; b = b->next) {
       if (DebugPool) {
@@ -1018,7 +1015,8 @@ class MyAssembler : public Assembler {
             entry += TargetBytesPerWord;
           }
 
-          o->entry->address = dst + entry;
+          o->entry->address = address + entry;
+          o->entry->slot = dst + entry;
 
           unsigned instruction = o->block->start + padding(o->block, o->offset)
                                  + o->offset;
@@ -1067,13 +1065,14 @@ class MyAssembler : public Assembler {
 
     for (ConstantPoolEntry* e = con.constantPool; e; e = e->next) {
       if (e->constant->resolved()) {
-        *static_cast<target_uintptr_t*>(e->address) = e->constant->value();
+        *static_cast<target_uintptr_t*>(e->slot) = e->constant->value();
       } else {
         new (e->constant->listen(sizeof(ConstantPoolListener)))
             ConstantPoolListener(
                 con.s,
-                static_cast<target_uintptr_t*>(e->address),
-                e->callOffset ? dst + e->callOffset->value() + 8 : 0);
+                static_cast<target_uintptr_t*>(e->slot),
+                e->address,
+                e->callOffset ? address + e->callOffset->value() + 8 : 0);
       }
       if (false) {
         fprintf(stderr,
@@ -1082,6 +1081,9 @@ class MyAssembler : public Assembler {
                 e->address);
       }
     }
+
+    con.buffer = 0;
+    con.address = 0;
   }
 
   virtual Promise* offset(bool forTrace)
