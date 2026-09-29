@@ -246,14 +246,23 @@ back to a single read/write/execute mapping.
 The environment variable `AVIAN_CODE_MEMORY` forces a backend: `rwx`
 everywhere, `dual-map` on Linux, `map-jit` on macOS.
 
-**Debugging generated code on Linux:** a debugger that plants a software
-breakpoint in JIT code (e.g. gdb `break *0x...`) writes it through
-`ptrace`, which gives that page of the executable view a private copy.
-From then on, patches the VM makes through the writable view are not seen
-by that page, and the program can misbehave.  Run with
-`AVIAN_CODE_MEMORY=rwx` when setting breakpoints in generated code.
-Hardware breakpoints and watchpoints, and breakpoints in the VM itself,
-are not affected.
+**Debugging generated code on Linux:** debuggers set software
+breakpoints by writing an instruction into the target with `ptrace`, and
+the kernel refuses such a write to the dual-mapped executable view (it is
+a shared mapping that isn't writable).  gdb then reports
+`Cannot insert breakpoint N. Cannot access memory at address 0x...`;
+nothing is corrupted.  So:
+
+  * If the VM is started under a debugger (`gdb --args avian ...`,
+`lldb -- avian ...`), it notices (`TracerPid` in `/proc/self/status`),
+prints `avian: debugger detected; using rwx code memory ...` and uses the
+read/write/execute backend, where software breakpoints work normally.
+  * If a debugger attaches later, use hardware breakpoints (`hbreak` in
+gdb, `breakpoint set -H` in lldb; a few are available), or restart the
+VM under the debugger or with `AVIAN_CODE_MEMORY=rwx`.
+  * `AVIAN_CODE_MEMORY` always takes precedence over the automatic choice.
+
+Breakpoints in the VM itself are not affected.
 
 Building with the Microsoft Visual C++ Compiler
 -----------------------------------------------

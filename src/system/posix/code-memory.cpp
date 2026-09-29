@@ -14,6 +14,8 @@
 
 #include "../code-memory-backend.h"
 
+#include <avian/system/debugger.h>
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,11 +162,13 @@ class RwxCodeMemory final : public CodeMemory {
 //
 // Caveats (also in README.md, "JIT Code Memory"):
 //
-// * A debugger that inserts a software breakpoint into JIT code through
-//   ptrace gets a private copy-on-write copy of that page in the
-//   executable view, after which patches made through the alias are no
-//   longer visible there.  Use AVIAN_CODE_MEMORY=rwx when debugging
-//   generated code that way.
+// * Debuggers can't plant software breakpoints in the executable view:
+//   they write them with ptrace (or /proc/pid/mem), and the kernel
+//   refuses a forced write to a shared mapping that isn't writable
+//   (EFAULT; gdb reports "Cannot insert breakpoint ... Cannot access
+//   memory").  Nothing is corrupted, and hardware breakpoints work.
+//   When a debugger is attached at startup, makeExecutableCodeMemory
+//   picks the rwx backend instead.
 // * Both views are MAP_SHARED, so a child created by fork() shares them
 //   with the parent instead of getting a copy.  That is harmless for
 //   fork-then-exec (what Runtime.exec does: the child runs no Java code
@@ -491,6 +495,18 @@ CodeMemory* makeExecutableCodeMemory(util::Alloc* allocator, size_t capacity)
   }
 
   if (requested == 0) {
+    // A debugger can't plant software breakpoints in the executable
+    // view (see DualMapCodeMemory), so if we were started under one,
+    // give up W^X for its sake.  It can still be forced with
+    // AVIAN_CODE_MEMORY=dual-map.
+    if (debuggerAttached()) {
+      fprintf(stderr,
+              "avian: debugger detected; using rwx code memory so that "
+              "breakpoints work in generated code "
+              "(AVIAN_CODE_MEMORY overrides)\n");
+      return RwxCodeMemory::make(allocator, capacity);
+    }
+
     // Prefer W^X; quietly fall back where memfds can't be executable
     // (old kernels, vm.memfd_noexec=2, restrictive LSM policies, ...).
     CodeMemory* memory = DualMapCodeMemory::make(allocator, capacity, false);
