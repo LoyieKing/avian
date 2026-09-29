@@ -41,7 +41,8 @@ namespace system {
 //
 // How executable memory is made writable is a property of the backend
 // alone; nothing outside the implementation toggles permissions or
-// flushes instruction caches.  Backends (see code-memory.cpp):
+// flushes instruction caches.  Backends (src/system/code-memory.cpp
+// and src/system/<os>/code-memory.cpp):
 //
 //   * Darwin: one MAP_JIT mapping; on Apple silicon, commit() and
 //     patch() flip the calling thread's pthread_jit_write_protect_np
@@ -50,7 +51,8 @@ namespace system {
 //     read+write (where it is staged and patched), so no page is ever
 //     both writable and executable.  Falls back to RWX where that is
 //     not available.
-//   * Elsewhere: a single read/write/execute mapping.
+//   * Windows and other POSIX systems: a single read/write/execute
+//     mapping (code is still staged and committed, as everywhere).
 //   * Boot image generation: a plain buffer that is never executed.
 //
 // Threading: allocate() and free() must be serialized by the caller
