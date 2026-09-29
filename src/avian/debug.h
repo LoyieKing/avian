@@ -146,6 +146,7 @@ void onThreadStart(Thread* t);
 void onThreadDeath(Thread* t);
 void requestPop(Thread* t);
 bool suspendedTopFrame(Thread* t);
+int topReturnTag(Thread* t);
 // mode 1: PopFrames (return a zero/null of the method's type).
 // mode 2: ForceEarlyReturn. tag/bits are the JDWP value. Object tags
 // carry an object id, resolved when the frame is actually left.

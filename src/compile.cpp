@@ -3466,9 +3466,22 @@ int jitFrameOp(Thread* thread, int op, int frame, int slot, debug::SlotIO* io)
       // dropped. The suspend snapshot still names the Java frame, and
       // debugCheckpoint pops it when the thread resumes.
       if (frame == 0 and debug::suspendedTopFrame(t)) {
-        if (op == 5)
+        if (op == 5) {
+          int want = debug::topReturnTag(t);
+          int got = io->tag;
+          bool obj = got == 'L' or got == '[' or got == 's' or got == 't'
+                     or got == 'g' or got == 'l' or got == 'c';
+          if (want == 'L') {
+            if (not obj) {
+              io->status = 34;
+              return 34;
+            }
+          } else if (want and got != want) {
+            io->status = 34;
+            return 34;
+          }
           debug::requestEarly(t, io->tag, io->bits);
-        else
+        } else
           debug::requestPop(t);
         io->status = 0;
         return 0;

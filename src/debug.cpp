@@ -3111,6 +3111,20 @@ bool suspendedTopFrameImpl(Thread* t)
   return s and s->count > 0 and s->frames[0].methodId != 0;
 }
 
+int topReturnTagImpl(Thread* t)
+{
+  Snap* s = static_cast<Snap*>(t->debugSnap);
+  if (s == 0 or s->count < 1 or s->frames[0].spec == 0)
+    return 0;
+  const char* spec = s->frames[0].spec;
+  const char* rp = ::strchr(spec, ')');
+  if (rp == 0 or rp[1] == 0)
+    return 'V';
+  if (rp[1] == 'L' or rp[1] == '[')
+    return 'L';
+  return rp[1];
+}
+
 bool takePopImpl(Thread* t, int* mode, int* tag, uint64_t* bits)
 {
   for (int i = 0; i < 32; ++i) {
@@ -5142,6 +5156,11 @@ void requestPop(Thread* t)
 bool suspendedTopFrame(Thread* t)
 {
   return t and suspendedTopFrameImpl(t);
+}
+
+int topReturnTag(Thread* t)
+{
+  return t ? topReturnTagImpl(t) : 0;
 }
 
 bool takePop(Thread* t, int* mode, int* tag, uint64_t* bits)

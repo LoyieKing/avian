@@ -105,6 +105,10 @@ public class JdwpDebug {
     }
   }
 
+  int peek() {
+    return n;
+  }
+
   static volatile int ranLeaf;
 
   static void leaf() {
