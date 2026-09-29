@@ -958,6 +958,7 @@ class Context {
     {
       v->visit(&(c->method));
       v->visit(&(c->objectPoolArray));
+      v->visit(&(c->callNodes));
 
       for (PoolElement* p = c->objectPool; p; p = p->next) {
         v->visit(&(p->target));
@@ -1173,6 +1174,7 @@ class Context {
         bootContext(bootContext),
         objectPool(0),
         objectPoolArray(0),
+        callNodes(0),
         subroutineCount(0),
         traceLog(0),
         visitTable(
@@ -1185,6 +1187,7 @@ class Context {
         executableStart(0),
         executableSize(0),
         objectPoolCount(0),
+        callNodeCount(0),
         traceLogCount(0),
         dirtyRoots(false),
         leaf(true),
@@ -1207,6 +1210,7 @@ class Context {
         bootContext(0),
         objectPool(0),
         objectPoolArray(0),
+        callNodes(0),
         subroutineCount(0),
         traceLog(0),
         visitTable(0, 0),
@@ -1215,6 +1219,7 @@ class Context {
         executableStart(0),
         executableSize(0),
         objectPoolCount(0),
+        callNodeCount(0),
         traceLogCount(0),
         dirtyRoots(false),
         leaf(true),
@@ -1272,6 +1277,10 @@ class Context {
   // The materialized pool for objectPool (see makeObjectPool); owned by
   // this context until publishObjectPool hands it to the VM.
   GcArray* objectPoolArray;
+  // Call nodes for this method's call sites, chained through their next
+  // fields; owned by this context until publishCallNodes links them
+  // into the call table.
+  GcCallNode* callNodes;
   unsigned subroutineCount;
   TraceElement* traceLog;
   Slice<uint16_t> visitTable;
@@ -1280,6 +1289,7 @@ class Context {
   uint8_t* executableStart;
   unsigned executableSize;
   unsigned objectPoolCount;
+  unsigned callNodeCount;
   unsigned traceLogCount;
   bool dirtyRoots;
   bool leaf;
@@ -7157,7 +7167,9 @@ GcIntArray* makeSimpleFrameMapTable(MyThread* t,
   return table;
 }
 
-void insertCallNode(MyThread* t, GcCallNode* node);
+void reserveCallNodes(MyThread* t, unsigned count);
+
+void publishCallNodes(MyThread* t, Context* context);
 
 GcArray* makeObjectPool(MyThread* t, Context* context)
 {
@@ -7303,8 +7315,11 @@ void finish(MyThread* t, Context* context)
         RUNTIME_ARRAY_BODY(elements)[index++] = p;
 
         if (p->target) {
-          insertCallNode(
-              t, makeCallNode(t, p->address->value(), p->target, p->flags, 0));
+          // Not linked into the call table yet: see publishCallNodes.
+          GcCallNode* node = makeCallNode(
+              t, p->address->value(), p->target, p->flags, context->callNodes);
+          context->callNodes = node;
+          ++context->callNodeCount;
         }
       }
     }
@@ -7319,15 +7334,6 @@ void finish(MyThread* t, Context* context)
 
     context->method->code()->setStackMap(t, map);
   }
-
-  logCompile(
-      t,
-      start,
-      codeSize,
-      reinterpret_cast<const char*>(
-          context->method->class_()->name()->body().begin()),
-      reinterpret_cast<const char*>(context->method->name()->body().begin()),
-      reinterpret_cast<const char*>(context->method->spec()->body().begin()));
 
   // for debugging:
   if (false
@@ -9846,10 +9852,31 @@ GcArray* resizeTable(MyThread* t, GcArray* oldTable, unsigned newLength)
   return newTable;
 }
 
-GcArray* insertCallNode(MyThread* t,
-                        GcArray* table,
-                        unsigned* size,
-                        GcCallNode* node)
+// Returns `table`, or a larger copy of it, with room for `count` more
+// nodes than the `size` it holds, so that they can then be linked in
+// with linkCallNode, which cannot fail.  May allocate.
+GcArray* reserveCallTable(MyThread* t,
+                          GcArray* table,
+                          unsigned size,
+                          unsigned count)
+{
+  unsigned length = table->length();
+  while (size + count >= length * 2) {
+    length *= 2;
+  }
+
+  if (length != table->length()) {
+    table = resizeTable(t, table, length);
+  }
+
+  return table;
+}
+
+// Links `node` into `table`, which must have room for it (see
+// reserveCallTable).  Doesn't allocate, so it can't fail.  findCallNode
+// walks buckets without locking, so the node is complete before it
+// becomes reachable.
+void linkCallNode(MyThread* t, GcArray* table, unsigned* size, GcCallNode* node)
 {
   if (DebugCallTable) {
     fprintf(stderr,
@@ -9857,20 +9884,26 @@ GcArray* insertCallNode(MyThread* t,
             reinterpret_cast<void*>(node->address()));
   }
 
-  PROTECT(t, table);
-  PROTECT(t, node);
-
+  assertT(t, *size + 1 < table->length() * 2);
   ++(*size);
-
-  if (*size >= table->length() * 2) {
-    table = resizeTable(t, table, table->length() * 2);
-  }
 
   intptr_t key = node->address();
   unsigned index = static_cast<uintptr_t>(key) & (table->length() - 1);
 
   node->setNext(t, cast<GcCallNode>(t, table->body()[index]));
+  storeStoreMemoryBarrier();
   table->setBodyElement(t, index, node);
+}
+
+GcArray* insertCallNode(MyThread* t,
+                        GcArray* table,
+                        unsigned* size,
+                        GcCallNode* node)
+{
+  PROTECT(t, node);
+
+  table = reserveCallTable(t, table, *size, 1);
+  linkCallNode(t, table, size, node);
 
   return table;
 }
@@ -10262,12 +10295,38 @@ intptr_t getThunk(MyThread* t, Thunk thunk)
 }
 
 #ifndef AVIAN_AOT_ONLY
-void insertCallNode(MyThread* t, GcCallNode* node)
+// Makes sure the call table can take `count` more nodes without growing,
+// so that publishCallNodes can't fail.  May allocate.  The caller must
+// hold classLock until it has published them.
+void reserveCallNodes(MyThread* t, unsigned count)
 {
-  GcArray* newArray = insertCallNode(
-      t, compileRoots(t)->callTable(), &(processor(t)->callTableSize), node);
-  // sequence point, for gc (don't recombine statements)
-  compileRoots(t)->setCallTable(t, newArray);
+  GcArray* table = reserveCallTable(
+      t, compileRoots(t)->callTable(), processor(t)->callTableSize, count);
+
+  if (table != compileRoots(t)->callTable()) {
+    // The copy holds exactly the same nodes; make it complete before
+    // readers (see findCallNode) can see it.
+    storeStoreMemoryBarrier();
+    compileRoots(t)->setCallTable(t, table);
+  }
+}
+
+// Links the call nodes of a compiled method into the call table.  The
+// room must have been reserved with reserveCallNodes; this doesn't
+// allocate, so it can't fail.
+void publishCallNodes(MyThread* t, Context* context)
+{
+  GcArray* table = compileRoots(t)->callTable();
+  unsigned* size = &(processor(t)->callTableSize);
+
+  for (GcCallNode* node = context->callNodes; node;) {
+    GcCallNode* next = node->next();
+    linkCallNode(t, table, size, node);
+    node = next;
+  }
+
+  context->callNodes = 0;
+  context->callNodeCount = 0;
 }
 
 BootImage::Thunk thunkToThunk(const MyProcessor::Thunk& thunk, uint8_t* base)
@@ -10625,7 +10684,9 @@ uintptr_t virtualThunk(MyThread* t, unsigned index)
   GcWordArray* oldArray = compileRoots(t)->virtualThunks();
   if (oldArray == 0 or oldArray->length() <= index * 2) {
     GcWordArray* newArray = makeWordArray(t, nextPowerOfTwo((index + 1) * 2));
-    if (compileRoots(t)->virtualThunks()) {
+    // makeWordArray may have collected and moved the old array.
+    oldArray = compileRoots(t)->virtualThunks();
+    if (oldArray) {
       memcpy(newArray->body().begin(),
              oldArray->body().begin(),
              oldArray->length() * BytesPerWord);
@@ -10720,6 +10781,16 @@ void compile(MyThread* t, BootContext* bootContext, GcMethod* method)
 
   finish(t, &context);
 
+  // Publication.  Everything up to the commit point below may allocate
+  // and therefore fail (collect, throw OutOfMemoryError); none of it is
+  // visible to other threads or to the rest of the VM.  If it fails,
+  // the context gives the code space back and the object pool and call
+  // nodes, never having been linked anywhere, are simply collected.
+  // From the commit point on nothing allocates, so the method is either
+  // published completely or not at all.
+
+  reserveCallNodes(t, context.callNodeCount);
+
   if (DebugMethodTree) {
     fprintf(stderr,
             "insert method at %p\n",
@@ -10743,7 +10814,13 @@ void compile(MyThread* t, BootContext* bootContext, GcMethod* method)
                                    clone,
                                    compileRoots(t)->methodTreeSentinal(),
                                    compareIpToMethodBounds);
-  // sequence point, for gc (don't recombine statements)
+
+  // ---- commit point: nothing below may allocate or throw ----
+
+  // Call nodes first: findCallNode must see them by the time any thread
+  // can be executing the method (see its loadMemoryBarrier).
+  publishCallNodes(t, &context);
+
   compileRoots(t)->setMethodTree(t, newTree);
 
   storeStoreMemoryBarrier();
@@ -10755,13 +10832,8 @@ void compile(MyThread* t, BootContext* bootContext, GcMethod* method)
         = reinterpret_cast<void*>(methodCompiled(t, clone));
   }
 
-  // we've compiled the method and inserted it into the tree without
-  // error, so we hand its object pool over to the VM and ensure that
-  // the executable area not be deallocated when we dispose of the
-  // context.  Nothing above may be moved below this point: if
-  // anything throws before here, the context releases the code space
-  // and the pool, having never been linked anywhere, is simply
-  // collected.
+  // The method's object pool now belongs to the VM, and its code space
+  // must survive the context.
   publishObjectPool(t, &context);
   context.executableMemory = 0;
 
@@ -10771,6 +10843,18 @@ void compile(MyThread* t, BootContext* bootContext, GcMethod* method)
              method,
              compileRoots(t)->methodTreeSentinal(),
              compareIpToMethodBounds);
+
+  // ---- published ----
+
+  // Tell the JIT log and compilation handlers only now that the method
+  // really exists.
+  logCompile(t,
+             reinterpret_cast<const void*>(methodCompiled(t, clone)),
+             methodCompiledSize(t, clone),
+             reinterpret_cast<const char*>(
+                 clone->class_()->name()->body().begin()),
+             reinterpret_cast<const char*>(clone->name()->body().begin()),
+             reinterpret_cast<const char*>(clone->spec()->body().begin()));
 #endif // not AVIAN_AOT_ONLY
 }
 
