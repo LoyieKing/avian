@@ -9,6 +9,7 @@
    details. */
 
 #include "avian/machine.h"
+#include "avian/debug.h"
 #include "avian/util.h"
 #include "avian/alloc-vector.h"
 #include "avian/process.h"
@@ -789,6 +790,37 @@ class Subroutine {
   bool visited;
 };
 
+
+int captureDebugFrames(Thread* thread, debug::WalkerFrame* out, int max)
+{
+  MyThread* t = static_cast<MyThread*>(thread);
+  int n = 0;
+  for (MyStackWalker walker(t); walker.valid() and n < max; walker.next()) {
+    GcMethod* method = walker.method();
+    if (method == 0 or method->name() == 0 or method->class_() == 0)
+      continue;
+    debug::WalkerFrame* frame = out + n;
+    frame->className[0] = 0;
+    frame->methodName[0] = 0;
+    frame->spec[0] = 0;
+    const char* cn = reinterpret_cast<const char*>(method->class_()->name()->body().begin());
+    const char* mn = reinterpret_cast<const char*>(method->name()->body().begin());
+    const char* sp = method->spec()
+                         ? reinterpret_cast<const char*>(method->spec()->body().begin())
+                         : "";
+    ::snprintf(frame->className, sizeof frame->className, "%s", cn);
+    ::snprintf(frame->methodName, sizeof frame->methodName, "%s", mn);
+    ::snprintf(frame->spec, sizeof frame->spec, "%s", sp);
+    int machine = walker.ip();
+    int bci = debug::machineOffsetToBci(frame->className, frame->methodName, frame->spec, machine);
+    if (bci < 0)
+      continue;
+    frame->index = bci;
+    ++n;
+  }
+  return n;
+}
+
 class Context;
 
 class TraceElement : public avian::codegen::TraceHandler {
@@ -884,7 +916,7 @@ enum Thunk {
 #undef THUNK
 };
 
-const unsigned ThunkCount = idleIfNecessaryThunk + 1;
+const unsigned ThunkCount = debugCheckpointThunk + 1;
 
 intptr_t getThunk(MyThread* t, Thunk thunk);
 
@@ -1192,6 +1224,7 @@ class Context {
         traceLogCount(0),
         dirtyRoots(false),
         leaf(true),
+        debugBits(0),
         eventLog(t->m->system, t->m->heap, 1024),
         protector(this),
         resource(this),
@@ -1224,6 +1257,7 @@ class Context {
         traceLogCount(0),
         dirtyRoots(false),
         leaf(true),
+        debugBits(0),
         eventLog(t->m->system, t->m->heap, 0),
         protector(this),
         resource(this),
@@ -1294,6 +1328,7 @@ class Context {
   unsigned traceLogCount;
   bool dirtyRoots;
   bool leaf;
+  uint8_t* debugBits;
   Vector eventLog;
   MyProtector protector;
   MyResource resource;
@@ -3134,6 +3169,13 @@ void idleIfNecessary(MyThread* t)
   if (UNLIKELY(t->m->exclusive)) {
     ENTER(t, Thread::IdleState);
   }
+  if (UNLIKELY(debug::enabled()))
+    debug::safepoint(t);
+}
+
+void debugCheckpoint(MyThread* t, uintptr_t bci, uintptr_t bits)
+{
+  debug::checkpoint(t, static_cast<int32_t>(bci), bits, 0);
 }
 
 bool useLongJump(MyThread* t, uintptr_t target)
@@ -4091,6 +4133,10 @@ void compile(MyThread* t,
   Frame* frame = initialFrame;
   avian::codegen::Compiler* c = frame->c;
   Context* context = frame->context;
+  if (debug::enabled() and context->debugBits == 0 and context->method->code()
+      and context->method->code()->length()) {
+    context->debugBits = debug::allocateBits(t, context->method->code()->length());
+  }
   unsigned stackSize = context->method->code()->maxStack();
   Stack stack(t);
   unsigned ip = initialIp;
@@ -4114,6 +4160,18 @@ loop:
     }
 
     frame->startLogicalIp(ip);
+
+    if (debug::enabled()) {
+      c->nativeCall(
+          c->constant(getThunk(t, debugCheckpointThunk), ir::Type::iptr()),
+          0,
+          frame->trace(0, 0),
+          ir::Type::void_(),
+          args(c->threadRegister(),
+               c->constant(static_cast<intptr_t>(ip), ir::Type::iptr()),
+               c->constant(reinterpret_cast<intptr_t>(context->debugBits),
+                           ir::Type::iptr())));
+    }
 
     if (exceptionHandlerStart >= 0) {
       c->initLocalsFromLogicalIp(exceptionHandlerStart);
@@ -7298,6 +7356,25 @@ void finish(MyThread* t, Context* context)
 
     GcCode* code = context->method->code();
 
+    if (context->debugBits) {
+      unsigned length = context->method->code()->length();
+      int32_t* map = static_cast<int32_t*>(malloc(sizeof(int32_t) * (length ? length : 1)));
+      if (map) {
+        for (unsigned bci = 0; bci < length; ++bci) {
+          map[bci] = -1;
+          if (context->subroutineCount == 0 and bci < context->visitTable.count
+              and context->visitTable[bci] > 0) {
+            Promise* promise = context->compiler->machineIp(bci);
+            if (promise and promise->resolved()) {
+              map[bci] = static_cast<int32_t>(
+                  promise->value() - reinterpret_cast<intptr_t>(start));
+            }
+          }
+        }
+      }
+      debug::publishCompiled(t, context->method, context->debugBits, length, map);
+    }
+
     code = makeCode(t,
                     0,
                     0,
@@ -9491,7 +9568,10 @@ class MyProcessor : public Processor {
       // about, so not while generating a boot image.
       jitDebug = avian::codegen::makeJitDebugInfo(allocator);
     }
+    if (codeMemory)
+      debug::setCodeMemory(codeMemory);
 #endif
+    debug::registerWalker(captureDebugFrames);
 
     if (image and code) {
       local::boot(static_cast<MyThread*>(t), image, code);

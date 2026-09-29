@@ -159,7 +159,8 @@ int main(int ac, const char** av)
       if (i + 1 == ac)
         usageAndExit(av[0]);
       jar = av[++i];
-    } else if (strncmp(av[i], "-X", 2) == 0 or strncmp(av[i], "-D", 2) == 0) {
+    } else if (strncmp(av[i], "-X", 2) == 0 or strncmp(av[i], "-D", 2) == 0
+               or strncmp(av[i], "-agentlib:", 10) == 0) {
       ++vmArgs.nOptions;
     } else if (strcmp(av[i], "-client") == 0 or strcmp(av[i], "-server") == 0) {
       // ignore
@@ -243,7 +244,8 @@ int main(int ac, const char** av)
       = RUNTIME_ARRAY_BODY(classpathPropertyBuffer);
 
   for (int i = 1; i < ac; ++i) {
-    if (strncmp(av[i], "-X", 2) == 0 or strncmp(av[i], "-D", 2) == 0) {
+    if (strncmp(av[i], "-X", 2) == 0 or strncmp(av[i], "-D", 2) == 0
+        or strncmp(av[i], "-agentlib:", 10) == 0) {
       vmArgs.options[optionIndex++].optionString = const_cast<char*>(av[i]);
     }
   }

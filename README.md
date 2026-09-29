@@ -41,6 +41,47 @@ provide a useful subset of Java's features, suitable for building
 self-contained applications.
 
 
+JDWP
+----
+
+Avian can host a JDWP (`dt_socket`) server so `jdb`, IntelliJ, or VS Code
+can attach:
+
+    avian -Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=5005 -cp . MyMain
+    jdb -attach 5005
+
+`-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005` is
+accepted as well. `address=0` prints the chosen port on stderr
+(`Listening for transport dt_socket at address: N`). `server=n` is not
+supported. Set `AVIAN_JDWP_LOG=1` to log every JDWP command. Windows
+sockets are not implemented: the flag is accepted and then ignored, and
+the process is not suspended.
+
+Suspension is cooperative. A thread stops at a safepoint the VM already
+has: every bytecode while interpreting, every bytecode of a method that
+was JIT-compiled after JDWP was enabled (a `CodeMemory` bitset, patched
+with `CodeMemory::patch`, gates the call), and the existing
+`idleIfNecessary` / interpreter safepoint for everything else. The
+stopped thread enters the Idle state, so GC can run, then blocks on a
+monitor. There is no preemptive suspend. Methods compiled before the
+agent, and boot-image / AOT code, honor suspend only at those existing
+safepoints and will not hit a breakpoint in their own bodies.
+
+Single-step is at bytecode granularity (`size=min`) or, when a line
+table exists, line granularity. Breakpoints are bytecode indices (jdb's
+`stop in` / `stop at` both become a location).
+
+Not implemented, on purpose, so the event layer can grow under JDWP
+rather than the other way around: RedefineClasses, field watch, monitor
+events, heap walking, early return, PopFrames, invoking a method from
+the debugger, local-variable tables and StackFrame.GetValues, a real
+ThisObject, exception / thread-start / thread-death / class-unload
+events, source-debug extension, `server=n`, and 32-bit builds (the
+`TARGET_THREAD_*` offsets in `target-fields.h` were only shifted for
+LP64).
+
+
+
 Supported Platforms
 -------------------
 

@@ -10,6 +10,7 @@
 
 #include "avian/jnienv.h"
 #include "avian/machine.h"
+#include "avian/debug.h"
 #include "avian/util.h"
 #include <avian/util/stream.h>
 #include "avian/constants.h"
@@ -3842,6 +3843,18 @@ Thread::Thread(Machine* m, GcThread* javaThread, Thread* parent)
           static_cast<uintptr_t*>(m->heap->allocate(ThreadHeapSizeInBytes))),
       heap(defaultHeap),
       backupHeapIndex(0),
+      debugSuspend(0),
+      debugStepping(0),
+      debugStepSize(0),
+      debugStepDepth(0),
+      debugStepBase(0),
+      debugStepLine(-1),
+      debugStepMethod(0),
+      debugInBlock(0),
+      debugSuppressBci(-1),
+      debugSuppressCookie(0),
+      debugDepth(0),
+      debugSnap(0),
       flags(ActiveFlag)
 {
 }
@@ -4879,9 +4892,14 @@ GcClass* resolveSystemClass(Thread* t,
   PROTECT(t, loader);
   PROTECT(t, spec);
 
+  GcClass* class_ = 0;
+  // Destroyed after the class lock so ClassPrepare can block without
+  // holding it.  Only a class this call actually defines is armed.
+  debug::ClassPrepareNotifier prepare(t, &class_);
+
   ACQUIRE(t, t->m->classLock);
 
-  GcClass* class_ = findLoadedClass(t, loader, spec);
+  class_ = findLoadedClass(t, loader, spec);
   if (class_ == 0) {
     PROTECT(t, class_);
 
@@ -4975,6 +4993,7 @@ GcClass* resolveSystemClass(Thread* t,
           t, cast<GcHashMap>(t, loader->map()), spec, class_, byteArrayHash);
 
       updatePackageMap(t, class_);
+      prepare.arm();
     } else if (throw_) {
       throwNew(t, throwType, "%s", spec->body().begin());
     }
@@ -5213,6 +5232,7 @@ void postInitClass(Thread* t, GcClass* c)
 
   if (t->exception
       and instanceOf(t, type(t, GcException::Type), t->exception)) {
+    debug::noteClassStatus(t, c, false, true);
     c->vmFlags() |= NeedInitFlag | InitErrorFlag;
     c->vmFlags() &= ~InitFlag;
 
@@ -5228,6 +5248,7 @@ void postInitClass(Thread* t, GcClass* c)
     throw_(t, initExecption->as<GcThrowable>(t));
   } else {
     c->vmFlags() &= ~(NeedInitFlag | InitFlag);
+    debug::noteClassStatus(t, c, true, false);
   }
   t->m->classLock->notifyAll(t->systemThread);
 }

@@ -1360,6 +1360,22 @@ class Thread {
   uintptr_t backupHeap[ThreadBackupHeapSizeInWords];
   unsigned backupHeapIndex;
 
+  // Debugger suspension.  Touched only by the JDWP event layer.
+  // debugSuspend is a per-thread suspend count; the VM-wide count
+  // lives in the debug module.  Checkpoint reads both.
+  int debugSuspend;
+  int debugStepping;
+  int debugStepSize;
+  int debugStepDepth;
+  int debugStepBase;
+  int debugStepLine;
+  uint64_t debugStepMethod;
+  int debugInBlock;
+  int32_t debugSuppressBci;
+  uintptr_t debugSuppressCookie;
+  int debugDepth;
+  void* debugSnap;
+
  private:
   unsigned flags;
 };

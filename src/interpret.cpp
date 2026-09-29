@@ -13,6 +13,7 @@
 #include <avian/system/signal.h>
 #include "avian/constants.h"
 #include "avian/machine.h"
+#include "avian/debug.h"
 #include "avian/processor.h"
 #include "avian/process.h"
 #include "avian/arch.h"
@@ -761,6 +762,8 @@ void safePoint(Thread* t)
   if (UNLIKELY(t->m->exclusive)) {
     ENTER(t, Thread::IdleState);
   }
+  if (UNLIKELY(vm::debug::enabled()))
+    vm::debug::safepoint(t);
 }
 
 object interpret3(Thread* t, const int base)
@@ -782,6 +785,10 @@ object interpret3(Thread* t, const int base)
   }
 
 loop:
+  if (UNLIKELY(vm::debug::enabled())) {
+    vm::debug::checkpoint(t, static_cast<int32_t>(ip), 0, frameMethod(t, frame));
+  }
+
   instruction = code->body()[ip++];
 
   if (DebugRun) {
@@ -3224,6 +3231,32 @@ object invoke(Thread* t, GcMethod* method)
   return result;
 }
 
+
+int captureDebugFrames(vm::Thread* thread, vm::debug::WalkerFrame* out, int max)
+{
+  Thread* t = static_cast<Thread*>(thread);
+  int n = 0;
+  for (int frame = t->frame; frame >= 0 and n < max; frame = frameNext(t, frame)) {
+    GcMethod* method = frameMethod(t, frame);
+    if (method == 0 or method->name() == 0)
+      continue;
+    vm::debug::WalkerFrame* slot = out + n;
+    const char* cn = method->class_() and method->class_()->name()
+                         ? reinterpret_cast<const char*>(method->class_()->name()->body().begin())
+                         : "";
+    const char* mn = reinterpret_cast<const char*>(method->name()->body().begin());
+    const char* sp = method->spec()
+                         ? reinterpret_cast<const char*>(method->spec()->body().begin())
+                         : "";
+    ::snprintf(slot->className, sizeof slot->className, "%s", cn);
+    ::snprintf(slot->methodName, sizeof slot->methodName, "%s", mn);
+    ::snprintf(slot->spec, sizeof slot->spec, "%s", sp);
+    slot->index = frame == t->frame ? static_cast<int32_t>(t->ip) : static_cast<int32_t>(frameIp(t, frame));
+    ++n;
+  }
+  return n;
+}
+
 class MyProcessor : public Processor {
  public:
   MyProcessor(System* s, Allocator* allocator, const char* crashDumpDirectory)
@@ -3536,6 +3569,7 @@ class MyProcessor : public Processor {
   virtual void boot(vm::Thread*, BootImage* image, uint8_t* code)
   {
     expect(s, image == 0 and code == 0);
+    vm::debug::registerWalker(captureDebugFrames);
   }
 
   virtual void callWithCurrentContinuation(vm::Thread*, object)
