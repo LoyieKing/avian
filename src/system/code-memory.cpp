@@ -30,24 +30,35 @@ size_t padToAlignment(size_t n)
 
 }  // namespace
 
+// allocate() and free() are lock-free so that callers may use them from
+// any thread and in any locking state; in particular a failed
+// compilation gives its space back while unwinding, after the lock it
+// allocated under has been released.
+
 uint8_t* CodeMemory::allocate(size_t size)
 {
-  size_t end = used_ + padToAlignment(size);
+  const size_t padded = padToAlignment(size);
+  size_t used = __atomic_load_n(&used_, __ATOMIC_RELAXED);
+  size_t end;
 
-  if (end > region_.count or end < used_) {
-    return 0;
-  }
+  do {
+    end = used + padded;
+    if (end > region_.count or end < used) {
+      return 0;
+    }
+  } while (not __atomic_compare_exchange_n(
+      &used_, &used, end, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
 
-  uint8_t* start = region_.begin() + used_;
-  used_ = end;
-  return start;
+  return region_.begin() + used;
 }
 
 void CodeMemory::free(uint8_t* start, size_t size)
 {
-  if (start + padToAlignment(size) == region_.begin() + used_) {
-    used_ = start - region_.begin();
-  }
+  // Reclaim the space only if nothing was allocated after it.
+  size_t end = (start - region_.begin()) + padToAlignment(size);
+  size_t begin = start - region_.begin();
+  __atomic_compare_exchange_n(
+      &used_, &end, begin, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
 }
 
 namespace code_memory {

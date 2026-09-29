@@ -55,11 +55,11 @@ namespace system {
 //     still staged and committed, as everywhere).
 //   * Boot image generation: a plain buffer that is never executed.
 //
-// Threading: allocate() and free() must be serialized by the caller
-// (the VM holds classLock).  commit() on distinct ranges and patch()
-// may run concurrently with each other and with threads executing
-// code.  None of these operations call back into the VM or execute JIT
-// code.
+// Threading: every operation may be called from any thread without
+// external locking.  allocate() and free() are lock-free; commit() on
+// distinct ranges and patch() may run concurrently with each other and
+// with threads executing code.  None of these operations call back into
+// the VM or execute JIT code.
 class CodeMemory {
  public:
   class Writer;
@@ -76,7 +76,7 @@ class CodeMemory {
 
   size_t used()
   {
-    return used_;
+    return __atomic_load_n(&used_, __ATOMIC_RELAXED);
   }
 
   bool contains(const void* p)
@@ -94,9 +94,9 @@ class CodeMemory {
   // at, or null if the region is exhausted.
   uint8_t* allocate(size_t size);
 
-  // Gives back an allocation whose code was never published.  Space is
-  // reclaimed only if it is the most recent allocation; otherwise it is
-  // simply not reused.
+  // Gives back an allocation whose code was never published (nothing
+  // may refer to it).  Space is reclaimed only if it is still the most
+  // recent allocation; otherwise it is simply not reused.
   void free(uint8_t* start, size_t size);
 
   // Where code destined for [address, address + size) may be assembled
