@@ -1,0 +1,206 @@
+/* Copyright (c) 2008-2015, Avian Contributors
+
+   Permission to use, copy, modify, and/or distribute this software
+   for any purpose with or without fee is hereby granted, provided
+   that the above copyright notice and this permission notice appear
+   in all copies.
+
+   There is NO WARRANTY for this software.  See license.txt for
+   details. */
+
+#ifndef AVIAN_COMPILE_CPP_INCLUDE
+#error "include this file from src/compile.cpp"
+#endif
+
+#include "compile/youngObjectStore.h"
+
+#if TARGET_BYTES_PER_WORD == 8
+// takeSideIp and the jsr scan live with InlineNew. A subroutine copy
+// occupies the next length-sized window of logical IPs, so this pass
+// refuses the same methods the bump refuses.
+bool methodAllowsInlineNew(Context* context);
+unsigned takeSideIp(Context* context);
+
+// Slow path of an inlined object putfield. The fast path is the plain
+// store; this call is setMaybeNull, flushed after the walk.
+class YoungObjectStoreSlowPath {
+ public:
+  YoungObjectStoreSlowPath* next;
+  Compiler::State* edge;
+  unsigned slowIp;
+  unsigned contIp;
+  TraceElement* trace;
+  ir::Value* self;
+  ir::Value* value;
+  int offset;
+};
+
+void queueYoungObjectStore(Context* context, YoungObjectStoreSlowPath* path)
+{
+  path->next = 0;
+  if (context->youngStoreSlowPathTail) {
+    context->youngStoreSlowPathTail->next = path;
+  } else {
+    context->youngStoreSlowPaths = path;
+  }
+  context->youngStoreSlowPathTail = path;
+}
+
+// invokespecial is three bytes. The index bytes are free logical IPs,
+// same layout as inlined new_: the store falls through, and the native
+// call lives on a side IP that jumps back.
+bool invokespecialHolesFree(MyThread* t, Context* context, unsigned origin)
+{
+  GcCode* code = context->method->code();
+  if (code == 0 or origin + 3 >= code->length()) {
+    return false;
+  }
+  if (static_cast<unsigned>(static_cast<uint8_t>(code->body()[origin]))
+      != invokespecial) {
+    return false;
+  }
+  if (context->visitTable[origin + 1] or context->visitTable[origin + 2]) {
+    return false;
+  }
+
+  GcExceptionHandlerTable* eht = cast<GcExceptionHandlerTable>(
+      t, code->exceptionHandlerTable());
+  if (eht) {
+    for (unsigned i = 0; i < eht->length(); ++i) {
+      unsigned hip = exceptionHandlerIp(eht->body()[i]);
+      if (hip == origin + 1 or hip == origin + 2) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Thread chunks come from the C allocator, not from gen2 or a fixie, so
+// a pointer inside [heap, heap + 64KB) does not need a remembered-set
+// update. Null, tenured, and fixed objects fail the range test and take
+// setMaybeNull. One condJump: the instruction only has two spare bytes.
+bool YoungObjectStore::tryCompile(MyThread* t,
+                                  Frame* frame,
+                                  unsigned callIp,
+                                  ir::Value* self,
+                                  ir::Value* value,
+                                  int offset)
+{
+  // 64KB chunk. The shift matches ThreadHeapSizeInBytes.
+  enum { ThreadChunkRangeShift = 16 };
+  expect(t,
+         (static_cast<unsigned>(1) << ThreadChunkRangeShift)
+             == ThreadHeapSizeInBytes);
+
+  Context* context = frame->context;
+  if (callIp != frame->ip or frame->subroutine) {
+    return false;
+  }
+  if (not methodAllowsInlineNew(context)) {
+    return false;
+  }
+  if (not invokespecialHolesFree(t, context, callIp)) {
+    return false;
+  }
+
+  Compiler* c = context->compiler;
+  TraceElement* trace = frame->trace(0, 0);
+
+  unsigned fastIp = callIp + 1;
+  unsigned contIp = callIp + 2;
+  unsigned slowIp = takeSideIp(context);
+  ir::Value* slow = c->promiseConstant(c->machineIp(slowIp), ir::Type::iptr());
+
+  ir::Value* heap = c->load(
+      ir::ExtendMode::Signed,
+      c->memory(c->threadRegister(), ir::Type::iptr(), ThreadHeapOffset),
+      ir::Type::iptr());
+  // subR is second minus first.
+  ir::Value* diff
+      = c->binaryOp(lir::Subtract, ir::Type::iptr(), heap, self);
+  ir::Value* high = c->binaryOp(
+      lir::UnsignedShiftRight,
+      ir::Type::iptr(),
+      c->constant(ThreadChunkRangeShift, ir::Type::iptr()),
+      diff);
+  // Bit 63 of (heap - 1) is set when heap is 0. A null heap and a
+  // null object would otherwise both produce a zero difference.
+  ir::Value* heapMinusOne = c->binaryOp(
+      lir::Subtract,
+      ir::Type::iptr(),
+      c->constant(1, ir::Type::iptr()),
+      heap);
+  ir::Value* heapZero = c->binaryOp(lir::UnsignedShiftRight,
+                                    ir::Type::iptr(),
+                                    c->constant(63, ir::Type::iptr()),
+                                    heapMinusOne);
+  ir::Value* outside
+      = c->binaryOp(lir::Or, ir::Type::iptr(), high, heapZero);
+  c->condJump(lir::JumpIfNotEqual,
+              c->constant(0, ir::Type::iptr()),
+              outside,
+              slow);
+  Compiler::State* edge = c->saveState();
+  c->startLogicalIp(fastIp);
+
+  // self and value are stack homes. The range math is only a branch
+  // input; recomputing it here would be a value with no site.
+  c->store(value, c->memory(self, ir::Type::object(), offset));
+
+  c->startLogicalIp(contIp);
+
+  YoungObjectStoreSlowPath* path = new (
+      context->zone.allocate(sizeof(YoungObjectStoreSlowPath)))
+      YoungObjectStoreSlowPath;
+  path->edge = edge;
+  path->slowIp = slowIp;
+  path->contIp = contIp;
+  path->trace = trace;
+  path->self = self;
+  path->value = value;
+  path->offset = offset;
+  queueYoungObjectStore(context, path);
+  return true;
+}
+
+void YoungObjectStore::flush(MyThread* t, Context* context)
+{
+  Compiler* c = context->compiler;
+
+  for (YoungObjectStoreSlowPath* path = context->youngStoreSlowPaths; path;
+       path = path->next) {
+    c->restoreState(path->edge);
+    c->startLogicalIp(path->slowIp);
+
+    c->nativeCall(
+        c->constant(getThunk(t, setMaybeNullThunk), ir::Type::iptr()),
+        0,
+        path->trace,
+        ir::Type::void_(),
+        args(c->threadRegister(),
+             path->self,
+             c->constant(path->offset, ir::Type::i4()),
+             path->value));
+    c->jmp(c->promiseConstant(c->machineIp(path->contIp), ir::Type::iptr()));
+    c->visitLogicalIp(path->contIp);
+  }
+
+  context->youngStoreSlowPaths = 0;
+  context->youngStoreSlowPathTail = 0;
+}
+#else  // not 64-bit target
+bool YoungObjectStore::tryCompile(MyThread* t UNUSED,
+                                  Frame* frame UNUSED,
+                                  unsigned callIp UNUSED,
+                                  ir::Value* self UNUSED,
+                                  ir::Value* value UNUSED,
+                                  int offset UNUSED)
+{
+  return false;
+}
+
+void YoungObjectStore::flush(MyThread* t UNUSED, Context* context UNUSED)
+{
+}
+#endif  // 64-bit target

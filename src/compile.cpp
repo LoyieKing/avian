@@ -9,6 +9,7 @@
    details. */
 
 #include "avian/machine.h"
+#include "compile/rangeCheckElimination.h"
 #include "avian/debug.h"
 #include "avian/util.h"
 #include "avian/alloc-vector.h"
@@ -281,7 +282,8 @@ class MyThread : public Thread {
         traceContext(0),
         stackLimit(0),
         referenceFrame(0),
-        methodLockIsClean(true)
+        methodLockIsClean(true),
+        allocationResult(0)
   {
     arch->acquire();
   }
@@ -309,6 +311,10 @@ class MyThread : public Thread {
   uintptr_t stackLimit;
   List<Reference*>* referenceFrame;
   bool methodLockIsClean;
+  // Join slot for an inlined new_. Both the bump and the makeNew64 slow
+  // path store the object here; the continuation loads it. scratch holds
+  // the vmInvoke native stack pointer for the whole Java call.
+  uintptr_t allocationResult;
 };
 
 void transition(MyThread* t,
@@ -825,6 +831,10 @@ int captureDebugFrames(Thread* thread, debug::WalkerFrame* out, int max)
 
 class Context;
 
+class InlineNewSlowPath;
+
+class YoungObjectStoreSlowPath;
+
 class TraceElement : public avian::codegen::TraceHandler {
  public:
   static const unsigned VirtualCall = 1 << 0;
@@ -1227,6 +1237,14 @@ class Context {
         dirtyRoots(false),
         leaf(true),
         debugBits(0),
+        safeArrayAccess(0),
+        inlineNewSlowPaths(0),
+        inlineNewSlowPathTail(0),
+        inlineNewOk(-1),
+        nextSideIp(0),
+        sideIpsReady(false),
+        youngStoreSlowPaths(0),
+        youngStoreSlowPathTail(0),
         eventLog(t->m->system, t->m->heap, 1024),
         protector(this),
         resource(this),
@@ -1260,6 +1278,14 @@ class Context {
         dirtyRoots(false),
         leaf(true),
         debugBits(0),
+        safeArrayAccess(0),
+        inlineNewSlowPaths(0),
+        inlineNewSlowPathTail(0),
+        inlineNewOk(-1),
+        nextSideIp(0),
+        sideIpsReady(false),
+        youngStoreSlowPaths(0),
+        youngStoreSlowPathTail(0),
         eventLog(t->m->system, t->m->heap, 0),
         protector(this),
         resource(this),
@@ -1331,6 +1357,25 @@ class Context {
   bool dirtyRoots;
   bool leaf;
   uint8_t* debugBits;
+  // Bytecode ip → 1 when that array access's index is proven in range.
+  // Avian cannot deoptimize, so this is set only for accesses that are
+  // in range on every execution.
+  uint8_t* safeArrayAccess;
+  // Inlined new_ slow paths, emitted after the bytecode walk so the
+  // fast-path fall-through keeps the first fork target. Side logical
+  // IPs start at the bytecode length. Methods that contain jsr are not
+  // inlined: a subroutine copy occupies the next length-sized window.
+  // inlineNewOk is -1 until the method is scanned, then 0 or 1.
+  InlineNewSlowPath* inlineNewSlowPaths;
+  InlineNewSlowPath* inlineNewSlowPathTail;
+  int inlineNewOk;
+  unsigned nextSideIp;
+  bool sideIpsReady;
+  // Inlined object-store slow paths. Same flush point as inline new:
+  // restoring the edge during the walk would attach the rest of the
+  // method to the native call.
+  YoungObjectStoreSlowPath* youngStoreSlowPaths;
+  YoungObjectStoreSlowPath* youngStoreSlowPathTail;
   Vector eventLog;
   MyProtector protector;
   MyResource resource;
@@ -3626,6 +3671,22 @@ unsigned frameSizeInBytes(MyThread* t, unsigned footprint);
 
 unsigned thunkFrameSize(MyThread* t);
 
+// Thread::m is the second pointer field. Machine::exclusive is the tenth.
+// makeThread aborts if this C++ layout disagrees.
+static const unsigned ThreadMachineOffset
+    = static_cast<unsigned>(sizeof(void*));
+static const unsigned MachineExclusiveOffset
+    = static_cast<unsigned>(9 * sizeof(void*));
+
+// LP64 layout after Thread::exception (TARGET_THREAD_EXCEPTION is 80).
+// makeThread aborts if the C++ layout disagrees. 32-bit builds leave
+// new_ on the native path; these constants are not that layout.
+#if TARGET_BYTES_PER_WORD == 8
+static const unsigned ThreadHeapIndexOffset = 88;
+static const unsigned ThreadHeapOffset = 160;
+static const unsigned AllocationResultOffset = 2480;
+#endif
+
 unsigned simpleFrameMapTableSize(MyThread* t, GcMethod* method, GcIntArray* map)
 {
   int size = frameMapSizeInBits(t, method);
@@ -3693,6 +3754,53 @@ void compileSafePoint(MyThread* t, Compiler* c, Frame* frame)
       ir::Type::void_(),
       args(c->threadRegister()));
 }
+
+// Backward unconditional goto. The fast path is a load of Machine::exclusive
+// and a not-taken branch, which is the usual case. The call remains the
+// slow path so its GC map is unchanged. Conditional back-edges are left on
+// the call: their safepoint is emitted before the condition.
+void compileBackwardGotoSafePoint(MyThread* t,
+                                 Compiler* c,
+                                 Frame* frame,
+                                 unsigned targetIp)
+{
+  if (debug::enabled()) {
+    compileSafePoint(t, c, frame);
+    return;
+  }
+
+  ir::Value* machine = c->load(
+      ir::ExtendMode::Signed,
+      c->memory(c->threadRegister(), ir::Type::iptr(), ThreadMachineOffset),
+      ir::Type::iptr());
+  ir::Value* exclusive = c->load(
+      ir::ExtendMode::Signed,
+      c->memory(machine, ir::Type::iptr(), MachineExclusiveOffset),
+      ir::Type::iptr());
+
+  // Equal means exclusive is null: skip the call and return to the loop.
+  // Linking this branch as a predecessor keeps live locals in the header's
+  // registers. frame->visitLogicalIp would also append a root-map event;
+  // the walker's visit of the target already records that edge.
+  c->condJump(lir::JumpIfEqual,
+              c->constant(0, ir::Type::iptr()),
+              exclusive,
+              frame->machineIpValue(targetIp));
+  Compiler::State* state = c->saveState();
+  c->visitLogicalIp(frame->duplicatedIp(targetIp));
+  c->restoreState(state);
+  compileSafePoint(t, c, frame);
+}
+
+// Inlined allocation, the trivial constructor, and the young-object
+// store. Included here, inside namespace local: Frame and Context are
+// visible in this translation unit. See src/compile/inlineNew.h.
+#define AVIAN_COMPILE_CPP_INCLUDE
+#include "compile/inlineNew.cpp"
+#include "compile/youngObjectStore.cpp"
+#include "compile/trivialConstructor.cpp"
+#undef AVIAN_COMPILE_CPP_INCLUDE
+
 
 void compileDirectInvoke(MyThread* t,
                          Frame* frame,
@@ -4544,6 +4652,14 @@ bool isLambda(Thread* t,
                           bootstrap->spec()->body().begin()) == 0));
 }
 
+bool arrayAccessProvenInBounds(Context* context, unsigned ip)
+{
+  uint8_t* safe = context->safeArrayAccess;
+  GcCode* code = context->method ? context->method->code() : 0;
+  return safe and code and ip < code->length() and safe[ip];
+}
+
+
 void compile(MyThread* t,
              Frame* initialFrame,
              unsigned initialIp,
@@ -4653,7 +4769,7 @@ loop:
         frame->trace(0, 0);
       }
 
-      if (CheckArrayBounds) {
+      if (CheckArrayBounds and not arrayAccessProvenInBounds(context, ip - 1)) {
         c->checkBounds(array, TargetArrayLength, index, aioobThunk(t));
       }
 
@@ -4754,7 +4870,7 @@ loop:
         frame->trace(0, 0);
       }
 
-      if (CheckArrayBounds) {
+      if (CheckArrayBounds and not arrayAccessProvenInBounds(context, ip - 1)) {
         c->checkBounds(array, TargetArrayLength, index, aioobThunk(t));
       }
 
@@ -5329,7 +5445,7 @@ loop:
       assertT(t, newIp < code->length());
 
       if (newIp <= ip) {
-        compileSafePoint(t, c, frame);
+        compileBackwardGotoSafePoint(t, c, frame, newIp);
       }
 
       c->jmp(frame->machineIpValue(newIp));
@@ -5342,7 +5458,7 @@ loop:
       assertT(t, newIp < code->length());
 
       if (newIp <= ip) {
-        compileSafePoint(t, c, frame);
+        compileBackwardGotoSafePoint(t, c, frame, newIp);
       }
 
       c->jmp(frame->machineIpValue(newIp));
@@ -5914,6 +6030,13 @@ loop:
           compileDirectAbstractInvoke(
               t, frame, getMethodAddressThunk, target, tailCall);
         } else {
+          // Keep target live if the inliner resolves fields and then
+          // falls back to the call.
+          PROTECT(t, target);
+          if (not tailCall
+              and TrivialConstructor::tryCompile(t, frame, target, ip - 3)) {
+            break;
+          }
           compileDirectInvoke(t, frame, target, tailCall);
         }
       } else {
@@ -6504,6 +6627,10 @@ loop:
 
       GcClass* class_
           = resolveClassInPool(t, context->method, index - 1, false);
+
+      if (class_ and InlineNew::tryCompile(t, context, frame, class_)) {
+        break;
+      }
 
       object argument;
       Thunk thunk;
@@ -7882,6 +8009,8 @@ void compile(MyThread* t, Context* context)
 {
   avian::codegen::Compiler* c = context->compiler;
 
+  InlineNew::checkClassVmFlagsOffset(t, context);
+
   if (false) {
     fprintf(stderr,
             "compiling %s.%s%s\n",
@@ -7945,6 +8074,9 @@ void compile(MyThread* t, Context* context)
   handleEntrance(t, &frame);
 
   Compiler::State* state = c->saveState();
+
+  context->safeArrayAccess = RangeCheckElimination::eliminate(
+      t, &context->zone, context->method);
 
   compile(t, &frame, 0);
 
@@ -8016,6 +8148,12 @@ void compile(MyThread* t, Context* context)
     context->dirtyRoots = false;
     calculateFrameMaps(t, context, 0, 0, 0);
   }
+
+  // After every handler has been compiled. Restoring an allocation
+  // edge earlier would put the rest of the method on the slow target.
+  InlineNew::flush(t, context);
+  YoungObjectStore::flush(t, context);
+
   free(stackMap);
 }
 #endif // not AVIAN_AOT_ONLY
@@ -9460,7 +9598,38 @@ class MyProcessor : public Processor {
           + checkConstant(t,
                           TARGET_THREAD_STACKLIMIT,
                           &MyThread::stackLimit,
-                          "TARGET_THREAD_STACKLIMIT");
+                          "TARGET_THREAD_STACKLIMIT")
+          + checkConstant(t, ThreadMachineOffset, &Thread::m, "Thread::m");
+
+#if TARGET_BYTES_PER_WORD == 8
+    mismatches
+        += checkConstant(t,
+                         ThreadHeapIndexOffset,
+                         &Thread::heapIndex,
+                         "Thread::heapIndex")
+           + checkConstant(
+                 t, ThreadHeapOffset, &Thread::heap, "Thread::heap")
+           + checkConstant(t,
+                           AllocationResultOffset,
+                           &MyThread::allocationResult,
+                           "MyThread::allocationResult");
+#endif
+
+    {
+      Machine* machine = t->m;
+      Thread* Machine::*exclusiveField = &Machine::exclusive;
+      size_t exclusiveOffset
+          = reinterpret_cast<uint8_t*>(&(machine->*exclusiveField))
+            - reinterpret_cast<uint8_t*>(machine);
+      if (exclusiveOffset != MachineExclusiveOffset) {
+        fprintf(stderr,
+                "constant mismatch (Machine::exclusive): \n\tconstant says: "
+                "%d\n\tc++ compiler says: %d\n",
+                static_cast<unsigned>(MachineExclusiveOffset),
+                static_cast<unsigned>(exclusiveOffset));
+        ++mismatches;
+      }
+    }
 
     if (mismatches > 0) {
       fprintf(stderr, "%d constant mismatches\n", mismatches);

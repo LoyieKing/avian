@@ -167,6 +167,39 @@ is compiled with a checkpoint on every bytecode, so compile-mode JDWP
 does not run there yet. CI itself is 64-bit only.
 
 
+JIT
+---
+
+`process=compile` now folds four things the old JIT left as calls or
+checks. The three allocation fast paths are 64-bit only. The passes
+live under `src/compile/`.
+Range-check elimination is its own translation unit. The thread-chunk
+`new`, the trivial `<init>` inliner, and the young-object reference
+store are included from `src/compile.cpp`, because `Frame` and
+`Context` are local to that file. A backward unconditional `goto`
+reads `Machine::exclusive` and calls the safepoint only when a
+collection is waiting.
+
+This does not add SIMD, a general inliner, escape analysis, a new
+allocator, a larger thread chunk, or an inlined remembered-set walk.
+32-bit builds keep the calls.
+
+`docs/jit.md` describes the passes and the layout constraints.
+`docs/benchmark.md` and `docs/MicroBench.java` are the OpenJDK 8
+comparison. On an Apple M4 Pro, Zulu 8 1.8.0_345, `-Xmx256m -Xss1m`,
+`mode=fast`, the same bytecode (median of five trials; Avian ran
+twice):
+
+    benchmark   Avian          OpenJDK 8   ratio
+    loop        322–323 ms     178 ms      1.8×
+    fib(38)     128–137 ms     69 ms       1.9–2.0×
+    array       335–336 ms     104 ms      3.2×
+    alloc       99 ms          55 ms       1.8×
+
+Every trial checksum matched. Before these passes, on the same
+machine, array was about 9.5× and alloc about 9.4×.
+
+
 Supported Platforms
 -------------------
 
