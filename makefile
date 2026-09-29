@@ -1803,6 +1803,7 @@ $(build)/extra-dir/multi-classpath-test.txt:
 	echo "$@" > $@
 
 $(build)/test/multi-classpath-test.txt:
+	mkdir -p $(dir $@)
 	echo "$@" > $@
 
 $(build)/test.sh: $(test)/test.sh
