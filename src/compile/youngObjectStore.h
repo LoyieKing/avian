@@ -16,13 +16,15 @@
 #define AVIAN_COMPILE_YOUNG_OBJECT_STORE_H
 
 // Plain store of one reference when the object is inside the current
-// thread chunk. The chunk is not a slice of gen2 and the object is not
-// a fixie, so needsMark is false.
+// thread TLAB. The TLAB is a slice of the reserved eden, not of gen2,
+// and the object is not a fixie, so needsMark is false.
 //
 // Null, tenured, and fixed objects fail the range test. The slow path
 // is store plus markField when the receiver is known non-null, and
-// setMaybeNull otherwise. The instruction must be three bytes: the two
-// operand bytes are the fast path and the join. 64-bit only.
+// setMaybeNull otherwise. That receiver may be null, so the slow path
+// does not store through it before the call. The instruction must be
+// three bytes: the two operand bytes are the fast path and the join.
+// 64-bit only.
 //
 // Included from src/compile.cpp for the same reason as inlineNew.h.
 

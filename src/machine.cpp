@@ -275,11 +275,222 @@ void killZombies(Thread* t, Thread* o)
   }
 }
 
+unsigned edenUsedBytes(Machine* m)
+{
+  if (m->edenStart == 0 or m->edenTop < m->edenStart) {
+    return 0;
+  }
+  return static_cast<unsigned>(m->edenTop - m->edenStart) * BytesPerWord;
+}
+
+unsigned tlabAvailableWords(Machine* m)
+{
+  if (m->edenStart == 0 or m->edenEnd < m->edenTop) {
+    return 0;
+  }
+  return static_cast<unsigned>(m->edenEnd - m->edenTop);
+}
+
+// Hands out a slice of the reserved eden. The slice is not cleared:
+// allocateSmall zeros one object, and an inlined new zeros only the
+// words its constructor does not store. Fails when the bump has reached
+// the end; the caller collects and the bump rewinds.
+bool tlabTakeSlice(Machine* m, unsigned chunkWords, uintptr_t** payload)
+{
+  if (chunkWords == 0 or tlabAvailableWords(m) < chunkWords) {
+    return false;
+  }
+
+  uintptr_t* start = m->edenTop;
+  m->edenTop = start + chunkWords;
+  *payload = start;
+  return true;
+}
+
+void tlabSeed(Thread* t)
+{
+  Machine* m = t->m;
+  unsigned edenWords = m->edenCapacity / BytesPerWord;
+  t->desiredWords = TlabSize::initialWords(
+      edenWords, m->allocatingThreads.average, m->tlabMinWords, m->tlabMaxWords);
+  t->refillWasteLimit = TlabSize::wasteLimit(t->desiredWords);
+  t->allocationFraction.sample(
+      TlabSize::seedFraction(t->desiredWords, edenWords));
+}
+
+void tlabRetireAccounting(Thread* t)
+{
+  if (t->heap == 0) {
+    return;
+  }
+  t->heapOffset += tlabCurrentWords(t);
+}
+
+bool tlabInstall(Thread* t, unsigned chunkWords)
+{
+  uintptr_t* payload = 0;
+  if (not tlabTakeSlice(t->m, chunkWords, &payload)) {
+    return false;
+  }
+
+  tlabRetireAccounting(t);
+
+  t->heap = payload;
+  t->heapTop = payload;
+  t->heapEnd = payload + chunkWords;
+  ++t->numberOfRefills;
+  t->refillWasteLimit = TlabSize::wasteLimit(t->desiredWords);
+  return true;
+}
+
+bool tlabAllocateOutside(Thread* t, unsigned words, object* result)
+{
+  uintptr_t* payload = 0;
+  if (not tlabTakeSlice(t->m, words, &payload)) {
+    return false;
+  }
+
+  unsigned bumped = t->refillWasteLimit + TlabWasteIncrementWords;
+  if (bumped > t->refillWasteLimit) {
+    t->refillWasteLimit = bumped;
+  }
+  t->slowWords += words;
+
+  memset(payload, 0, words * BytesPerWord);
+  *result = reinterpret_cast<object>(payload);
+  return true;
+}
+
+// HotSpot mem_allocate_inside_tlab_slow: if the tail is larger than the
+// waste limit, keep the TLAB and place this object beside it. Otherwise
+// retire the tail and carve a chunk of the desired size.
+bool tlabSatisfyMiss(Thread* t, unsigned words, object* result)
+{
+  unsigned freeWords = 0;
+  if (t->heapEnd > t->heapTop) {
+    freeWords = static_cast<unsigned>(t->heapEnd - t->heapTop);
+  }
+
+  if (t->heap != 0 and freeWords > t->refillWasteLimit) {
+    return tlabAllocateOutside(t, words, result);
+  }
+
+  unsigned chunk = TlabSize::computeChunk(t->desiredWords,
+                                          words,
+                                          tlabAvailableWords(t->m),
+                                          t->m->tlabMinWords,
+                                          t->m->tlabMaxWords);
+  if (chunk != 0 and tlabInstall(t, chunk)) {
+    *result = allocateSmall(t, words * BytesPerWord);
+    return true;
+  }
+
+  // Not enough eden left for a whole TLAB. A smaller object can still
+  // take a slice of its own size.
+  return tlabAllocateOutside(t, words, result);
+}
+
+void tlabAccumulate(Thread* t, unsigned edenUsed)
+{
+  unsigned edenCap = t->m->edenCapacity;
+  if (t->numberOfRefills > 0 and edenUsed > 0 and edenUsed > edenCap / 2) {
+    unsigned threadWords
+        = t->heapOffset + tlabCurrentWords(t) + t->slowWords;
+    float fraction
+        = (static_cast<float>(threadWords) * static_cast<float>(BytesPerWord))
+          / static_cast<float>(edenUsed);
+    if (fraction > 1.f) {
+      fraction = 1.f;
+    }
+    t->allocationFraction.sample(fraction);
+  }
+
+  t->numberOfRefills = 0;
+  t->heapOffset = 0;
+  t->slowWords = 0;
+}
+
+void tlabResize(Thread* t)
+{
+  unsigned edenWords = t->m->edenCapacity / BytesPerWord;
+  t->desiredWords = TlabSize::resizedWords(t->allocationFraction.average,
+                                           edenWords,
+                                           t->m->tlabMinWords,
+                                           t->m->tlabMaxWords);
+  t->refillWasteLimit = TlabSize::wasteLimit(t->desiredWords);
+}
+
+unsigned finishTlabs(Thread* t, unsigned edenUsed)
+{
+  unsigned allocating = 0;
+  if (t->numberOfRefills > 0 or t->slowWords > 0) {
+    allocating = 1;
+  }
+
+  tlabAccumulate(t, edenUsed);
+  tlabResize(t);
+
+  t->heap = 0;
+  t->heapTop = 0;
+  t->heapEnd = 0;
+
+  if (t->getFlags() & Thread::UseBackupHeapFlag) {
+    memset(t->backupHeap, 0, ThreadBackupHeapSizeInBytes);
+    t->clearFlag(Thread::UseBackupHeapFlag);
+    t->backupHeapIndex = 0;
+  }
+
+  for (Thread* c = t->child; c; c = c->peer) {
+    allocating += finishTlabs(c, edenUsed);
+  }
+  return allocating;
+}
+
+void resetEden(Machine* m)
+{
+  m->edenTop = m->edenStart;
+}
+
+void freeEden(Machine* m)
+{
+  if (m->edenStart == 0) {
+    return;
+  }
+  m->heap->free(m->edenStart, m->edenCapacity);
+  m->edenStart = 0;
+  m->edenTop = 0;
+  m->edenEnd = 0;
+}
+
+void configureTlabs(Machine* m)
+{
+  unsigned bytes = TlabSize::edenCapacity(m->heap->limit());
+  unsigned extra = bytes % BytesPerWord;
+  if (extra) {
+    bytes -= extra;
+  }
+  if (bytes < BytesPerWord) {
+    bytes = BytesPerWord;
+  }
+
+  m->edenCapacity = bytes;
+  m->tlabMinWords = TlabSize::minWords(bytes);
+  m->tlabMaxWords = TlabSize::maxWords(bytes, m->tlabMinWords);
+
+  void* mem = m->heap->allocate(bytes);
+  m->edenStart = static_cast<uintptr_t*>(mem);
+  m->edenTop = m->edenStart;
+  m->edenEnd = m->edenStart + (bytes / BytesPerWord);
+
+  m->allocatingThreads.sample(1.f);
+}
+
 unsigned footprint(Thread* t)
 {
   expect(t, t->criticalLevel == 0);
 
-  unsigned n = t->heapOffset + t->heapIndex + t->backupHeapIndex;
+  unsigned n = t->heapOffset + tlabCurrentWords(t) + t->slowWords
+               + t->backupHeapIndex;
 
   for (Thread* c = t->child; c; c = c->peer) {
     n += footprint(c);
@@ -667,40 +878,14 @@ void postVisit(Thread* t, Heap::Visitor* v)
 
 void postCollect(Thread* t)
 {
-#ifdef VM_STRESS
-  t->m->heap->free(t->defaultHeap, ThreadHeapSizeInBytes);
-  t->defaultHeap
-      = static_cast<uintptr_t*>(t->m->heap->allocate(ThreadHeapSizeInBytes));
-  memset(t->defaultHeap, 0, ThreadHeapSizeInBytes);
-#endif
-
-  if (t->heap == t->defaultHeap) {
-    memset(t->defaultHeap, 0, t->heapIndex * BytesPerWord);
-  } else {
-    memset(t->defaultHeap, 0, ThreadHeapSizeInBytes);
-    t->heap = t->defaultHeap;
+  // Survivors have been copied out. Sample each thread's share of the
+  // bytes handed out, resize, then rewind the bump. The buffer stays.
+  unsigned edenUsed = edenUsedBytes(t->m);
+  unsigned allocating = finishTlabs(t, edenUsed);
+  if (edenUsed > 0) {
+    t->m->allocatingThreads.sample(static_cast<float>(allocating));
   }
-
-  t->heapOffset = 0;
-
-  if (t->m->heap->limitExceeded()) {
-    // if we're out of memory, pretend the thread-local heap is
-    // already full so we don't make things worse:
-    t->heapIndex = ThreadHeapSizeInWords;
-  } else {
-    t->heapIndex = 0;
-  }
-
-  if (t->getFlags() & Thread::UseBackupHeapFlag) {
-    memset(t->backupHeap, 0, ThreadBackupHeapSizeInBytes);
-
-    t->clearFlag(Thread::UseBackupHeapFlag);
-    t->backupHeapIndex = 0;
-  }
-
-  for (Thread* c = t->child; c; c = c->peer) {
-    postCollect(c);
-  }
+  resetEden(t->m);
 }
 
 uint64_t invoke(Thread* t, uintptr_t* arguments)
@@ -3579,20 +3764,12 @@ void doCollect(Thread* t, Heap::CollectionType type, int pendingAllocation)
   Machine* m = t->m;
 
   m->unsafe = true;
-  m->heap->collect(
-      type,
-      footprint(m->rootThread),
-      pendingAllocation - (t->m->heapPoolIndex * ThreadHeapSizeInWords));
+  m->heap->collect(type, footprint(m->rootThread), pendingAllocation);
   m->unsafe = false;
 
   postCollect(m->rootThread);
 
   killZombies(t, m->rootThread);
-
-  for (unsigned i = 0; i < m->heapPoolIndex; ++i) {
-    m->heap->free(m->heapPool[i], ThreadHeapSizeInBytes);
-  }
-  m->heapPoolIndex = 0;
 
   if (m->heap->limitExceeded()) {
     // if we're out of memory, disallow further allocations of fixed
@@ -3792,8 +3969,16 @@ Machine::Machine(System* system,
       triedBuiltinOnLoad(false),
       dumpedHeapOnOOM(false),
       alive(true),
-      heapPoolIndex(0)
+      edenStart(0),
+      edenTop(0),
+      edenEnd(0),
+      edenCapacity(0),
+      tlabMinWords(0),
+      tlabMaxWords(0),
+      allocatingThreads()
 {
+  configureTlabs(this);
+
   heap->setClient(heapClient);
 
   populateJNITables(&javaVMVTable, &jniEnvVTable);
@@ -3863,9 +4048,7 @@ void Machine::dispose()
     heap->free(tmp, sizeof(*tmp));
   }
 
-  for (unsigned i = 0; i < heapPoolIndex; ++i) {
-    heap->free(heapPool[i], ThreadHeapSizeInBytes);
-  }
+  freeEden(this);
 
   if (bootimage) {
     heap->free(bootimage, bootimageSize);
@@ -3896,16 +4079,20 @@ Thread::Thread(Machine* m, GcThread* javaThread, Thread* parent)
       lock(0),
       javaThread(javaThread),
       exception(0),
-      heapIndex(0),
       heapOffset(0),
+      refillWasteLimit(0),
       protector(0),
       classInitStack(0),
       libraryLoadStack(0),
       runnable(this),
-      defaultHeap(
-          static_cast<uintptr_t*>(m->heap->allocate(ThreadHeapSizeInBytes))),
-      heap(defaultHeap),
+      heapTop(0),
+      heap(0),
+      heapEnd(0),
       backupHeapIndex(0),
+      desiredWords(0),
+      slowWords(0),
+      numberOfRefills(0),
+      allocationFraction(),
       debugSuspend(0),
       debugStepping(0),
       debugStepSize(0),
@@ -3920,11 +4107,11 @@ Thread::Thread(Machine* m, GcThread* javaThread, Thread* parent)
       debugSnap(0),
       flags(ActiveFlag)
 {
+  tlabSeed(this);
 }
 
 void Thread::init()
 {
-  memset(defaultHeap, 0, ThreadHeapSizeInBytes);
   memset(backupHeap, 0, ThreadBackupHeapSizeInBytes);
 
   if (parent == 0) {
@@ -4044,7 +4231,11 @@ void Thread::dispose()
 
   --m->threadCount;
 
-  m->heap->free(defaultHeap, ThreadHeapSizeInBytes);
+  // The slice stays in the eden until the next collection copies out
+  // anything this thread published and rewinds the bump.
+  heap = 0;
+  heapTop = 0;
+  heapEnd = 0;
 
   m->processor->dispose(this);
 }
@@ -4311,13 +4502,12 @@ void enter(Thread* t, Thread::State s)
 
 object allocate2(Thread* t, unsigned sizeInBytes, bool objectMask)
 {
-  return allocate3(
-      t,
-      ceilingDivide(sizeInBytes, BytesPerWord) > ThreadHeapSizeInWords
-          ? Machine::FixedAllocation
-          : Machine::MovableAllocation,
-      sizeInBytes,
-      objectMask);
+  unsigned words = ceilingDivide(sizeInBytes, BytesPerWord);
+  return allocate3(t,
+                   words > t->m->tlabMaxWords ? Machine::FixedAllocation
+                                              : Machine::MovableAllocation,
+                   sizeInBytes,
+                   objectMask);
 }
 
 object allocate3(Thread* t,
@@ -4337,9 +4527,7 @@ object allocate3(Thread* t,
     fieldAtOffset<object>(o, 0) = 0;
     return o;
   } else if (UNLIKELY(t->getFlags() & Thread::TracingFlag)) {
-    expect(t,
-           t->heapIndex + ceilingDivide(sizeInBytes, BytesPerWord)
-           <= ThreadHeapSizeInWords);
+    expect(t, tlabHasRoom(t, ceilingDivide(sizeInBytes, BytesPerWord)));
     return allocateSmall(t, sizeInBytes);
   }
 
@@ -4355,51 +4543,46 @@ object allocate3(Thread* t,
     }
   }
 
+  unsigned collects = 0;
+  unsigned words = ceilingDivide(sizeInBytes, BytesPerWord);
+
   do {
+    bool needCollect = false;
+
     switch (type) {
     case Machine::MovableAllocation:
-      if (t->heapIndex + ceilingDivide(sizeInBytes, BytesPerWord)
-          > ThreadHeapSizeInWords) {
-        t->heap = 0;
-        if ((not t->m->heap->limitExceeded())
-            and t->m->heapPoolIndex < ThreadHeapPoolSize) {
-          t->heap = static_cast<uintptr_t*>(
-              t->m->heap->tryAllocate(ThreadHeapSizeInBytes));
-
-          if (t->heap) {
-            memset(t->heap, 0, ThreadHeapSizeInBytes);
-
-            t->m->heapPool[t->m->heapPoolIndex++] = t->heap;
-            t->heapOffset += t->heapIndex;
-            t->heapIndex = 0;
-          }
+      if (not tlabHasRoom(t, words)) {
+        object satisfied = 0;
+        if (tlabSatisfyMiss(t, words, &satisfied)) {
+          return satisfied;
         }
+        needCollect = true;
       }
       break;
 
     case Machine::FixedAllocation:
       if (t->m->fixedFootprint + sizeInBytes > FixedFootprintThresholdInBytes) {
-        t->heap = 0;
+        needCollect = true;
       }
       break;
-
     }
 
-    int pendingAllocation = t->m->heap->fixedFootprint(
-        ceilingDivide(sizeInBytes, BytesPerWord), objectMask);
+    int pendingAllocation = t->m->heap->fixedFootprint(words, objectMask);
 
-    if (t->heap == 0 or t->m->heap->limitExceeded(pendingAllocation)) {
+    if (needCollect or t->m->heap->limitExceeded(pendingAllocation)) {
+      if (collects >= 2) {
+        throw_(t, roots(t)->outOfMemoryError());
+      }
       //     fprintf(stderr, "gc");
       //     vmPrintTrace(t);
       collect(t, Heap::MinorCollection, pendingAllocation);
+      ++collects;
     }
 
     if (t->m->heap->limitExceeded(pendingAllocation)) {
       throw_(t, roots(t)->outOfMemoryError());
     }
-  } while (type == Machine::MovableAllocation
-           and t->heapIndex + ceilingDivide(sizeInBytes, BytesPerWord)
-               > ThreadHeapSizeInWords);
+  } while (type == Machine::MovableAllocation and not tlabHasRoom(t, words));
 
   switch (type) {
   case Machine::MovableAllocation: {
@@ -4429,16 +4612,13 @@ void collect(Thread* t, Heap::CollectionType type, int pendingAllocation)
 {
   ENTER(t, Thread::ExclusiveState);
 
-  unsigned pending = pendingAllocation
-                     - (t->m->heapPoolIndex * ThreadHeapSizeInWords);
-
-  if (t->m->heap->limitExceeded(pending)) {
+  if (t->m->heap->limitExceeded(pendingAllocation)) {
     type = Heap::MajorCollection;
   }
 
   doCollect(t, type, pendingAllocation);
 
-  if (t->m->heap->limitExceeded(pending)) {
+  if (t->m->heap->limitExceeded(pendingAllocation)) {
     // try once more, giving the heap a chance to squeeze everything
     // into the smallest possible space:
     doCollect(t, Heap::MajorCollection, pendingAllocation);

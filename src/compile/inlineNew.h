@@ -15,15 +15,14 @@
 #ifndef AVIAN_COMPILE_INLINE_NEW_H
 #define AVIAN_COMPILE_INLINE_NEW_H
 
-// Inlined `new` of an ordinary object into the calling thread's 64KB
-// chunk.
+// Inlined `new` of an ordinary object into the calling thread's TLAB.
 //
 // Same entry shape as HotSpot C1's GraphBuilder allocation and as
 // RangeCheckElimination: the compiler calls one static method, and the
 // .cpp owns the bump and the slow path. C1 can deoptimize out of a
 // speculative fast path. Avian cannot, so the bump is taken only when
 // the class is already prepared, has no finalizer and is not a weak
-// reference, and the chunk has room. The slow path is the existing
+// reference, and the current TLAB has room. The slow path is the existing
 // makeNew64 call.
 //
 // Frame and Context are local to src/compile.cpp, so this header is
