@@ -1001,6 +1001,19 @@ extern "C" JNIEXPORT jobjectArray JNICALL
     add(e, array, index++, "user.region=%s", locale.getRegion());
   }
 
+  // Gson and other libraries call System.getProperty("java.version") during
+  // <clinit> and NPE if it is missing. This VM's classpath is the Java 8 subset.
+  e->SetObjectArrayElement(
+      array, index++, e->NewStringUTF("java.version=1.8.0"));
+  e->SetObjectArrayElement(
+      array, index++, e->NewStringUTF("java.specification.version=1.8"));
+  e->SetObjectArrayElement(
+      array, index++, e->NewStringUTF("java.vendor=Avian"));
+  e->SetObjectArrayElement(
+      array, index++, e->NewStringUTF("java.vm.name=Avian"));
+  e->SetObjectArrayElement(
+      array, index++, e->NewStringUTF("file.encoding=UTF-8"));
+
   return array;
 }
 

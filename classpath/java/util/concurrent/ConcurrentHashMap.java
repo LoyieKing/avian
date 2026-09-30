@@ -435,4 +435,7 @@ public class ConcurrentHashMap<K,V>
       }
     }
   }
+
+  public static class KeySetView<K, V> {
+  }
 }

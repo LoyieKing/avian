@@ -243,6 +243,8 @@ enum Constant {
   CONSTANT_Long = 5,
   CONSTANT_MethodHandle = 15,
   CONSTANT_MethodType = 16,
+  CONSTANT_Module = 19,
+  CONSTANT_Package = 20,
   CONSTANT_Methodref = 10,
   CONSTANT_NameAndType = 12,
   CONSTANT_String = 8,

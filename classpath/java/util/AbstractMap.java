@@ -10,4 +10,26 @@
 
 package java.util;
 
-public abstract class AbstractMap<K,V> extends Object implements Map<K,V> { }
+public abstract class AbstractMap<K,V> extends Object implements Map<K,V> {
+  public static class SimpleImmutableEntry<K, V> implements Map.Entry<K, V> {
+    private final K key;
+    private final V value;
+
+    public SimpleImmutableEntry(K key, V value) {
+      this.key = key;
+      this.value = value;
+    }
+
+    public K getKey() {
+      return key;
+    }
+
+    public V getValue() {
+      return value;
+    }
+
+    public V setValue(V value) {
+      throw new UnsupportedOperationException();
+    }
+  }
+}

@@ -1226,6 +1226,8 @@ unsigned parsePoolEntry(Thread* t,
     return 1;
 
   case CONSTANT_MethodType:
+  case CONSTANT_Module:
+  case CONSTANT_Package:
     if (singletonObject(t, pool, i) == 0) {
       unsigned ni = s.read2() - 1;
 
@@ -1361,6 +1363,8 @@ GcSingleton* parsePool(Thread* t, Stream& s, GcList* invocations)
         break;
 
       case CONSTANT_MethodType:
+      case CONSTANT_Module:
+      case CONSTANT_Package:
         singletonMarkObject(t, pool, i);
         s.skip(2);
         break;
@@ -6319,8 +6323,9 @@ GcJclass* getDeclaringClass(Thread* t, GcClass* c)
 // static data in the bootstrap method table, which in turn points to
 // a bootstrap method and stores additional data to be passed to
 // it. `resolveDynamic` will then call this bootstrap method after
-// resolving the arguments as required. The called method is assumed
-// to be a lambda `metafactory` or `altMetafactory`.
+// resolving the arguments as required. The called method is
+// LambdaMetafactory.metafactory, altMetafactory, or
+// StringConcatFactory.makeConcatWithConstants.
 //
 // Note that capture/bridging etc happens within the bootstrap method,
 // this is just the code that dispatches to it.
@@ -6396,8 +6401,23 @@ GcCallSite* resolveDynamic(Thread* t, GcInvocation* invocation)
   GcArray* argArray = array;
   PROTECT(t, argArray);
 
+  // Java 9 string concatenation. The recipe is a static String argument and
+  // the trailing Object[] holds the remaining constants, which may be empty.
+  const char* concatSpec
+      = "(Ljava/lang/invoke/MethodHandles$Lookup;"
+        "Ljava/lang/String;"
+        "Ljava/lang/invoke/MethodType;"
+        "Ljava/lang/String;"
+        "[Ljava/lang/Object;)"
+        "Ljava/lang/invoke/CallSite;";
+  bool stringConcat
+      = ::strcmp(reinterpret_cast<char*>(bootstrap->spec()->body().begin()),
+                 concatSpec) == 0;
+
   // Check if the bootstrap method's signature matches that of an altMetafactory
-  if (::strcmp(reinterpret_cast<char*>(bootstrap->spec()->body().begin()),
+  if (stringConcat) {
+    spec = concatSpec;
+  } else if (::strcmp(reinterpret_cast<char*>(bootstrap->spec()->body().begin()),
                "(Ljava/lang/invoke/MethodHandles$Lookup;"
                "Ljava/lang/String;"
                "Ljava/lang/invoke/MethodType;"
@@ -6429,10 +6449,32 @@ GcCallSite* resolveDynamic(Thread* t, GcInvocation* invocation)
     abort(t);
   }
 
+  if (stringConcat) {
+    expect(t, bootstrapArray->length() >= 2);
+    array->setBodyElement(
+        t,
+        3,
+        singletonObject(t, invocation->pool(), bootstrapArray->body()[1]));
+
+    unsigned nconst = bootstrapArray->length() - 2;
+    GcArray* consts = makeArray(t, nconst);
+    PROTECT(t, consts);
+    for (unsigned k = 0; k < nconst; ++k) {
+      unsigned pi = bootstrapArray->body()[2 + k];
+      if (not singletonIsObject(t, invocation->pool(), pi)) {
+        fprintf(stderr, "todo: non-object string concat constant\n");
+        abort(t);
+      }
+      consts->setBodyElement(
+          t, k, singletonObject(t, invocation->pool(), pi));
+    }
+    array->setBodyElement(t, 4, consts);
+  }
+
   MethodSpecIterator it(t, spec);
 
   // Skip over the already handled 3 arguments.
-  for (unsigned i = 0; i < argument; ++i)
+  for (unsigned i = 0; i < argument && not stringConcat; ++i)
     it.next();
 
   // If we're calling altMetafactory then we reset the argument
@@ -6446,14 +6488,30 @@ GcCallSite* resolveDynamic(Thread* t, GcInvocation* invocation)
   // the bootstrap method's name), `it` iterates through the corresponding types
   // in the method signature
   unsigned i = 0;
-  while (i + 1 < bootstrapArray->length() && it.hasNext()) {
+  while (not stringConcat && i + 1 < bootstrapArray->length() && it.hasNext()) {
     const char* p = it.next();
 
     switch (*p) {
     case 'L': {
       const char* const methodType = "Ljava/lang/invoke/MethodType;";
       const char* const methodHandle = "Ljava/lang/invoke/MethodHandle;";
-      if (strncmp(p, methodType, strlen(methodType)) == 0) {
+      const char* const stringType = "Ljava/lang/String;";
+      const char* const classType = "Ljava/lang/Class;";
+      if (strncmp(p, stringType, strlen(stringType)) == 0) {
+        array->setBodyElement(
+            t,
+            i + argument,
+            singletonObject(
+                t, invocation->pool(), bootstrapArray->body()[i + 1]));
+      } else if (strncmp(p, classType, strlen(classType)) == 0) {
+        GcReference* ref = cast<GcReference>(
+            t,
+            singletonObject(
+                t, invocation->pool(), bootstrapArray->body()[i + 1]));
+        GcClass* k = resolveClass(
+            t, c->loader(), ref->name(), true, GcNoClassDefFoundError::Type);
+        array->setBodyElement(t, i + argument, getJClass(t, k));
+      } else if (strncmp(p, methodType, strlen(methodType)) == 0) {
         GcMethodType* type = makeMethodType(
             t,
             c->loader(),

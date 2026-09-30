@@ -18,5 +18,9 @@ public enum ElementType {
   METHOD,
   PACKAGE,
   PARAMETER,
-  TYPE
+  TYPE,
+  TYPE_PARAMETER,
+  TYPE_USE,
+  MODULE,
+  RECORD_COMPONENT
 }

@@ -118,11 +118,20 @@ public class Classes {
          new String(name, 0, name.length - 1));
     }
 
-    case 'c':{
+    case 'c': {
       byte[] name = (byte[]) Singleton.getObject(pool, read2(in) - 1);
-
+      // Field descriptor plus a trailing NUL: "V", "[I", or "Ljava/lang/String;".
+      if (name.length == 2) {
+        return SystemClassLoader.getClass(primitiveClass((char) name[0]));
+      }
+      int start = 0;
+      int length = name.length - 1;
+      if (name[0] == 'L') {
+        start = 1;
+        length -= 2;
+      }
       return SystemClassLoader.getClass
-        (loadVMClass(loader, name, 1, name.length - 3));
+        (loadVMClass(loader, name, start, length));
     }
 
     case '@':

@@ -1833,6 +1833,14 @@ $(classpath-dep): $(classpath-sources) $(classpath-jar-dep)
 	$(javac) -source 1.$(java-version) -target 1.$(java-version) \
 		-d $(classpath-build) -bootclasspath $(boot-classpath) \
 		$(classpath-sources)
+	# JDK 11 javac writes its platform ElementType when -d is the bootclasspath.
+	@mkdir -p $(build)/element-type
+	@echo "staging java.lang.annotation.ElementType"
+	$(javac) -source 1.$(java-version) -target 1.$(java-version) \
+		-d $(build)/element-type -bootclasspath $(boot-classpath) \
+		$(classpath-src)/java/lang/annotation/ElementType.java
+	cp $(build)/element-type/java/lang/annotation/ElementType.class \
+		$(classpath-build)/java/lang/annotation/ElementType.class
 	@touch $(@)
 
 $(build)/android-src/%.cpp: $(luni-native)/%.cpp
