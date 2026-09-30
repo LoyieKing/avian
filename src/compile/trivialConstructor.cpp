@@ -13,7 +13,7 @@
 #endif
 
 #include "compile/trivialConstructor.h"
-#include "compile/youngObjectStore.h"
+#include "compile/objectStore.h"
 
 bool inTryBlock(MyThread* t, GcCode* code, unsigned ip);
 bool needsReturnBarrier(MyThread* t, GcMethod* method);
@@ -364,6 +364,7 @@ bool TrivialConstructor::tryCompile(MyThread* t,
 
   // Peek while the arguments are still on the stack. saveState and
   // setMaybeNull both need those frame homes. Pop once, after the join.
+  // ObjectStore does not pop.
   ir::Value* self = 0;
   ir::Value* values[InlineInitMaxStores];
   if (storeCount) {
@@ -393,9 +394,6 @@ bool TrivialConstructor::tryCompile(MyThread* t,
   }
 
   for (unsigned i = 0; i < storeCount; ++i) {
-    if (static_cast<int>(i) == youngStore) {
-      continue;
-    }
     ir::Value* value = values[i];
     int offset = fieldOffsets[i];
     switch (fieldCodes[i]) {
@@ -426,38 +424,22 @@ bool TrivialConstructor::tryCompile(MyThread* t,
       break;
 
     case ObjectField:
-      c->nativeCall(
-          c->constant(getThunk(t, setMaybeNullThunk), ir::Type::iptr()),
-          0,
-          frame->trace(0, 0),
-          ir::Type::void_(),
-          args(c->threadRegister(),
-               self,
-               c->constant(offset, ir::Type::i4()),
-               value));
+      // callIp is the invokespecial. The receiver fact was recorded
+      // there, before the call's safepoint. allowBranch only for the
+      // one object store that is last: the slow path joins after it.
+      ObjectStore::store(t,
+                         frame,
+                         callIp,
+                         self,
+                         value,
+                         offset,
+                         invokespecial,
+                         static_cast<int>(i) == youngStore);
       break;
 
     default:
       abort(t);
     }
-  }
-
-  if (youngStore >= 0
-      and not YoungObjectStore::tryCompile(t,
-                                           frame,
-                                           callIp,
-                                           self,
-                                           values[youngStore],
-                                           fieldOffsets[youngStore])) {
-    c->nativeCall(
-        c->constant(getThunk(t, setMaybeNullThunk), ir::Type::iptr()),
-        0,
-        frame->trace(0, 0),
-        ir::Type::void_(),
-        args(c->threadRegister(),
-             self,
-             c->constant(fieldOffsets[youngStore], ir::Type::i4()),
-             values[youngStore]));
   }
 
   if (barrier) {

@@ -229,8 +229,11 @@ bool InlineNew::tryCompile(MyThread* t,
       ir::ExtendMode::Signed,
       c->memory(machine, ir::Type::iptr(), MachineExclusiveOffset),
       ir::Type::iptr());
+  // heapIndex is a 32-bit unsigned below ThreadHeapSizeInWords (8192).
+  // x86 MoveZ only zero-extends a 16-bit source; a 32-bit unsigned load
+  // aborts in debug. Sign-extending this value is the same bits.
   ir::Value* index = c->load(
-      ir::ExtendMode::Unsigned,
+      ir::ExtendMode::Signed,
       c->memory(c->threadRegister(), ir::Type::i4(), ThreadHeapIndexOffset),
       ir::Type::iptr());
   ir::Value* next = c->binaryOp(lir::Add,
@@ -261,7 +264,7 @@ bool InlineNew::tryCompile(MyThread* t,
   // Values defined above a condJump lose their sites on the other side.
   // Reload the index and the class pointer here, on the fall-through.
   ir::Value* indexPtr = c->load(
-      ir::ExtendMode::Unsigned,
+      ir::ExtendMode::Signed,
       c->memory(c->threadRegister(), ir::Type::i4(), ThreadHeapIndexOffset),
       ir::Type::iptr());
   ir::Value* heap = c->load(
@@ -279,7 +282,7 @@ bool InlineNew::tryCompile(MyThread* t,
       = c->binaryOp(lir::Add,
                     ir::Type::i4(),
                     c->constant(words, ir::Type::i4()),
-                    c->load(ir::ExtendMode::Unsigned,
+                    c->load(ir::ExtendMode::Signed,
                             c->memory(c->threadRegister(),
                                       ir::Type::i4(),
                                       ThreadHeapIndexOffset),

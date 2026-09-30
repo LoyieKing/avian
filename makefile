@@ -1333,8 +1333,10 @@ all-codegen-target-sources = \
 ifeq ($(process),compile)
 	vm-sources += $(compiler-sources)
 	vm-sources += $(src)/compile/rangeCheckElimination.cpp
-	# inlineNew, youngObjectStore, and trivialConstructor are included
-	# from compile.cpp. Frame and Context are local to that file.
+	vm-sources += $(src)/compile/objectStoreFacts.cpp
+	# inlineNew, youngObjectStore, objectStore, and trivialConstructor
+	# are included from compile.cpp. Frame and Context are local to
+	# that file. objectStoreFacts is its own translation unit.
 
 	ifeq ($(codegen-targets),native)
 		vm-sources += $(native-assembler-sources)

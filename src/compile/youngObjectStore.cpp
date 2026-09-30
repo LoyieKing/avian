@@ -20,9 +20,12 @@
 // refuses the same methods the bump refuses.
 bool methodAllowsInlineNew(Context* context);
 unsigned takeSideIp(Context* context);
+bool inTryBlock(MyThread* t, GcCode* code, unsigned ip);
 
-// Slow path of an inlined object putfield. The fast path is the plain
-// store; this call is setMaybeNull, flushed after the walk.
+// Slow path of a reference store whose fast path is the plain store.
+// markOnly writes and then calls markField. Otherwise the call is
+// setMaybeNull, which still throws on a null receiver. Flushed after
+// the walk so the call is not the fall-through of the next bytecode.
 class YoungObjectStoreSlowPath {
  public:
   YoungObjectStoreSlowPath* next;
@@ -33,6 +36,7 @@ class YoungObjectStoreSlowPath {
   ir::Value* self;
   ir::Value* value;
   int offset;
+  bool markOnly;
 };
 
 void queueYoungObjectStore(Context* context, YoungObjectStoreSlowPath* path)
@@ -46,17 +50,21 @@ void queueYoungObjectStore(Context* context, YoungObjectStoreSlowPath* path)
   context->youngStoreSlowPathTail = path;
 }
 
-// invokespecial is three bytes. The index bytes are free logical IPs,
+// A three-byte instruction. The operand bytes are free logical IPs,
 // same layout as inlined new_: the store falls through, and the native
-// call lives on a side IP that jumps back.
-bool invokespecialHolesFree(MyThread* t, Context* context, unsigned origin)
+// call lives on a side IP that jumps back. putfield's holes are its
+// index bytes; invokespecial's are the two bytes already used this way.
+bool objectStoreHolesFree(MyThread* t,
+                          Context* context,
+                          unsigned origin,
+                          unsigned opcode)
 {
   GcCode* code = context->method->code();
   if (code == 0 or origin + 3 >= code->length()) {
     return false;
   }
   if (static_cast<unsigned>(static_cast<uint8_t>(code->body()[origin]))
-      != invokespecial) {
+      != opcode) {
     return false;
   }
   if (context->visitTable[origin + 1] or context->visitTable[origin + 2]) {
@@ -78,14 +86,16 @@ bool invokespecialHolesFree(MyThread* t, Context* context, unsigned origin)
 
 // Thread chunks come from the C allocator, not from gen2 or a fixie, so
 // a pointer inside [heap, heap + 64KB) does not need a remembered-set
-// update. Null, tenured, and fixed objects fail the range test and take
-// setMaybeNull. One condJump: the instruction only has two spare bytes.
+// update. Null, tenured, and fixed objects fail the range test. One
+// condJump: the instruction only has two spare bytes.
 bool YoungObjectStore::tryCompile(MyThread* t,
                                   Frame* frame,
                                   unsigned callIp,
                                   ir::Value* self,
                                   ir::Value* value,
-                                  int offset)
+                                  int offset,
+                                  unsigned opcode,
+                                  bool markOnly)
 {
   // 64KB chunk. The shift matches ThreadHeapSizeInBytes.
   enum { ThreadChunkRangeShift = 16 };
@@ -97,10 +107,16 @@ bool YoungObjectStore::tryCompile(MyThread* t,
   if (callIp != frame->ip or frame->subroutine) {
     return false;
   }
+  // The slow call is a side IP past the bytecode. Handler ranges do not
+  // cover it, so a null receiver inside a try would escape the catch.
+  // The inline setMaybeNull at this ip stays inside the range.
+  if (inTryBlock(t, context->method->code(), callIp)) {
+    return false;
+  }
   if (not methodAllowsInlineNew(context)) {
     return false;
   }
-  if (not invokespecialHolesFree(t, context, callIp)) {
+  if (not objectStoreHolesFree(t, context, callIp, opcode)) {
     return false;
   }
 
@@ -160,6 +176,7 @@ bool YoungObjectStore::tryCompile(MyThread* t,
   path->self = self;
   path->value = value;
   path->offset = offset;
+  path->markOnly = markOnly;
   queueYoungObjectStore(context, path);
   return true;
 }
@@ -173,15 +190,30 @@ void YoungObjectStore::flush(MyThread* t, Context* context)
     c->restoreState(path->edge);
     c->startLogicalIp(path->slowIp);
 
-    c->nativeCall(
-        c->constant(getThunk(t, setMaybeNullThunk), ir::Type::iptr()),
-        0,
-        path->trace,
-        ir::Type::void_(),
-        args(c->threadRegister(),
-             path->self,
-             c->constant(path->offset, ir::Type::i4()),
-             path->value));
+    if (path->markOnly) {
+      // The receiver is not null. Store, then mark: targetNeedsMark
+      // reads the new referent. mark does not collect on this path.
+      c->store(path->value,
+               c->memory(path->self, ir::Type::object(), path->offset));
+      c->nativeCall(
+          c->constant(getThunk(t, markFieldThunk), ir::Type::iptr()),
+          0,
+          0,
+          ir::Type::void_(),
+          args(c->threadRegister(),
+               path->self,
+               c->constant(path->offset, ir::Type::i4())));
+    } else {
+      c->nativeCall(
+          c->constant(getThunk(t, setMaybeNullThunk), ir::Type::iptr()),
+          0,
+          path->trace,
+          ir::Type::void_(),
+          args(c->threadRegister(),
+               path->self,
+               c->constant(path->offset, ir::Type::i4()),
+               path->value));
+    }
     c->jmp(c->promiseConstant(c->machineIp(path->contIp), ir::Type::iptr()));
     c->visitLogicalIp(path->contIp);
   }
@@ -195,7 +227,9 @@ bool YoungObjectStore::tryCompile(MyThread* t UNUSED,
                                   unsigned callIp UNUSED,
                                   ir::Value* self UNUSED,
                                   ir::Value* value UNUSED,
-                                  int offset UNUSED)
+                                  int offset UNUSED,
+                                  unsigned opcode UNUSED,
+                                  bool markOnly UNUSED)
 {
   return false;
 }

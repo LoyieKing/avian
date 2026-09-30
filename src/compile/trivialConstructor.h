@@ -20,10 +20,12 @@
 // putfield), then return. A computed value, a branch, or any other
 // call stays a real invoke.
 //
-// One object putfield, and only when it is the last store, goes through
-// YoungObjectStore. Every other object store calls setMaybeNull.
-// Primitive stores are direct. Included from src/compile.cpp for the
-// same reason as inlineNew.h.
+// Every object putfield goes through ObjectStore, which uses the fact
+// recorded at this invokespecial. At most one of them branches: the
+// single object store that is also the last store. A slow path jumps
+// to the join and must not skip a later store. Primitive stores are
+// direct. Included from src/compile.cpp for the same reason as
+// inlineNew.h.
 
 class TrivialConstructor {
  public:

@@ -10,6 +10,7 @@
 
 #include "avian/machine.h"
 #include "compile/rangeCheckElimination.h"
+#include "compile/objectStoreFacts.h"
 #include "avian/debug.h"
 #include "avian/util.h"
 #include "avian/alloc-vector.h"
@@ -1238,6 +1239,7 @@ class Context {
         leaf(true),
         debugBits(0),
         safeArrayAccess(0),
+        objectStoreFacts(0),
         inlineNewSlowPaths(0),
         inlineNewSlowPathTail(0),
         inlineNewOk(-1),
@@ -1279,6 +1281,7 @@ class Context {
         leaf(true),
         debugBits(0),
         safeArrayAccess(0),
+        objectStoreFacts(0),
         inlineNewSlowPaths(0),
         inlineNewSlowPathTail(0),
         inlineNewOk(-1),
@@ -1361,6 +1364,10 @@ class Context {
   // Avian cannot deoptimize, so this is set only for accesses that are
   // in range on every execution.
   uint8_t* safeArrayAccess;
+  // Bytecode ip → receiver fact at a reference store. Fresh is a plain
+  // store. NonNull still marks unless the chunk range check hits.
+  // Null means this method had nothing to remove. See ObjectStoreFacts.
+  uint8_t* objectStoreFacts;
   // Inlined new_ slow paths, emitted after the bytecode walk so the
   // fast-path fall-through keeps the first fork target. Side logical
   // IPs start at the bytecode length. Methods that contain jsr are not
@@ -2866,6 +2873,13 @@ void setMaybeNull(MyThread* t, object o, unsigned offset, object value)
   }
 }
 
+// The non-null half of setMaybeNull. mark is inline and divides the
+// byte offset by BytesPerWord; the thunk has to be an actual function.
+void markField(MyThread* t, object o, unsigned offset)
+{
+  mark(t, o, offset);
+}
+
 void acquireMonitorForObject(MyThread* t, object o)
 {
   if (LIKELY(o)) {
@@ -3759,12 +3773,25 @@ void compileSafePoint(MyThread* t, Compiler* c, Frame* frame)
 // and a not-taken branch, which is the usual case. The call remains the
 // slow path so its GC map is unchanged. Conditional back-edges are left on
 // the call: their safepoint is emitted before the condition.
+//
+// The caller treats newIp <= ip as backward. That is also true of a goto
+// whose target is the next bytecode: the walker has not opened it, so it
+// has no logical instruction. A jump into code this walk has not visited
+// is the same. visitLogicalIp would then null-deref. Those edges keep the
+// call. A loop header is already in the visit table.
 void compileBackwardGotoSafePoint(MyThread* t,
                                  Compiler* c,
                                  Frame* frame,
                                  unsigned targetIp)
 {
   if (debug::enabled()) {
+    compileSafePoint(t, c, frame);
+    return;
+  }
+
+  unsigned dup = frame->duplicatedIp(targetIp);
+  if (dup >= frame->context->visitTable.count
+      or frame->context->visitTable[dup] == 0) {
     compileSafePoint(t, c, frame);
     return;
   }
@@ -3792,12 +3819,14 @@ void compileBackwardGotoSafePoint(MyThread* t,
   compileSafePoint(t, c, frame);
 }
 
-// Inlined allocation, the trivial constructor, and the young-object
-// store. Included here, inside namespace local: Frame and Context are
-// visible in this translation unit. See src/compile/inlineNew.h.
+// Inlined allocation, the reference store, and the trivial constructor.
+// Included here, inside namespace local: Frame and Context are visible
+// in this translation unit. The nullness facts are a separate unit.
+// See src/compile/inlineNew.h.
 #define AVIAN_COMPILE_CPP_INCLUDE
 #include "compile/inlineNew.cpp"
 #include "compile/youngObjectStore.cpp"
+#include "compile/objectStore.cpp"
 #include "compile/trivialConstructor.cpp"
 #undef AVIAN_COMPILE_CPP_INCLUDE
 
@@ -4876,22 +4905,9 @@ loop:
 
       switch (instruction) {
       case aastore: {
-        c->nativeCall(
-            c->constant(getThunk(t, setMaybeNullThunk), ir::Type::iptr()),
-            0,
-            frame->trace(0, 0),
-            ir::Type::void_(),
-            args(c->threadRegister(),
-                 array,
-                 c->binaryOp(lir::Add,
-                             ir::Type::i4(),
-                             c->constant(TargetArrayBody, ir::Type::i4()),
-                             c->binaryOp(lir::ShiftLeft,
-                                         ir::Type::i4(),
-                                         c->constant(log(TargetBytesPerWord),
-                                                     ir::Type::i4()),
-                                         index)),
-                 value));
+        // Already popped. aastore is one byte, so there is no hole for
+        // a range-check branch.
+        ObjectStore::storeElement(t, frame, ip - 1, array, index, value);
       } break;
 
       case fastore:
@@ -6808,16 +6824,21 @@ loop:
 
         case ObjectField:
           if (instruction == putfield) {
-            c->nativeCall(
-                c->constant(getThunk(t, setMaybeNullThunk), ir::Type::iptr()),
-                0,
-                frame->trace(0, 0),
-                ir::Type::void_(),
-                args(c->threadRegister(),
-                     table,
-                     c->constant(targetFieldOffset(context, field),
-                                 ir::Type::i4()),
-                     value));
+            // Back on the stack so a joined slow path reloads them.
+            // The pops sit at the join, before the next bytecode.
+            // fieldBci is the opcode; the index bytes are the holes.
+            frame->push(ir::Type::object(), table);
+            frame->push(ir::Type::object(), value);
+            ObjectStore::store(t,
+                               frame,
+                               static_cast<unsigned>(fieldBci),
+                               table,
+                               value,
+                               targetFieldOffset(context, field),
+                               putfield,
+                               true);
+            frame->pop(ir::Type::object());
+            frame->pop(ir::Type::object());
           } else {
             c->nativeCall(
                 c->constant(getThunk(t, setObjectThunk), ir::Type::iptr()),
@@ -8076,6 +8097,8 @@ void compile(MyThread* t, Context* context)
   Compiler::State* state = c->saveState();
 
   context->safeArrayAccess = RangeCheckElimination::eliminate(
+      t, &context->zone, context->method);
+  context->objectStoreFacts = ObjectStoreFacts::analyze(
       t, &context->zone, context->method);
 
   compile(t, &frame, 0);
