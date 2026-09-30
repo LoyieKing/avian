@@ -1337,7 +1337,8 @@ bool rceTryLoop(RceCfg* cfg,
                 unsigned markCap,
                 uint8_t* safe,
                 unsigned gotoIp,
-                unsigned header)
+                unsigned header,
+                uint16_t* ivAtHeader)
 {
   const uint8_t* code = cfg->code;
   unsigned length = cfg->length;
@@ -1583,6 +1584,9 @@ bool rceTryLoop(RceCfg* cfg,
       any = true;
     }
   }
+  if (any and ivAtHeader and iv < RangeCheckElimination::NoCountedLoop) {
+    ivAtHeader[header] = static_cast<uint16_t>(iv);
+  }
   return any;
 }
 
@@ -1625,12 +1629,12 @@ class RangeCheckEliminator {
   {
   }
 
-  uint8_t* eliminate();
+  uint8_t* eliminate(uint16_t** countedLoopIv);
 
  private:
   bool copyCode();
   bool buildCfg();
-  uint8_t* markCountedLoops();
+  uint8_t* markCountedLoops(uint16_t** countedLoopIv);
 
   Thread* thread;
   Zone* zone;
@@ -1656,12 +1660,12 @@ class RangeCheckEliminator {
   RceCfg cfg;
 };
 
-uint8_t* RangeCheckEliminator::eliminate()
+uint8_t* RangeCheckEliminator::eliminate(uint16_t** countedLoopIv)
 {
   if (not copyCode() or not buildCfg()) {
     return 0;
   }
-  return markCountedLoops();
+  return markCountedLoops(countedLoopIv);
 }
 
 bool RangeCheckEliminator::copyCode()
@@ -1841,7 +1845,7 @@ bool RangeCheckEliminator::buildCfg()
   return true;
 }
 
-uint8_t* RangeCheckEliminator::markCountedLoops()
+uint8_t* RangeCheckEliminator::markCountedLoops(uint16_t** countedLoopIv)
 {
   unsigned stackCap = maxStack + 4;
   RceStack stack;
@@ -1853,6 +1857,13 @@ uint8_t* RangeCheckEliminator::markCountedLoops()
       = static_cast<unsigned*>(rceAlloc(zone, length * sizeof(unsigned)));
   unsigned markCount = 0;
   uint8_t* safe = static_cast<uint8_t*>(rceAlloc(zone, length));
+  // NoCountedLoop is 0xFFFF, so a byte fill is the sentinel in each slot.
+  uint16_t* ivAtHeader = 0;
+  if (countedLoopIv) {
+    ivAtHeader = static_cast<uint16_t*>(
+        rceAlloc(zone, length * sizeof(uint16_t)));
+    memset(ivAtHeader, 0xFF, length * sizeof(uint16_t));
+  }
   bool any = false;
 
   for (unsigned ip = 0; ip < length; ++ip) {
@@ -1869,13 +1880,17 @@ uint8_t* RangeCheckEliminator::markCountedLoops()
                      length,
                      safe,
                      ip,
-                     branch[ip])) {
+                     branch[ip],
+                     ivAtHeader)) {
         any = true;
       }
     }
   }
 
   if (any) {
+    if (countedLoopIv) {
+      *countedLoopIv = ivAtHeader;
+    }
     return safe;
   }
   return 0;
@@ -1883,12 +1898,18 @@ uint8_t* RangeCheckEliminator::markCountedLoops()
 
 }  // namespace
 
-uint8_t* RangeCheckElimination::eliminate(Thread* t, Zone* zone, GcMethod* method)
+uint8_t* RangeCheckElimination::eliminate(Thread* t,
+                                        Zone* zone,
+                                        GcMethod* method,
+                                        uint16_t** countedLoopIv)
 {
+  if (countedLoopIv) {
+    *countedLoopIv = 0;
+  }
   if (method == 0 or method->code() == 0) {
     return 0;
   }
-  return RangeCheckEliminator(t, zone, method).eliminate();
+  return RangeCheckEliminator(t, zone, method).eliminate(countedLoopIv);
 }
 
 }  // namespace vm

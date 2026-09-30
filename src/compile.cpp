@@ -1239,6 +1239,7 @@ class Context {
         leaf(true),
         debugBits(0),
         safeArrayAccess(0),
+        countedLoopIv(0),
         objectStoreFacts(0),
         inlineNewSlowPaths(0),
         inlineNewSlowPathTail(0),
@@ -1281,6 +1282,7 @@ class Context {
         leaf(true),
         debugBits(0),
         safeArrayAccess(0),
+        countedLoopIv(0),
         objectStoreFacts(0),
         inlineNewSlowPaths(0),
         inlineNewSlowPathTail(0),
@@ -1364,6 +1366,10 @@ class Context {
   // Avian cannot deoptimize, so this is set only for accesses that are
   // in range on every execution.
   uint8_t* safeArrayAccess;
+  // Bytecode header → induction local of a proved counted loop, or
+  // NoCountedLoop. Same lifetime as safeArrayAccess. Null when this
+  // method had no such loop. The back-edge poll reads it.
+  uint16_t* countedLoopIv;
   // Bytecode ip → receiver fact at a reference store. Fresh is a plain
   // store. NonNull still marks unless the chunk range check hits.
   // Null means this method had nothing to remove. See ObjectStoreFacts.
@@ -3784,6 +3790,11 @@ void compileSafePoint(MyThread* t, Compiler* c, Frame* frame)
 // jump into code this walk has not visited has no logical instruction.
 // visitLogicalIp would then null-deref. Those edges keep the call. A
 // loop header is already in the visit table.
+//
+// A proved counted loop polls every 256 trips. The index starts
+// non-negative and steps by +1, and this test runs after iinc, so the
+// gap is at most 256 iterations. Debug and jsr copies keep a poll on
+// every edge: field watches, and a subroutine copy is a second shape.
 void compileBackwardGotoSafePoint(MyThread* t,
                                  Compiler* c,
                                  Frame* frame,
@@ -3799,6 +3810,23 @@ void compileBackwardGotoSafePoint(MyThread* t,
       or frame->context->visitTable[dup] == 0) {
     compileSafePoint(t, c, frame);
     return;
+  }
+
+  uint16_t* ivAt = frame->context->countedLoopIv;
+  unsigned codeLength = frame->context->method->code()->length();
+  if (frame->subroutine == 0 and ivAt != 0 and targetIp < codeLength
+      and ivAt[targetIp] != RangeCheckElimination::NoCountedLoop) {
+    // test i, 255; jnz. The index stays live, so this must not be an
+    // and into a copy. 255 does not fit in a signed imm8; the test
+    // uses a 32-bit immediate.
+    const unsigned strideMask = 255;
+    c->condJump(lir::JumpIfTestNotZero,
+                c->constant(strideMask, ir::Type::i4()),
+                loadLocal(frame->context, 1, ir::Type::i4(), ivAt[targetIp]),
+                frame->machineIpValue(targetIp));
+    Compiler::State* state = c->saveState();
+    c->visitLogicalIp(frame->duplicatedIp(targetIp));
+    c->restoreState(state);
   }
 
   ir::Value* machine = c->load(
@@ -8111,7 +8139,7 @@ void compile(MyThread* t, Context* context)
   Compiler::State* state = c->saveState();
 
   context->safeArrayAccess = RangeCheckElimination::eliminate(
-      t, &context->zone, context->method);
+      t, &context->zone, context->method, &context->countedLoopIv);
   context->objectStoreFacts = ObjectStoreFacts::analyze(
       t, &context->zone, context->method);
 

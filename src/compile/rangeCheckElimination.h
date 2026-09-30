@@ -40,9 +40,19 @@ class GcMethod;
 // compiler emits that *aload or *astore without a bounds check. Null means
 // this method had nothing to remove. Storage comes from the compilation
 // zone and lives as long as the compilation does.
+//
+// countedLoopIv, when not null, receives a second zone array of the same
+// length, or null when the safe vector is null. Entry header is the
+// induction local of a loop this pass proved, or NoCountedLoop. The
+// compiler polls that back edge every 256 iterations instead of every one.
 class RangeCheckElimination {
  public:
-  static uint8_t* eliminate(Thread* t, Zone* zone, GcMethod* method);
+  static const uint16_t NoCountedLoop = 0xFFFF;
+
+  static uint8_t* eliminate(Thread* t,
+                            Zone* zone,
+                            GcMethod* method,
+                            uint16_t** countedLoopIv);
 
  private:
   RangeCheckElimination();

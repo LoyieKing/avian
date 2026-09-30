@@ -1249,6 +1249,17 @@ void branchRR(Context* con,
               lir::RegisterPair* b,
               lir::Constant* target)
 {
+  if (op == lir::JumpIfTestNotZero) {
+    lir::RegisterPair tmp(con->client->acquireTemporary(GPR_MASK));
+    andR(con, size, a, b, &tmp);
+    ResolvedPromise zeroPromise(0);
+    lir::Constant zero(&zeroPromise);
+    compareCR(con, size, &zero, size, &tmp);
+    con->client->releaseTemporary(tmp.low);
+    branch(con, lir::JumpIfNotEqual, target);
+    return;
+  }
+
   if (!isFpr(a) && size > vm::TargetBytesPerWord) {
     lir::RegisterPair ah(a->high);
     lir::RegisterPair bh(b->high);
@@ -1268,6 +1279,17 @@ void branchCR(Context* con,
               lir::RegisterPair* b,
               lir::Constant* target)
 {
+  if (op == lir::JumpIfTestNotZero) {
+    lir::RegisterPair tmp(con->client->acquireTemporary(GPR_MASK));
+    andC(con, size, a, b, &tmp);
+    ResolvedPromise zeroPromise(0);
+    lir::Constant zero(&zeroPromise);
+    compareCR(con, size, &zero, size, &tmp);
+    con->client->releaseTemporary(tmp.low);
+    branch(con, lir::JumpIfNotEqual, target);
+    return;
+  }
+
   assertT(con, !isFloatBranch(op));
 
   if (size > vm::TargetBytesPerWord) {

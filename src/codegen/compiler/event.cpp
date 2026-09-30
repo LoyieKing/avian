@@ -1524,17 +1524,13 @@ class MemoryEvent : public Event {
 
     popRead(c, this, base);
     if (index) {
-      if (c->targetInfo.pointerSize == 8 and indexRegister != NoRegister) {
-        apply(c,
-              lir::Move,
-              4,
-              index->source,
-              index->source,
-              8,
-              index->source,
-              index->source);
-      }
-
+      // A Java int written by a 32-bit operation is zero-extended on
+      // x86-64 and AArch64. Every indexed memory in this compiler is an
+      // array access, and it is reached only when the index is >= 0:
+      // the bounds check already branched to the exception, or
+      // range-check elimination proved the index. Sign-extending here
+      // did not change the address. It was a second instruction on
+      // both the load and the store.
       popRead(c, this, index);
     }
 
@@ -1603,6 +1599,9 @@ bool shouldJump(Context* c,
 
   case lir::JumpIfNotEqual:
     return a != b;
+
+  case lir::JumpIfTestNotZero:
+    return (a & b) != 0;
 
   case lir::JumpIfLess:
     return a < b;

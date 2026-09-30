@@ -1455,6 +1455,17 @@ void branchRR(Context* c,
               lir::RegisterPair* b,
               lir::Constant* target)
 {
+  if (op == lir::JumpIfTestNotZero) {
+    lir::RegisterPair tmp(c->client->acquireTemporary(GPR_MASK));
+    andR(c, size, a, b, &tmp);
+    ResolvedPromise zeroPromise(0);
+    lir::Constant zero(&zeroPromise);
+    compareCR(c, size, &zero, size, &tmp);
+    c->client->releaseTemporary(tmp.low);
+    branch(c, lir::JumpIfNotEqual, target);
+    return;
+  }
+
   compareRR(c, size, a, size, b);
   branch(c, op, target);
 }
@@ -1466,6 +1477,17 @@ void branchCR(Context* c,
               lir::RegisterPair* b,
               lir::Constant* target)
 {
+  if (op == lir::JumpIfTestNotZero) {
+    lir::RegisterPair tmp(c->client->acquireTemporary(GPR_MASK));
+    andC(c, size, a, b, &tmp);
+    ResolvedPromise zeroPromise(0);
+    lir::Constant zero(&zeroPromise);
+    compareCR(c, size, &zero, size, &tmp);
+    c->client->releaseTemporary(tmp.low);
+    branch(c, lir::JumpIfNotEqual, target);
+    return;
+  }
+
   assertT(c, not isFloatBranch(op));
 
   compareCR(c, size, a, size, b);

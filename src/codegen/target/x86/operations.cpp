@@ -1189,6 +1189,30 @@ void branchLong(Context* c,
   }
 }
 
+void testRR(Context* c,
+           unsigned size,
+           lir::RegisterPair* a,
+           lir::RegisterPair* b)
+{
+  maybeRex(c, size, a, b);
+  opcode(c, 0x85);
+  modrm(c, 0xc0, b, a);
+}
+
+void testCR(Context* c,
+           unsigned size,
+           lir::Constant* a,
+           lir::RegisterPair* b)
+{
+  int64_t v = a->value->value();
+  assertT(c, vm::fitsInInt32(v));
+  maybeRex(c, size, b);
+  // TEST r/m, imm32. The immediate is not sign-extended to a byte:
+  // 255 must stay 255.
+  opcode(c, 0xF7, 0xC0 + regCode(b));
+  c->code.append4(v);
+}
+
 void branchRR(Context* c,
               lir::TernaryOperation op,
               unsigned size,
@@ -1196,6 +1220,12 @@ void branchRR(Context* c,
               lir::RegisterPair* b,
               lir::Constant* target)
 {
+  if (op == lir::JumpIfTestNotZero) {
+    testRR(c, size, a, b);
+    branch(c, lir::JumpIfNotEqual, target);
+    return;
+  }
+
   if (isFloatBranch(op)) {
     compareFloatRR(c, size, a, size, b);
     branchFloat(c, op, target);
@@ -1217,6 +1247,12 @@ void branchCR(Context* c,
               lir::RegisterPair* b,
               lir::Constant* target)
 {
+  if (op == lir::JumpIfTestNotZero) {
+    testCR(c, size, a, b);
+    branch(c, lir::JumpIfNotEqual, target);
+    return;
+  }
+
   assertT(c, not isFloatBranch(op));
 
   if (size > vm::TargetBytesPerWord) {
