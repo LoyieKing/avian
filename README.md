@@ -180,9 +180,9 @@ store are included from `src/compile.cpp`, because `Frame` and
 reads `Machine::exclusive` and calls the safepoint only when a
 collection is waiting.
 
-This does not add SIMD, a general inliner, escape analysis, a new
-allocator, a larger thread chunk, or an inlined remembered-set walk.
-32-bit builds keep the calls.
+The thread-local buffer now grows and shrinks inside a reserved young
+region. This does not add SIMD, a general inliner, escape analysis, or
+an inlined remembered-set walk. 32-bit builds keep the calls.
 
 `docs/jit.md` describes the passes and the layout constraints.
 `docs/benchmark.md` and `docs/MicroBench.java` are the OpenJDK 8

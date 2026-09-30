@@ -16,10 +16,11 @@
 #define AVIAN_COMPILE_YOUNG_OBJECT_STORE_H
 
 // Plain store of one reference field when the object is inside the
-// current thread chunk.
+// current thread TLAB.
 //
-// The chunk is not a slice of gen2 and the object is not a fixie, so
-// needsMark is false and the remembered set does not change. Null,
+// The TLAB is a slice of the reserved eden, not of gen2, and the object
+// is not a fixie, so needsMark is false and the remembered set does not
+// change. Null,
 // tenured, and fixed objects fail the range test and take setMaybeNull.
 // invokespecial has two spare bytes, so this is one condJump. The fast
 // path is 64-bit only.

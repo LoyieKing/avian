@@ -3682,9 +3682,14 @@ static const unsigned MachineExclusiveOffset
 // makeThread aborts if the C++ layout disagrees. 32-bit builds leave
 // new_ on the native path; these constants are not that layout.
 #if TARGET_BYTES_PER_WORD == 8
-static const unsigned ThreadHeapIndexOffset = 88;
+// Thread::heapTop, Thread::heap, Thread::heapEnd. makeThread aborts if
+// the C++ layout disagrees. heap stayed at 160; heapTop replaced
+// defaultHeap and heapEnd was inserted after heap. Fields below that
+// moved; see target-fields.h.
+static const unsigned ThreadHeapTopOffset = 152;
 static const unsigned ThreadHeapOffset = 160;
-static const unsigned AllocationResultOffset = 2480;
+static const unsigned ThreadHeapEndOffset = 168;
+static const unsigned AllocationResultOffset = 2512;
 #endif
 
 unsigned simpleFrameMapTableSize(MyThread* t, GcMethod* method, GcIntArray* map)
@@ -5440,11 +5445,15 @@ loop:
     } break;
 
     case goto_: {
+      // ip already points past the opcode. Compare with the opcode
+      // address: a branch to the next instruction is not a back edge,
+      // and that target has not been started yet.
+      uint32_t origin = ip - 1;
       uint32_t offset = codeReadInt16(t, code, ip);
-      uint32_t newIp = (ip - 3) + offset;
+      uint32_t newIp = origin + offset;
       assertT(t, newIp < code->length());
 
-      if (newIp <= ip) {
+      if (newIp <= origin) {
         compileBackwardGotoSafePoint(t, c, frame, newIp);
       }
 
@@ -5453,11 +5462,12 @@ loop:
     } break;
 
     case goto_w: {
+      uint32_t origin = ip - 1;
       uint32_t offset = codeReadInt32(t, code, ip);
-      uint32_t newIp = (ip - 5) + offset;
+      uint32_t newIp = origin + offset;
       assertT(t, newIp < code->length());
 
-      if (newIp <= ip) {
+      if (newIp <= origin) {
         compileBackwardGotoSafePoint(t, c, frame, newIp);
       }
 
@@ -5567,11 +5577,12 @@ loop:
 
     case if_acmpeq:
     case if_acmpne: {
+      uint32_t origin = ip - 1;
       uint32_t offset = codeReadInt16(t, code, ip);
-      newIp = (ip - 3) + offset;
+      newIp = origin + offset;
       assertT(t, newIp < code->length());
 
-      if (newIp <= ip) {
+      if (newIp <= origin) {
         compileSafePoint(t, c, frame);
       }
 
@@ -5589,11 +5600,12 @@ loop:
     case if_icmpge:
     case if_icmplt:
     case if_icmple: {
+      uint32_t origin = ip - 1;
       uint32_t offset = codeReadInt16(t, code, ip);
-      newIp = (ip - 3) + offset;
+      newIp = origin + offset;
       assertT(t, newIp < code->length());
 
-      if (newIp <= ip) {
+      if (newIp <= origin) {
         compileSafePoint(t, c, frame);
       }
 
@@ -5611,13 +5623,14 @@ loop:
     case ifge:
     case iflt:
     case ifle: {
+      uint32_t origin = ip - 1;
       uint32_t offset = codeReadInt16(t, code, ip);
-      newIp = (ip - 3) + offset;
+      newIp = origin + offset;
       assertT(t, newIp < code->length());
 
       ir::Value* target = frame->machineIpValue(newIp);
 
-      if (newIp <= ip) {
+      if (newIp <= origin) {
         compileSafePoint(t, c, frame);
       }
 
@@ -5630,11 +5643,12 @@ loop:
 
     case ifnull:
     case ifnonnull: {
+      uint32_t origin = ip - 1;
       uint32_t offset = codeReadInt16(t, code, ip);
-      newIp = (ip - 3) + offset;
+      newIp = origin + offset;
       assertT(t, newIp < code->length());
 
-      if (newIp <= ip) {
+      if (newIp <= origin) {
         compileSafePoint(t, c, frame);
       }
 
@@ -9602,17 +9616,18 @@ class MyProcessor : public Processor {
           + checkConstant(t, ThreadMachineOffset, &Thread::m, "Thread::m");
 
 #if TARGET_BYTES_PER_WORD == 8
-    mismatches
-        += checkConstant(t,
-                         ThreadHeapIndexOffset,
-                         &Thread::heapIndex,
-                         "Thread::heapIndex")
-           + checkConstant(
-                 t, ThreadHeapOffset, &Thread::heap, "Thread::heap")
-           + checkConstant(t,
-                           AllocationResultOffset,
-                           &MyThread::allocationResult,
-                           "MyThread::allocationResult");
+    mismatches += checkConstant(
+                      t, ThreadHeapTopOffset, &Thread::heapTop, "Thread::heapTop")
+                  + checkConstant(
+                        t, ThreadHeapOffset, &Thread::heap, "Thread::heap")
+                  + checkConstant(t,
+                                  ThreadHeapEndOffset,
+                                  &Thread::heapEnd,
+                                  "Thread::heapEnd")
+                  + checkConstant(t,
+                                  AllocationResultOffset,
+                                  &MyThread::allocationResult,
+                                  "MyThread::allocationResult");
 #endif
 
     {

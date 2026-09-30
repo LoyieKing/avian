@@ -156,11 +156,126 @@ bool inlineNewHolesFree(MyThread* t, Context* context, unsigned origin)
   return true;
 }
 
+bool invokespecialHolesFree(MyThread* t, Context* context, unsigned origin);
+bool trivialInitStoresAllFields(MyThread* t,
+                                GcMethod* target,
+                                GcClass* class_,
+                                unsigned* objectStores,
+                                int* lastObject,
+                                unsigned* storeCount);
+
+// Pushes that cannot resolve, allocate, or call. Used to see that nothing
+// between new and its constructor is a safepoint.
+bool inlineNewSafeArgument(unsigned op)
+{
+  if (op == nop or op == aconst_null) {
+    return true;
+  }
+  if (op >= iconst_m1 and op <= dconst_1) {
+    return true;
+  }
+  if (op == bipush or op == sipush) {
+    return true;
+  }
+  if (op >= iload and op <= aload) {
+    return true;
+  }
+  if (op >= iload_0 and op <= aload_3) {
+    return true;
+  }
+  return false;
+}
+
+// True when this new's result is initialized by an inlined constructor
+// before any safepoint, so the fast path does not have to zero it.
+// The eden slice is not cleared. A field the constructor does not store
+// would otherwise be read back as garbage, and a reference left
+// uninitialized would be scanned if a call happened first.
+bool followingInitCoversFields(MyThread* t,
+                               Context* context,
+                               unsigned newIp,
+                               GcClass* class_)
+{
+  GcCode* code = context->method->code();
+  if (code == 0) {
+    return false;
+  }
+
+  unsigned length = code->length();
+  unsigned pc = newIp + 3;
+  if (pc >= length
+      or static_cast<unsigned>(static_cast<uint8_t>(code->body()[pc]))
+             != dup) {
+    return false;
+  }
+  ++pc;
+
+  unsigned invokeIp = 0;
+  bool found = false;
+  while (pc < length) {
+    unsigned op = static_cast<unsigned>(static_cast<uint8_t>(code->body()[pc]));
+    if (op == invokespecial) {
+      invokeIp = pc;
+      found = true;
+      break;
+    }
+    unsigned len = 0;
+    if (not inlineNewSafeArgument(op) or not inlineNewOpcodeLength(op, &len)
+        or len == 0 or pc + len > length) {
+      return false;
+    }
+    pc += len;
+  }
+
+  if (not found or invokeIp + 2 >= length) {
+    return false;
+  }
+
+  // One reference store can be the young-object fast path, and only when
+  // it is the last store: the slow path of that branch writes null before
+  // its call. Any earlier reference store is a call that would observe
+  // the uninitialized field. No spare bytes means that branch is not
+  // emitted and the store is setMaybeNull.
+  unsigned index = (static_cast<unsigned>(static_cast<uint8_t>(
+                        code->body()[invokeIp + 1]))
+                    << 8)
+                   | static_cast<unsigned>(
+                         static_cast<uint8_t>(code->body()[invokeIp + 2]));
+  if (index == 0) {
+    return false;
+  }
+
+  GcMethod* target = resolveMethod(t, context->method, index - 1, false);
+  if (target == 0) {
+    return false;
+  }
+
+  unsigned objectStores = 0;
+  int lastObject = -1;
+  unsigned storeCount = 0;
+  if (not trivialInitStoresAllFields(
+          t, target, class_, &objectStores, &lastObject, &storeCount)) {
+    return false;
+  }
+
+  if (objectStores > 1) {
+    return false;
+  }
+  if (objectStores == 1
+      and (lastObject + 1 != static_cast<int>(storeCount)
+           or not invokespecialHolesFree(t, context, invokeIp))) {
+    return false;
+  }
+  return true;
+}
+
 // Fast path duplicates allocateSmall + setObjectClass. The slow path is
 // the existing makeNew64 call, emitted after the walk. saveState's first
-// target is the bump; the call fills the second. One branch covers class
-// init, exclusive GC, and a full chunk, because a second condJump would
-// need a third logical IP and the instruction only has two spare bytes.
+// target is the bump; the call fills the second. The chunk end is the
+// thread's current TLAB. Class init is compiled in when the class has no
+// <clinit>, and a loop back-edge already polls exclusive GC, so the fast
+// path compares the bump against the TLAB end and nothing else. A class
+// that still needs initialization keeps that test on the same branch.
 bool InlineNew::tryCompile(MyThread* t,
                            Context* context,
                            Frame* frame,
@@ -179,7 +294,7 @@ bool InlineNew::tryCompile(MyThread* t,
   }
 
   unsigned bytes = pad(class_->fixedSize());
-  if (bytes == 0 or bytes > ThreadHeapSizeInBytes) {
+  if (bytes == 0 or bytes > TlabMaxBytes) {
     return false;
   }
 
@@ -193,10 +308,26 @@ bool InlineNew::tryCompile(MyThread* t,
 
   PROTECT(t, class_);
 
-  unsigned words = bytes / BytesPerWord;
+  // No <clinit> means initialization publishes nothing user-visible.
+  // Doing it now deletes the flag test from the bump. A class with a
+  // <clinit> keeps the test so that code still runs at the first new.
+  if (classNeedsInit(t, class_) and classInitializer(t, class_) == 0) {
+    initClass(t, class_);
+  }
+  bool checkInit = classNeedsInit(t, class_);
+
+  // Words the constructor will store are not zeroed. Anything else is
+  // zeroed here, in line, and only up to a few words: a large body that
+  // still needs a clear falls back to makeNew.
+  bool skipZero = followingInitCoversFields(t, context, frame->ip, class_);
+  if (not skipZero and bytes > 128) {
+    return false;
+  }
+
   Compiler* c = context->compiler;
 
   TraceElement* trace = frame->trace(0, 0);
+  // append inserts the class into the pool the header store addresses.
   ir::Value* classArg = frame->append(class_);
 
   PoolElement* pool = 0;
@@ -213,83 +344,70 @@ bool InlineNew::tryCompile(MyThread* t,
   unsigned slowIp = takeSideIp(context);
   ir::Value* slow = c->promiseConstant(c->machineIp(slowIp), ir::Type::iptr());
 
-  ir::Value* flags = c->load(
-      ir::ExtendMode::Unsigned,
-      c->memory(classArg, ir::Type::i2(), ClassVmFlagsOffset),
-      ir::Type::iptr());
-  ir::Value* needInit = c->binaryOp(lir::And,
-                                    ir::Type::iptr(),
-                                    c->constant(NeedInitFlag, ir::Type::iptr()),
-                                    flags);
-  ir::Value* machine = c->load(
+  ir::Value* top = c->load(
       ir::ExtendMode::Signed,
-      c->memory(c->threadRegister(), ir::Type::iptr(), ThreadMachineOffset),
+      c->memory(c->threadRegister(), ir::Type::iptr(), ThreadHeapTopOffset),
       ir::Type::iptr());
-  ir::Value* exclusive = c->load(
+  ir::Value* end = c->load(
       ir::ExtendMode::Signed,
-      c->memory(machine, ir::Type::iptr(), MachineExclusiveOffset),
+      c->memory(c->threadRegister(), ir::Type::iptr(), ThreadHeapEndOffset),
       ir::Type::iptr());
-  ir::Value* index = c->load(
-      ir::ExtendMode::Unsigned,
-      c->memory(c->threadRegister(), ir::Type::i4(), ThreadHeapIndexOffset),
-      ir::Type::iptr());
-  ir::Value* next = c->binaryOp(lir::Add,
-                                ir::Type::iptr(),
-                                c->constant(words, ir::Type::iptr()),
-                                index);
-  // subR is second minus first: ThreadHeapSizeInWords - next. Negative
-  // exactly when next is strictly greater, which is allocate()'s test.
-  ir::Value* limitMinusNext = c->binaryOp(
-      lir::Subtract,
-      ir::Type::iptr(),
-      next,
-      c->constant(ThreadHeapSizeInWords, ir::Type::iptr()));
-  ir::Value* noRoom = c->binaryOp(lir::ShiftRight,
+  ir::Value* newTop = c->binaryOp(lir::Add,
                                   ir::Type::iptr(),
-                                  c->constant(63, ir::Type::iptr()),
-                                  limitMinusNext);
-  ir::Value* blocked
-      = c->binaryOp(lir::Or, ir::Type::iptr(), needInit, exclusive);
-  blocked = c->binaryOp(lir::Or, ir::Type::iptr(), blocked, noRoom);
-  c->condJump(lir::JumpIfNotEqual,
-              c->constant(0, ir::Type::iptr()),
-              blocked,
-              slow);
+                                  c->constant(bytes, ir::Type::iptr()),
+                                  top);
+  if (checkInit) {
+    // Same single branch as before, without the exclusive load. subR is
+    // second minus first: end - newTop. Negative when the bump passes
+    // the TLAB. A null chunk has end == top == 0, so newTop is the size.
+    ir::Value* flags = c->load(
+        ir::ExtendMode::Unsigned,
+        c->memory(classArg, ir::Type::i2(), ClassVmFlagsOffset),
+        ir::Type::iptr());
+    ir::Value* needInit = c->binaryOp(lir::And,
+                                      ir::Type::iptr(),
+                                      c->constant(NeedInitFlag, ir::Type::iptr()),
+                                      flags);
+    ir::Value* endMinusNew = c->binaryOp(
+        lir::Subtract, ir::Type::iptr(), newTop, end);
+    ir::Value* noRoom = c->binaryOp(lir::ShiftRight,
+                                    ir::Type::iptr(),
+                                    c->constant(63, ir::Type::iptr()),
+                                    endMinusNew);
+    ir::Value* blocked = c->binaryOp(lir::Or, ir::Type::iptr(), needInit, noRoom);
+    c->condJump(lir::JumpIfNotEqual,
+                c->constant(0, ir::Type::iptr()),
+                blocked,
+                slow);
+  } else {
+    // JumpIfGreater(end, newTop) is taken when newTop > end.
+    c->condJump(lir::JumpIfGreater, end, newTop, slow);
+  }
   Compiler::State* edge = c->saveState();
   c->startLogicalIp(bumpIp);
 
   // Values defined above a condJump lose their sites on the other side.
-  // Reload the index and the class pointer here, on the fall-through.
-  ir::Value* indexPtr = c->load(
-      ir::ExtendMode::Unsigned,
-      c->memory(c->threadRegister(), ir::Type::i4(), ThreadHeapIndexOffset),
-      ir::Type::iptr());
-  ir::Value* heap = c->load(
+  // Reload the top here, on the fall-through.
+  ir::Value* objectPointer = c->load(
       ir::ExtendMode::Signed,
-      c->memory(c->threadRegister(), ir::Type::iptr(), ThreadHeapOffset),
+      c->memory(c->threadRegister(), ir::Type::iptr(), ThreadHeapTopOffset),
       ir::Type::iptr());
-  ir::Value* scaled = c->binaryOp(lir::ShiftLeft,
-                                  ir::Type::iptr(),
-                                  c->constant(3, ir::Type::iptr()),
-                                  indexPtr);
-  ir::Value* objectPointer
-      = c->binaryOp(lir::Add, ir::Type::iptr(), heap, scaled);
-
-  ir::Value* storedNext
+  ir::Value* storedTop
       = c->binaryOp(lir::Add,
-                    ir::Type::i4(),
-                    c->constant(words, ir::Type::i4()),
-                    c->load(ir::ExtendMode::Unsigned,
-                            c->memory(c->threadRegister(),
-                                      ir::Type::i4(),
-                                      ThreadHeapIndexOffset),
-                            ir::Type::i4()));
+                    ir::Type::iptr(),
+                    c->constant(bytes, ir::Type::iptr()),
+                    objectPointer);
   ir::Value* classBits = c->address(ir::Type::object(), pool);
 
-  // The installed chunk is zeroed, so the header word is just the class.
-  c->store(storedNext,
+  c->store(storedTop,
            c->memory(
-               c->threadRegister(), ir::Type::i4(), ThreadHeapIndexOffset));
+               c->threadRegister(), ir::Type::iptr(), ThreadHeapTopOffset));
+  if (not skipZero) {
+    for (unsigned off = BytesPerWord; off < bytes; off += BytesPerWord) {
+      c->store(c->constant(0, ir::Type::iptr()),
+               c->memory(objectPointer, ir::Type::iptr(), off));
+    }
+  }
   c->store(classBits, c->memory(objectPointer, ir::Type::object(), 0));
   c->store(objectPointer,
            c->memory(c->threadRegister(),

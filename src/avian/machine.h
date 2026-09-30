@@ -12,6 +12,7 @@
 #define MACHINE_H
 
 #include "avian/common.h"
+#include "avian/tlab.h"
 #include "java-common.h"
 #include <avian/system/system.h>
 #include <avian/system/signal.h>
@@ -140,17 +141,13 @@ const uintptr_t HashTakenMark = 1;
 const uintptr_t ExtendedMark = 2;
 const uintptr_t FixedMark = 3;
 
-const unsigned ThreadHeapSizeInBytes = 64 * 1024;
-const unsigned ThreadHeapSizeInWords = ThreadHeapSizeInBytes / BytesPerWord;
-
 const unsigned ThreadBackupHeapSizeInBytes = 2 * 1024;
 const unsigned ThreadBackupHeapSizeInWords = ThreadBackupHeapSizeInBytes
                                              / BytesPerWord;
 
-const unsigned ThreadHeapPoolSize = 64;
-
-const unsigned FixedFootprintThresholdInBytes = ThreadHeapPoolSize
-                                                * ThreadHeapSizeInBytes;
+// Fixed objects are still capped between collections. The old cap was
+// 64 chunks of 64KB.
+const unsigned FixedFootprintThresholdInBytes = 4 * 1024 * 1024;
 
 // number of zombie threads which may accumulate before we force a GC
 // to clean them up:
@@ -1081,8 +1078,16 @@ class Machine {
   bool alive;
   JavaVMVTable javaVMVTable;
   JNIEnvVTable jniEnvVTable;
-  uintptr_t* heapPool[ThreadHeapPoolSize];
-  unsigned heapPoolIndex;
+  // Reserved young space, allocated once. TLABs and one-off young
+  // objects are slices. The collector traces from roots, then the bump
+  // rewinds. The buffer stays, so a refill does not malloc again.
+  uintptr_t* edenStart;
+  uintptr_t* edenTop;
+  uintptr_t* edenEnd;
+  unsigned edenCapacity;
+  unsigned tlabMinWords;
+  unsigned tlabMaxWords;
+  TlabAverage allocatingThreads;
   size_t bootimageSize;
 };
 
@@ -1348,18 +1353,30 @@ class Thread {
   System::Monitor* lock;
   GcThread* javaThread;
   GcThrowable* exception;
-  unsigned heapIndex;
+  // Words used by TLABs retired since the last collection. The current
+  // chunk's used words are (heapTop - heap).
   unsigned heapOffset;
+  // Free words above this are kept: the object is allocated beside the
+  // TLAB instead of discarding the tail. HotSpot's refill_waste_limit.
+  unsigned refillWasteLimit;
   Protector* protector;
   ClassInitStack* classInitStack;
   LibraryLoadStack* libraryLoadStack;
   Resource* resource;
   Checkpoint* checkpoint;
   Runnable runnable;
-  uintptr_t* defaultHeap;
+  // [heap, heapEnd) is the current chunk. heapTop is the bump. All
+  // three are null when the thread has no chunk; the fast path then
+  // misses and the slow path carves a new one at desiredWords.
+  uintptr_t* heapTop;
   uintptr_t* heap;
+  uintptr_t* heapEnd;
   uintptr_t backupHeap[ThreadBackupHeapSizeInWords];
   unsigned backupHeapIndex;
+  unsigned desiredWords;
+  unsigned slowWords;
+  unsigned numberOfRefills;
+  TlabAverage allocationFraction;
 
   // Debugger suspension.  Touched only by the JDWP event layer.
   // debugSuspend is a per-thread suspend count; the VM-wide count
@@ -1630,10 +1647,25 @@ inline Aborter* getAborter(Thread* t)
   return t->m->system;
 }
 
+inline unsigned tlabCurrentWords(Thread* t)
+{
+  if (t->heap == 0 or t->heapTop < t->heap) {
+    return 0;
+  }
+  return static_cast<unsigned>(t->heapTop - t->heap);
+}
+
+inline bool tlabHasRoom(Thread* t, unsigned words)
+{
+  if (t->heapEnd < t->heapTop) {
+    return false;
+  }
+  return static_cast<uintptr_t>(t->heapEnd - t->heapTop) >= words;
+}
+
 inline bool ensure(Thread* t, unsigned sizeInBytes)
 {
-  if (t->heapIndex + ceilingDivide(sizeInBytes, BytesPerWord)
-      > ThreadHeapSizeInWords) {
+  if (not tlabHasRoom(t, ceilingDivide(sizeInBytes, BytesPerWord))) {
     if (sizeInBytes <= ThreadBackupHeapSizeInBytes) {
       expect(t, (t->getFlags() & Thread::UseBackupHeapFlag) == 0);
 
@@ -1657,12 +1689,14 @@ object allocate3(Thread* t,
 
 inline object allocateSmall(Thread* t, unsigned sizeInBytes)
 {
-  assertT(t,
-          t->heapIndex + ceilingDivide(sizeInBytes, BytesPerWord)
-          <= ThreadHeapSizeInWords);
+  unsigned words = ceilingDivide(sizeInBytes, BytesPerWord);
+  assertT(t, tlabHasRoom(t, words));
 
-  object o = reinterpret_cast<object>(t->heap + t->heapIndex);
-  t->heapIndex += ceilingDivide(sizeInBytes, BytesPerWord);
+  object o = reinterpret_cast<object>(t->heapTop);
+  t->heapTop += words;
+  // The eden slice is not pre-zeroed. This is the runtime alloc path;
+  // the inlined bump zeros, or skips the zero, itself.
+  memset(o, 0, words * BytesPerWord);
   return o;
 }
 
@@ -1670,8 +1704,8 @@ inline object allocate(Thread* t, unsigned sizeInBytes, bool objectMask)
 {
   stress(t);
 
-  if (UNLIKELY(t->heapIndex + ceilingDivide(sizeInBytes, BytesPerWord)
-               > ThreadHeapSizeInWords or t->m->exclusive)) {
+  if (UNLIKELY(not tlabHasRoom(t, ceilingDivide(sizeInBytes, BytesPerWord))
+               or t->m->exclusive)) {
     return allocate2(t, sizeInBytes, objectMask);
   } else {
     assertT(t, t->criticalLevel == 0);

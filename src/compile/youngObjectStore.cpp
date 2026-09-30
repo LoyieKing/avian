@@ -77,9 +77,11 @@ bool invokespecialHolesFree(MyThread* t, Context* context, unsigned origin)
 }
 
 // Thread chunks come from the C allocator, not from gen2 or a fixie, so
-// a pointer inside [heap, heap + 64KB) does not need a remembered-set
+// a pointer inside [heap, heapEnd) does not need a remembered-set
 // update. Null, tenured, and fixed objects fail the range test and take
 // setMaybeNull. One condJump: the instruction only has two spare bytes.
+// The end moves when the TLAB is resized, so this is a compare rather
+// than a constant shift.
 bool YoungObjectStore::tryCompile(MyThread* t,
                                   Frame* frame,
                                   unsigned callIp,
@@ -87,12 +89,6 @@ bool YoungObjectStore::tryCompile(MyThread* t,
                                   ir::Value* value,
                                   int offset)
 {
-  // 64KB chunk. The shift matches ThreadHeapSizeInBytes.
-  enum { ThreadChunkRangeShift = 16 };
-  expect(t,
-         (static_cast<unsigned>(1) << ThreadChunkRangeShift)
-             == ThreadHeapSizeInBytes);
-
   Context* context = frame->context;
   if (callIp != frame->ip or frame->subroutine) {
     return false;
@@ -116,27 +112,29 @@ bool YoungObjectStore::tryCompile(MyThread* t,
       ir::ExtendMode::Signed,
       c->memory(c->threadRegister(), ir::Type::iptr(), ThreadHeapOffset),
       ir::Type::iptr());
-  // subR is second minus first.
-  ir::Value* diff
+  ir::Value* end = c->load(
+      ir::ExtendMode::Signed,
+      c->memory(c->threadRegister(), ir::Type::iptr(), ThreadHeapEndOffset),
+      ir::Type::iptr());
+  // subR is second minus first. User pointers sit below 2^63, so the
+  // sign bit is the compare. self < heap, or self >= end, is outside.
+  // A null chunk has heap == end == 0, and end - self - 1 is negative.
+  ir::Value* selfMinusHeap
       = c->binaryOp(lir::Subtract, ir::Type::iptr(), heap, self);
-  ir::Value* high = c->binaryOp(
-      lir::UnsignedShiftRight,
-      ir::Type::iptr(),
-      c->constant(ThreadChunkRangeShift, ir::Type::iptr()),
-      diff);
-  // Bit 63 of (heap - 1) is set when heap is 0. A null heap and a
-  // null object would otherwise both produce a zero difference.
-  ir::Value* heapMinusOne = c->binaryOp(
-      lir::Subtract,
-      ir::Type::iptr(),
-      c->constant(1, ir::Type::iptr()),
-      heap);
-  ir::Value* heapZero = c->binaryOp(lir::UnsignedShiftRight,
-                                    ir::Type::iptr(),
-                                    c->constant(63, ir::Type::iptr()),
-                                    heapMinusOne);
+  ir::Value* below = c->binaryOp(lir::ShiftRight,
+                                 ir::Type::iptr(),
+                                 c->constant(63, ir::Type::iptr()),
+                                 selfMinusHeap);
+  ir::Value* endMinusSelf
+      = c->binaryOp(lir::Subtract, ir::Type::iptr(), self, end);
+  ir::Value* endMinusSelfMinusOne = c->binaryOp(
+      lir::Subtract, ir::Type::iptr(), c->constant(1, ir::Type::iptr()), endMinusSelf);
+  ir::Value* above = c->binaryOp(lir::ShiftRight,
+                                 ir::Type::iptr(),
+                                 c->constant(63, ir::Type::iptr()),
+                                 endMinusSelfMinusOne);
   ir::Value* outside
-      = c->binaryOp(lir::Or, ir::Type::iptr(), high, heapZero);
+      = c->binaryOp(lir::Or, ir::Type::iptr(), below, above);
   c->condJump(lir::JumpIfNotEqual,
               c->constant(0, ir::Type::iptr()),
               outside,
@@ -173,6 +171,14 @@ void YoungObjectStore::flush(MyThread* t, Context* context)
     c->restoreState(path->edge);
     c->startLogicalIp(path->slowIp);
 
+    // The fast path stored nothing yet. A fresh object is not pre-zeroed,
+    // so the field has to be a real reference before this call: GC maps
+    // the receiver at the call, before setMaybeNull runs. Null needs no
+    // remembered-set entry. The receiver is the constructor's this, which
+    // is not null, so the store itself does not fault. setMaybeNull then
+    // overwrites it and marks.
+    c->store(c->constant(0, ir::Type::object()),
+             c->memory(path->self, ir::Type::object(), path->offset));
     c->nativeCall(
         c->constant(getThunk(t, setMaybeNullThunk), ir::Type::iptr()),
         0,
