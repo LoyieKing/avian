@@ -27,9 +27,49 @@ public interface Collection<T> extends Iterable<T> {
 
   public boolean removeAll(Collection<?> c);
 
+  public default boolean retainAll(Collection<?> c) {
+    if (c == null) {
+      throw new NullPointerException();
+    }
+    boolean modified = false;
+    Iterator<T> it = iterator();
+    while (it.hasNext()) {
+      if (!c.contains(it.next())) {
+        it.remove();
+        modified = true;
+      }
+    }
+    return modified;
+  }
+
+  public default boolean removeIf(java.util.function.Predicate<? super T> filter) {
+    boolean removed = false;
+    Iterator<T> it = iterator();
+    while (it.hasNext()) {
+      if (filter.test(it.next())) {
+        it.remove();
+        removed = true;
+      }
+    }
+    return removed;
+  }
+
   public Object[] toArray();
 
   public <S> S[] toArray(S[] array);
 
   public void clear();
+
+  public default java.util.stream.Stream<T> stream() {
+    return java.util.stream.RefStream.fromCollection(this);
+  }
+
+  public default java.util.stream.Stream<T> parallelStream() {
+    return stream();
+  }
+
+  public default void forEach(java.util.function.Consumer<? super T> action) {
+    Iterator<T> it = iterator();
+    while (it.hasNext()) action.accept(it.next());
+  }
 }

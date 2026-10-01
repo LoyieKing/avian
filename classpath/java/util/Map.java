@@ -10,6 +10,9 @@
 
 package java.util;
 
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+
 public interface Map<K, V> {
   public boolean isEmpty();
 
@@ -39,11 +42,54 @@ public interface Map<K, V> {
 
   public int hashCode();
 
+  public default V getOrDefault(Object key, V defaultValue) {
+    V v = get(key);
+    return (v != null || containsKey(key)) ? v : defaultValue;
+  }
+
+  public default V computeIfAbsent(K key, Function<? super K, ? extends V> mapping) {
+    if (mapping == null) {
+      throw new NullPointerException();
+    }
+    V v = get(key);
+    if (v == null) {
+      V newValue = mapping.apply(key);
+      if (newValue != null) {
+        put(key, newValue);
+      }
+      return newValue;
+    }
+    return v;
+  }
+
+  public default boolean remove(Object key, Object value) {
+    Object cur = get(key);
+    if (!Objects.equals(cur, value) || (cur == null && !containsKey(key))) {
+      return false;
+    }
+    remove(key);
+    return true;
+  }
+
+  public default void forEach(BiConsumer<? super K, ? super V> action) {
+    for (Entry<K, V> entry : entrySet()) {
+      action.accept(entry.getKey(), entry.getValue());
+    }
+  }
+
   public interface Entry<K, V> {
     public K getKey();
 
     public V getValue();
 
     public V setValue(V value);
+
+    public static <K extends Comparable<? super K>, V> Comparator<Entry<K, V>> comparingByKey() {
+      return new Comparator<Entry<K, V>>() {
+        public int compare(Entry<K, V> a, Entry<K, V> b) {
+          return a.getKey().compareTo(b.getKey());
+        }
+      };
+    }
   }
 }

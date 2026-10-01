@@ -10,9 +10,12 @@
 
 package java.util;
 
-import java.lang.Error;
-
 public class ServiceConfigurationError extends Error {
-  public ServiceConfigurationError() { super(); }
-  public ServiceConfigurationError(String message) { super(message); }
+  public ServiceConfigurationError(String message) {
+    super(message);
+  }
+
+  public ServiceConfigurationError(String message, Throwable cause) {
+    super(message, cause);
+  }
 }

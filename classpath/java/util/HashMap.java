@@ -12,6 +12,8 @@ package java.util;
 
 import avian.Data;
 
+import java.util.function.BiConsumer;
+
 public class HashMap<K, V> implements Map<K, V> {
   private static final int MinimumCapacity = 16;
 
@@ -225,6 +227,10 @@ public class HashMap<K, V> implements Map<K, V> {
 
   public Collection<V> values() {
     return new Data.Values(new MyEntryMap());
+  }
+
+  public void forEach(BiConsumer<? super K, ? super V> action) {
+    for (Entry<K, V> entry : entrySet()) action.accept(entry.getKey(), entry.getValue());
   }
 
   Iterator<Entry<K, V>> iterator() {

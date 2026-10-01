@@ -11,4 +11,19 @@
 package java.util.stream;
 
 public interface IntStream {
+  int sum();
+}
+
+final class IntPipeline implements IntStream {
+  private final int[] data;
+
+  IntPipeline(int[] data) {
+    this.data = data;
+  }
+
+  public int sum() {
+    int sum = 0;
+    for (int i = 0; i < data.length; i++) sum += data[i];
+    return sum;
+  }
 }

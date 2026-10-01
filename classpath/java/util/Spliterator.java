@@ -10,5 +10,14 @@
 
 package java.util;
 
-public interface Spliterator {
+import java.util.function.Consumer;
+
+public interface Spliterator<T> {
+  boolean tryAdvance(Consumer<? super T> action);
+
+  Spliterator<T> trySplit();
+
+  long estimateSize();
+
+  int characteristics();
 }

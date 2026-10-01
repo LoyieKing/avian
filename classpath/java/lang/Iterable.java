@@ -14,4 +14,9 @@ import java.util.Iterator;
 
 public interface Iterable<T> {
   public Iterator<T> iterator();
+
+  public default void forEach(java.util.function.Consumer<? super T> action) {
+    Iterator<T> it = iterator();
+    while (it.hasNext()) action.accept(it.next());
+  }
 }

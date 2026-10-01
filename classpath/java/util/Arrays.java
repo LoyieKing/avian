@@ -431,6 +431,11 @@ public class Arrays {
     return true;
   }
 
+  public static <T> java.util.stream.Stream<T> stream(T[] array) {
+    if (array == null) throw new NullPointerException();
+    return java.util.stream.RefStream.fromCollection(asList(array));
+  }
+
   public static <T> List<T> asList(final T ... array) {
     return new AbstractList<T>() {
       @Override
@@ -712,4 +717,191 @@ public class Arrays {
     return -left - 1;
   }
 
+  public static boolean[] copyOfRange(boolean[] array, int from, int to) {
+    int length = rangeLength(array.length, from, to);
+    boolean[] result = new boolean[length];
+    System.arraycopy(array, from, result, 0, copyCount(array.length, from, length));
+    return result;
+  }
+
+  public static byte[] copyOfRange(byte[] array, int from, int to) {
+    int length = rangeLength(array.length, from, to);
+    byte[] result = new byte[length];
+    System.arraycopy(array, from, result, 0, copyCount(array.length, from, length));
+    return result;
+  }
+
+  public static char[] copyOfRange(char[] array, int from, int to) {
+    int length = rangeLength(array.length, from, to);
+    char[] result = new char[length];
+    System.arraycopy(array, from, result, 0, copyCount(array.length, from, length));
+    return result;
+  }
+
+  public static double[] copyOfRange(double[] array, int from, int to) {
+    int length = rangeLength(array.length, from, to);
+    double[] result = new double[length];
+    System.arraycopy(array, from, result, 0, copyCount(array.length, from, length));
+    return result;
+  }
+
+  public static float[] copyOfRange(float[] array, int from, int to) {
+    int length = rangeLength(array.length, from, to);
+    float[] result = new float[length];
+    System.arraycopy(array, from, result, 0, copyCount(array.length, from, length));
+    return result;
+  }
+
+  public static int[] copyOfRange(int[] array, int from, int to) {
+    int length = rangeLength(array.length, from, to);
+    int[] result = new int[length];
+    System.arraycopy(array, from, result, 0, copyCount(array.length, from, length));
+    return result;
+  }
+
+  public static long[] copyOfRange(long[] array, int from, int to) {
+    int length = rangeLength(array.length, from, to);
+    long[] result = new long[length];
+    System.arraycopy(array, from, result, 0, copyCount(array.length, from, length));
+    return result;
+  }
+
+  public static short[] copyOfRange(short[] array, int from, int to) {
+    int length = rangeLength(array.length, from, to);
+    short[] result = new short[length];
+    System.arraycopy(array, from, result, 0, copyCount(array.length, from, length));
+    return result;
+  }
+
+  public static <T> T[] copyOfRange(T[] array, int from, int to) {
+    return copyOfRange(array, from, to, (Class<T[]>) array.getClass());
+  }
+
+  public static <T, U> T[] copyOfRange(U[] array, int from, int to,
+                                       Class<? extends T[]> newType) {
+    int length = rangeLength(array.length, from, to);
+    T[] result = (T[]) Array.newInstance(newType.getComponentType(), length);
+    System.arraycopy(array, from, result, 0, copyCount(array.length, from, length));
+    return result;
+  }
+
+  private static int rangeLength(int original, int from, int to) {
+    if (from < 0 || from > original) {
+      throw new ArrayIndexOutOfBoundsException(from);
+    }
+    int length = to - from;
+    if (length < 0) {
+      throw new IllegalArgumentException(from + " > " + to);
+    }
+    return length;
+  }
+
+  private static int copyCount(int original, int from, int length) {
+    int available = original - from;
+    return available < length ? available : length;
+  }
+
+  public static int hashCode(byte[] array) {
+    return primitiveHash(array);
+  }
+
+  public static int hashCode(short[] array) {
+    return primitiveHash(array);
+  }
+
+  public static int hashCode(int[] array) {
+    if (array == null) return 0;
+    int result = 1;
+    for (int i = 0; i < array.length; ++i) {
+      result = 31 * result + array[i];
+    }
+    return result;
+  }
+
+  public static int hashCode(long[] array) {
+    if (array == null) return 0;
+    int result = 1;
+    for (int i = 0; i < array.length; ++i) {
+      long element = array[i];
+      int elementHash = (int) (element ^ (element >>> 32));
+      result = 31 * result + elementHash;
+    }
+    return result;
+  }
+
+  public static int hashCode(char[] array) {
+    if (array == null) return 0;
+    int result = 1;
+    for (int i = 0; i < array.length; ++i) {
+      result = 31 * result + (int) array[i];
+    }
+    return result;
+  }
+
+  public static int hashCode(boolean[] array) {
+    if (array == null) return 0;
+    int result = 1;
+    for (int i = 0; i < array.length; ++i) {
+      result = 31 * result + (array[i] ? 1231 : 1237);
+    }
+    return result;
+  }
+
+  public static int hashCode(float[] array) {
+    if (array == null) return 0;
+    int result = 1;
+    for (int i = 0; i < array.length; ++i) {
+      result = 31 * result + Float.floatToIntBits(array[i]);
+    }
+    return result;
+  }
+
+  public static int hashCode(double[] array) {
+    if (array == null) return 0;
+    int result = 1;
+    for (int i = 0; i < array.length; ++i) {
+      long bits = Double.doubleToLongBits(array[i]);
+      result = 31 * result + (int) (bits ^ (bits >>> 32));
+    }
+    return result;
+  }
+
+  private static int primitiveHash(byte[] array) {
+    if (array == null) return 0;
+    int result = 1;
+    for (int i = 0; i < array.length; ++i) {
+      result = 31 * result + array[i];
+    }
+    return result;
+  }
+
+  private static int primitiveHash(short[] array) {
+    if (array == null) return 0;
+    int result = 1;
+    for (int i = 0; i < array.length; ++i) {
+      result = 31 * result + array[i];
+    }
+    return result;
+  }
+
+  public static boolean equals(boolean[] a, boolean[] b) {
+    if (a == b) return true;
+    if (a == null || b == null || a.length != b.length) return false;
+    for (int i = 0; i < a.length; ++i) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  public static String toString(char[] a) {
+    if (a == null) return "null";
+    StringBuilder sb = new StringBuilder();
+    sb.append("[");
+    for (int i = 0; i < a.length; ++i) {
+      sb.append(String.valueOf(a[i]));
+      if (i + 1 != a.length) sb.append(", ");
+    }
+    sb.append("]");
+    return sb.toString();
+  }
 }
