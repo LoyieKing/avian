@@ -100,6 +100,7 @@ public class ZipFile {
 
     case Deflated:
       return new InflaterInputStream(in, new Inflater(true)) {
+        { nowrapEofPadding = true; }
         int remaining = uncompressedSize(window, pointer);
 
         public int read() throws IOException {

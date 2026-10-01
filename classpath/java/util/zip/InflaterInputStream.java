@@ -18,6 +18,11 @@ public class InflaterInputStream extends InputStream {
   private final InputStream in;
   private final Inflater inflater;
   private final byte[] buffer;
+  // Raw DEFLATE (nowrap) has no trailer. zlib reports it needs another
+  // input byte before it will return Z_STREAM_END. ZipFile sets this so a
+  // finished entry is not reported as a truncated stream.
+  boolean nowrapEofPadding;
+  private boolean eofPaddingFed;
 
   public InflaterInputStream(InputStream in, Inflater inflater, int bufferSize)
   {
@@ -50,6 +55,10 @@ public class InflaterInputStream extends InputStream {
         int count = in.read(buffer);
         if (count > 0) {
           inflater.setInput(buffer, 0, count);
+        } else if (nowrapEofPadding && !eofPaddingFed) {
+          eofPaddingFed = true;
+          buffer[0] = 0;
+          inflater.setInput(buffer, 0, 1);
         } else {
           throw new EOFException();
         }
