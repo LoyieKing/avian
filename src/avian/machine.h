@@ -1007,6 +1007,22 @@ class GcArray;
 class GcThrowable;
 class GcRoots;
 
+// One thread's JNI local handles, in the shape of a HotSpot JNIHandleBlock.
+// Slots are oops. A free slot holds a tagged pointer to the next free slot.
+// Blocks are reused by the thread; the heap lock is taken only when this
+// thread has never held enough blocks and the process-wide free list is empty.
+class LocalHandleBlock {
+ public:
+  static const int Slots = 32;
+
+  object slots[Slots];
+  int top;
+  LocalHandleBlock* next;
+  LocalHandleBlock* last;
+  object* freeList;
+  LocalHandleBlock* popLink;
+};
+
 class Machine {
  public:
   enum AllocationType {
@@ -1060,6 +1076,8 @@ class Machine {
   System::Monitor* heapLock;
   System::Monitor* classLock;
   System::Monitor* referenceLock;
+  System::Monitor* handleBlockLock;
+  LocalHandleBlock* handleBlockFree;
   System::Monitor* shutdownLock;
   System::Library* libraries;
   FILE* errorLog;

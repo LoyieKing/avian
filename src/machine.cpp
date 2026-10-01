@@ -3957,6 +3957,8 @@ Machine::Machine(System* system,
       heapLock(0),
       classLock(0),
       referenceLock(0),
+      handleBlockLock(0),
+      handleBlockFree(0),
       shutdownLock(0),
       libraries(0),
       errorLog(0),
@@ -4012,6 +4014,7 @@ Machine::Machine(System* system,
       or not system->success(system->make(&heapLock))
       or not system->success(system->make(&classLock))
       or not system->success(system->make(&referenceLock))
+      or not system->success(system->make(&handleBlockLock))
       or not system->success(system->make(&shutdownLock))
       or not system->success(system->load(&libraries, bootstrapPropertyDup))) {
     system->abort();
@@ -4040,6 +4043,12 @@ void Machine::dispose()
   heapLock->dispose();
   classLock->dispose();
   referenceLock->dispose();
+  handleBlockLock->dispose();
+  for (LocalHandleBlock* block = handleBlockFree; block;) {
+    LocalHandleBlock* next = block->next;
+    heap->free(block, sizeof(*block));
+    block = next;
+  }
   shutdownLock->dispose();
 
   if (libraries) {

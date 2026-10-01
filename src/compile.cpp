@@ -284,7 +284,9 @@ class MyThread : public Thread {
         stackLimit(0),
         referenceFrame(0),
         methodLockIsClean(true),
-        allocationResult(0)
+        allocationResult(0),
+        localHandles(0),
+        spareHandles(0)
   {
     arch->acquire();
   }
@@ -316,6 +318,9 @@ class MyThread : public Thread {
   // path store the object here; the continuation loads it. scratch holds
   // the vmInvoke native stack pointer for the whole Java call.
   uintptr_t allocationResult;
+  // After allocationResult so the checked MyThread offsets stay put.
+  LocalHandleBlock* localHandles;
+  LocalHandleBlock* spareHandles;
 };
 
 void transition(MyThread* t,
@@ -8350,6 +8355,181 @@ uint64_t linkDynamicMethod(MyThread* t)
   return reinterpret_cast<uintptr_t>(linkDynamicMethod2(t, index));
 }
 
+bool isTaggedHandle(object slot)
+{
+  return (reinterpret_cast<uintptr_t>(slot) & 1) != 0;
+}
+
+object tagHandle(object* next)
+{
+  return reinterpret_cast<object>(reinterpret_cast<uintptr_t>(next) | 1);
+}
+
+object* untagHandle(object slot)
+{
+  return reinterpret_cast<object*>(reinterpret_cast<uintptr_t>(slot)
+                                   & ~uintptr_t(1));
+}
+
+void resetHandleBlock(LocalHandleBlock* block)
+{
+  memset(block->slots, 0, sizeof(block->slots));
+  block->top = 0;
+  block->next = 0;
+  block->last = block;
+  block->freeList = 0;
+  block->popLink = 0;
+}
+
+LocalHandleBlock* claimHandleBlock(MyThread* t)
+{
+  if (t->spareHandles) {
+    LocalHandleBlock* block = t->spareHandles;
+    t->spareHandles = block->next;
+    resetHandleBlock(block);
+    return block;
+  }
+
+  LocalHandleBlock* block = 0;
+  {
+    // The caller is holding a raw oop. Stay in the current state so a
+    // moving collection cannot relocate it between the pop and the store.
+    ACQUIRE_RAW(t, t->m->handleBlockLock);
+    block = t->m->handleBlockFree;
+    if (block) {
+      t->m->handleBlockFree = block->next;
+    }
+  }
+  if (block == 0) {
+    block = static_cast<LocalHandleBlock*>(
+        t->m->heap->allocate(sizeof(LocalHandleBlock)));
+  }
+  resetHandleBlock(block);
+  return block;
+}
+
+void recycleHandleChain(MyThread* t, LocalHandleBlock* block)
+{
+  while (block) {
+    LocalHandleBlock* next = block->next;
+    block->next = t->spareHandles;
+    t->spareHandles = block;
+    block = next;
+  }
+}
+
+void freeHandleChain(MyThread* t, LocalHandleBlock* block)
+{
+  while (block) {
+    LocalHandleBlock* next = block->next;
+    t->m->heap->free(block, sizeof(*block));
+    block = next;
+  }
+}
+
+void releaseLocalHandles(MyThread* t)
+{
+  while (t->localHandles) {
+    LocalHandleBlock* frame = t->localHandles;
+    t->localHandles = frame->popLink;
+    frame->popLink = 0;
+    freeHandleChain(t, frame);
+  }
+  freeHandleChain(t, t->spareHandles);
+  t->spareHandles = 0;
+}
+
+void pushLocalHandles(MyThread* t)
+{
+  LocalHandleBlock* fresh = claimHandleBlock(t);
+  fresh->popLink = t->localHandles;
+  fresh->last = fresh;
+  t->localHandles = fresh;
+}
+
+void popLocalHandles(MyThread* t)
+{
+  LocalHandleBlock* frame = t->localHandles;
+  expect(t, frame);
+  t->localHandles = frame->popLink;
+  frame->popLink = 0;
+  recycleHandleChain(t, frame);
+}
+
+object* allocLocalHandle(MyThread* t, object o)
+{
+  if (t->localHandles == 0) {
+    t->localHandles = claimHandleBlock(t);
+  }
+  LocalHandleBlock* head = t->localHandles;
+  if (head->freeList) {
+    object* slot = head->freeList;
+    object* next = untagHandle(*slot);
+    *slot = o;
+    storeStoreMemoryBarrier();
+    head->freeList = next;
+    return slot;
+  }
+  LocalHandleBlock* last = head->last;
+  if (last->top == LocalHandleBlock::Slots) {
+    LocalHandleBlock* fresh = claimHandleBlock(t);
+    last->next = fresh;
+    storeStoreMemoryBarrier();
+    head->last = fresh;
+    last = fresh;
+  }
+  object* slot = &last->slots[last->top];
+  *slot = o;
+  storeStoreMemoryBarrier();
+  ++last->top;
+  return slot;
+}
+
+bool handleBlockContains(LocalHandleBlock* block, object* slot)
+{
+  return slot >= block->slots && slot < block->slots + LocalHandleBlock::Slots;
+}
+
+void deleteLocalHandle(MyThread* t, object* slot)
+{
+  if (slot == 0) {
+    return;
+  }
+  for (LocalHandleBlock* frame = t->localHandles; frame; frame = frame->popLink) {
+    for (LocalHandleBlock* block = frame;; block = block->next) {
+      expect(t, block);
+      if (handleBlockContains(block, slot)) {
+        *slot = tagHandle(frame->freeList);
+        storeStoreMemoryBarrier();
+        frame->freeList = slot;
+        return;
+      }
+      if (block == frame->last) {
+        break;
+      }
+    }
+  }
+  abort(t);
+}
+
+void visitLocalHandles(MyThread* t, Heap::Visitor* v)
+{
+  for (LocalHandleBlock* frame = t->localHandles; frame; frame = frame->popLink) {
+    for (LocalHandleBlock* block = frame;; block = block->next) {
+      expect(t, block);
+      for (int i = 0; i < block->top; ++i) {
+        object slot = block->slots[i];
+        if (slot != 0 && !isTaggedHandle(slot)) {
+          v->visit(&block->slots[i]);
+        }
+      }
+      if (block == frame->last) {
+        break;
+      }
+    }
+  }
+}
+
 uint64_t invokeNativeFast(MyThread* t, GcMethod* method, void* function)
 {
   FastNativeFunction f;
@@ -8448,7 +8628,7 @@ uint64_t invokeNativeSlow(MyThread* t, GcMethod* method, void* function)
     }
   }
 
-  Reference* reference = t->reference;
+  pushLocalHandles(t);
 
   {
     ENTER(t, Thread::IdleState);
@@ -8480,12 +8660,11 @@ uint64_t invokeNativeSlow(MyThread* t, GcMethod* method, void* function)
             method->name()->body().begin());
   }
 
+  GcThrowable* pending = 0;
   if (UNLIKELY(t->exception)) {
-    GcThrowable* exception = t->exception;
+    pending = t->exception;
     t->exception = 0;
-    vm::throw_(t, exception);
-  }
-
+  } else {
   switch (returnCode) {
   case ByteField:
   case BooleanField:
@@ -8522,9 +8701,11 @@ uint64_t invokeNativeSlow(MyThread* t, GcMethod* method, void* function)
   default:
     abort(t);
   }
+  }
 
-  while (t->reference != reference) {
-    dispose(t, t->reference);
+  popLocalHandles(t);
+  if (pending) {
+    vm::throw_(t, pending);
   }
 
   return result;
@@ -9816,9 +9997,7 @@ class MyProcessor : public Processor {
 
     v->visit(&(t->continuation));
 
-    for (Reference* r = t->reference; r; r = r->next) {
-      v->visit(&(r->target));
-    }
+    visitLocalHandles(t, v);
 
     visitStack(t, v);
   }
@@ -9839,22 +10018,7 @@ class MyProcessor : public Processor {
   virtual object* makeLocalReference(Thread* vmt, object o)
   {
     if (o) {
-      MyThread* t = static_cast<MyThread*>(vmt);
-
-      for (Reference* r = t->reference; r; r = r->next) {
-        if (r->target == o) {
-          acquire(t, r);
-
-          return &(r->target);
-        }
-      }
-
-      Reference* r = new (t->m->heap->allocate(sizeof(Reference)))
-          Reference(o, &(t->reference), false);
-
-      acquire(t, r);
-
-      return &(r->target);
+      return allocLocalHandle(static_cast<MyThread*>(vmt), o);
     } else {
       return 0;
     }
@@ -9862,32 +10026,18 @@ class MyProcessor : public Processor {
 
   virtual void disposeLocalReference(Thread* t, object* r)
   {
-    if (r) {
-      release(t, reinterpret_cast<Reference*>(r));
-    }
+    deleteLocalHandle(static_cast<MyThread*>(t), r);
   }
 
   virtual bool pushLocalFrame(Thread* vmt, unsigned)
   {
-    MyThread* t = static_cast<MyThread*>(vmt);
-
-    t->referenceFrame = new (t->m->heap->allocate(sizeof(List<Reference*>)))
-        List<Reference*>(t->reference, t->referenceFrame);
-
+    pushLocalHandles(static_cast<MyThread*>(vmt));
     return true;
   }
 
   virtual void popLocalFrame(Thread* vmt)
   {
-    MyThread* t = static_cast<MyThread*>(vmt);
-
-    List<Reference*>* f = t->referenceFrame;
-    t->referenceFrame = f->next;
-    while (t->reference != f->item) {
-      vm::dispose(t, t->reference);
-    }
-
-    t->m->heap->free(f, sizeof(List<Reference*>));
+    popLocalHandles(static_cast<MyThread*>(vmt));
   }
 
   virtual object invokeArray(Thread* t,
@@ -10039,9 +10189,7 @@ class MyProcessor : public Processor {
   {
     MyThread* t = static_cast<MyThread*>(vmt);
 
-    while (t->reference) {
-      vm::dispose(t, t->reference);
-    }
+    releaseLocalHandles(t);
 
     t->arch->release();
 
