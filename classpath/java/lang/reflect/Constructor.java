@@ -12,7 +12,8 @@ package java.lang.reflect;
 
 import java.lang.annotation.Annotation;
 
-public class Constructor<T> extends AccessibleObject implements Member {
+public class Constructor<T> extends AccessibleObject
+  implements Member, GenericDeclaration {
   private Method<T> method;
 
   public Constructor(Method<T> method) {
@@ -40,6 +41,14 @@ public class Constructor<T> extends AccessibleObject implements Member {
     return method.getParameterTypes();
   }
 
+  public TypeVariable<?>[] getTypeParameters() {
+    return method.getTypeParameters();
+  }
+
+  public Type[] getGenericParameterTypes() {
+    return method.getGenericParameterTypes();
+  }
+
   public int getModifiers() {
     return method.getModifiers();
   }
@@ -62,6 +71,10 @@ public class Constructor<T> extends AccessibleObject implements Member {
 
   public Annotation[] getDeclaredAnnotations() {
     return method.getDeclaredAnnotations();
+  }
+
+  public Annotation[][] getParameterAnnotations() {
+    return method.getParameterAnnotations();
   }
 
   private static native Object make(avian.VMClass c);

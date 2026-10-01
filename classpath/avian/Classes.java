@@ -543,6 +543,40 @@ public class Classes {
     return array;
   }
 
+  public static Annotation[][] getParameterAnnotations(VMMethod method) {
+    int count = method.parameterCount;
+    Annotation[][] result = new Annotation[count][];
+    for (int i = 0; i < count; ++i) {
+      result[i] = new Annotation[0];
+    }
+    MethodAddendum addendum = method.addendum;
+    if (addendum == null
+        || !(addendum.parameterAnnotationTable instanceof byte[])) {
+      return result;
+    }
+    try {
+      InputStream in = new ByteArrayInputStream
+        ((byte[]) addendum.parameterAnnotationTable);
+      int numParameters = read1(in);
+      for (int p = 0; p < numParameters; ++p) {
+        Object[] table = parseAnnotationTable
+          (method.class_.loader, addendum.pool, in);
+        if (p >= count) continue;
+        Annotation[] annotations = new Annotation[table.length];
+        for (int i = 0; i < table.length; ++i) {
+          annotations[i] = getAnnotation
+            (method.class_.loader, (Object[]) table[i]);
+        }
+        result[p] = annotations;
+      }
+      return result;
+    } catch (IOException e) {
+      AssertionError error = new AssertionError();
+      error.initCause(e);
+      throw error;
+    }
+  }
+
   public static Annotation getAnnotation(ClassLoader loader, Object[] a) {
     if (a[0] == null) {
       a[0] = Proxy.newProxyInstance

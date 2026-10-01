@@ -17,7 +17,7 @@ import avian.Classes;
 
 import java.lang.annotation.Annotation;
 
-public class Method<T> extends AccessibleObject implements Member {
+public class Method<T> extends AccessibleObject implements Member, GenericDeclaration {
   public final VMMethod vmMethod;
   private boolean accessible;
 
@@ -102,6 +102,37 @@ public class Method<T> extends AccessibleObject implements Member {
                                       Object ... arguments)
     throws InvocationTargetException, IllegalAccessException;
 
+  public TypeVariable<?>[] getTypeParameters() {
+    String signature = genericSignature();
+    if (signature == null) {
+      return new TypeVariable[0];
+    }
+    return SignatureParser.methodTypeParameters(getDeclaringClass(), signature);
+  }
+
+  public Type[] getGenericParameterTypes() {
+    String signature = genericSignature();
+    if (signature == null) {
+      return getParameterTypes();
+    }
+    return SignatureParser.genericParameterTypes(getDeclaringClass(), signature);
+  }
+
+  public Type getGenericReturnType() {
+    String signature = genericSignature();
+    if (signature == null) {
+      return getReturnType();
+    }
+    return SignatureParser.genericReturnType(getDeclaringClass(), signature);
+  }
+
+  private String genericSignature() {
+    if (vmMethod.addendum == null || vmMethod.addendum.signature == null) {
+      return null;
+    }
+    return Classes.toString((byte[]) vmMethod.addendum.signature);
+  }
+
   public Class getReturnType() {
     for (int i = 0; i < vmMethod.spec.length - 1; ++i) {
       if (vmMethod.spec[i] == ')') {
@@ -145,6 +176,10 @@ public class Method<T> extends AccessibleObject implements Member {
     return getAnnotations();
   }
 
+  public Annotation[][] getParameterAnnotations() {
+    return Classes.getParameterAnnotations(vmMethod);
+  }
+
   public boolean isVarArgs() {
     return (getModifiers() & ACC_VARARGS) != 0;
   }
@@ -155,7 +190,9 @@ public class Method<T> extends AccessibleObject implements Member {
 
   public Object getDefaultValue() {
     ClassLoader loader = getDeclaringClass().getClassLoader();
-    return Classes.getAnnotationDefaultValue(loader, vmMethod.addendum);
+    return AnnotationInvocationHandler.coerce
+      (Classes.getAnnotationDefaultValue(loader, vmMethod.addendum),
+       getReturnType());
   }
 
   public Class<?>[] getExceptionTypes() {

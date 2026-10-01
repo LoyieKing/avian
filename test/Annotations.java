@@ -7,6 +7,7 @@ import avian.testing.annotations.Test;
 import avian.testing.annotations.TestComplex;
 import avian.testing.annotations.TestEnum;
 import avian.testing.annotations.TestInteger;
+import avian.testing.annotations.TestInts;
 
 public class Annotations {
   private static void expect(boolean v) {
@@ -32,6 +33,22 @@ public class Annotations {
     expect(noAnno.getAnnotations().length == 0);
     testProxyDefaultValue();
     testComplexAnnotation();
+    testIntArray();
+    testParameterAnnotations();
+  }
+
+  public static void annotated(@Test("couscous") String name) {
+  }
+
+  private static void testParameterAnnotations() throws Exception {
+    java.lang.annotation.Annotation[][] present = Annotations.class
+      .getMethod("annotated", String.class).getParameterAnnotations();
+    expect(present.length == 1);
+    expect(present[0].length == 1);
+    expect("couscous".equals(((Test) present[0][0]).value()));
+    java.lang.annotation.Annotation[][] absent = Annotations.class
+      .getMethod("noAnnotation").getParameterAnnotations();
+    expect(absent.length == 0);
   }
 
   @Test("couscous")
@@ -39,6 +56,34 @@ public class Annotations {
   @TestInteger(42)
   public static void foo() {
     
+  }
+
+  @TestInts(value = { 2, 1, 0 }, names = { "kind" })
+  public static void ints() {
+  }
+
+  @TestInts(names = { "kind" })
+  public static void intsDefault() {
+  }
+
+  private static void testIntArray() throws Exception {
+    TestInts annotation = (TestInts) Annotations.class.getMethod("ints").getAnnotation(TestInts.class);
+    int[] value = annotation.value();
+    expect(value instanceof int[]);
+    expect(value.length == 3);
+    expect(value[0] == 2 && value[1] == 1 && value[2] == 0);
+    expect(annotation.names().length == 1);
+    expect("kind".equals(annotation.names()[0]));
+
+    TestInts defaults = (TestInts) Annotations.class.getMethod("intsDefault").getAnnotation(TestInts.class);
+    int[] fallback = defaults.value();
+    expect(fallback.length == 3);
+    expect(fallback[0] == 2 && fallback[1] == 1 && fallback[2] == 0);
+
+    int[] fromMethod = (int[]) TestInts.class.getMethod("value").getDefaultValue();
+    expect(fromMethod.length == 3);
+    expect(fromMethod[0] == 2 && fromMethod[1] == 1 && fromMethod[2] == 0);
+    expect(annotation.equals(Annotations.class.getMethod("ints").getAnnotation(TestInts.class)));
   }
   
   public static void noAnnotation() {
