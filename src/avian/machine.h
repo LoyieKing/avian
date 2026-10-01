@@ -1023,6 +1023,49 @@ class LocalHandleBlock {
   LocalHandleBlock* popLink;
 };
 
+// JNI global handles, in the shape of a HotSpot OopStorage. Each
+// NewGlobalRef owns one slot: there is no identity coalesce and no
+// refcount. allocate() holds allocationLock only long enough to claim a
+// free bit. release() updates the bitmask with a CAS and does not take
+// that lock; a block that becomes empty or stops being full is pushed
+// onto a deferred list for the next allocate to repair.
+//
+// A slot pointer is converted back to its block by alignment. HotSpot
+// walks section-sized candidates and SafeFetch-es the owner word. Avian
+// has no SafeFetch, so each block is aligned to its whole slot array and
+// the owner word is read only at that aligned address.
+class GlobalHandleStorage {
+ public:
+  static GlobalHandleStorage* make(System* system);
+  void dispose();
+  object* allocate(Thread* t);
+  void release(Thread* t, object* slot);
+  void visit(Heap::Visitor* v);
+  void clearFinalizable(Thread* t);
+  void postVisit(Thread* t, Heap::Visitor* v);
+
+ private:
+  explicit GlobalHandleStorage(System* system);
+  struct Block;
+  Block* blockForAllocation(Thread* t);
+  bool tryAddBlock(Thread* t);
+  bool reduceDeferred();
+  Block* blockFor(object* slot);
+  void unlink(Block* block);
+  void pushFront(Block* block);
+  void pushBack(Block* block);
+  bool onList(Block* block);
+  static void releaseEntries(Thread* t, Block* block, uintptr_t releasing,
+                              GlobalHandleStorage* owner);
+
+  System* system;
+  System::Monitor* allocationLock;
+  Block* allocationHead;
+  Block* allocationTail;
+  Block* allBlocks;
+  Block* volatile deferredUpdates;
+};
+
 class Machine {
  public:
   enum AllocationType {
@@ -1060,6 +1103,8 @@ class Machine {
   Thread* rootThread;
   Thread* exclusive;
   Thread* finalizeThread;
+  // Unused. Left in place so Machine::exclusive stays the tenth pointer.
+  // Global JNI refs are globalHandles and weakGlobalHandles, below.
   Reference* jniReferences;
   char** properties;
   unsigned propertyCount;
@@ -1107,6 +1152,9 @@ class Machine {
   unsigned tlabMaxWords;
   TlabAverage allocatingThreads;
   size_t bootimageSize;
+  // Appended so every earlier Machine offset, including exclusive, stays put.
+  GlobalHandleStorage* globalHandles;
+  GlobalHandleStorage* weakGlobalHandles;
 };
 
 void printTrace(Thread* t, GcThrowable* exception);

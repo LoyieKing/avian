@@ -723,12 +723,8 @@ void postVisit(Thread* t, Heap::Visitor* v)
     }
   }
 
-  for (Reference* r = m->jniReferences; r; r = r->next) {
-    if (r->weak
-        and isFinalizable(t,
-                          static_cast<object>(t->m->heap->follow(r->target)))) {
-      r->target = 0;
-    }
+  if (m->weakGlobalHandles) {
+    m->weakGlobalHandles->clearFinalizable(t);
   }
 
   GcFinalizer* firstNewTenuredFinalizer = 0;
@@ -865,14 +861,8 @@ void postVisit(Thread* t, Heap::Visitor* v)
     m->tenuredWeakReferences = firstNewTenuredWeakReference;
   }
 
-  for (Reference* r = m->jniReferences; r; r = r->next) {
-    if (r->weak) {
-      if (m->heap->status(r->target) == Heap::Unreachable) {
-        r->target = 0;
-      } else {
-        v->visit(&(r->target));
-      }
-    }
+  if (m->weakGlobalHandles) {
+    m->weakGlobalHandles->postVisit(t, v);
   }
 }
 
@@ -3920,6 +3910,344 @@ void updatePackageMap(Thread* t, GcClass* class_)
 
 namespace vm {
 
+namespace {
+
+inline unsigned trailingZeros(uintptr_t value)
+{
+#if TARGET_BYTES_PER_WORD == 8
+  return static_cast<unsigned>(__builtin_ctzll(value));
+#else
+  return static_cast<unsigned>(__builtin_ctz(static_cast<unsigned>(value)));
+#endif
+}
+
+inline uintptr_t loadMask(volatile uintptr_t* word)
+{
+  return __atomic_load_n(const_cast<uintptr_t*>(word), __ATOMIC_ACQUIRE);
+}
+
+inline bool fullMask(uintptr_t mask)
+{
+  return mask == ~uintptr_t(0);
+}
+
+}  // namespace
+
+struct GlobalHandleStorage::Block {
+  enum { Slots = BitsPerWord };
+
+  object data[Slots];
+  volatile uintptr_t allocatedBitmask;
+  intptr_t ownerAddress;
+  void* memory;
+  Block* allocationPrev;
+  Block* allocationNext;
+  Block* volatile deferredNext;
+  volatile uint32_t releaseRefcount;
+  Block* nextAll;
+};
+
+GlobalHandleStorage::GlobalHandleStorage(System* system)
+    : system(system),
+      allocationLock(0),
+      allocationHead(0),
+      allocationTail(0),
+      allBlocks(0),
+      deferredUpdates(0)
+{
+  static_assert((sizeof(Block::data) & (sizeof(Block::data) - 1)) == 0,
+                "slot array must be a power of two so a slot maps to its block");
+  if (not system->success(system->make(&allocationLock))) {
+    abort(system);
+  }
+}
+
+GlobalHandleStorage* GlobalHandleStorage::make(System* system)
+{
+  void* p = system->tryAllocate(sizeof(GlobalHandleStorage));
+  if (p == 0) {
+    abort(system);
+  }
+  return new (p) GlobalHandleStorage(system);
+}
+
+void GlobalHandleStorage::dispose()
+{
+  System* s = system;
+  allocationLock->dispose();
+  for (Block* block = allBlocks; block != 0;) {
+    Block* next = block->nextAll;
+    void* memory = block->memory;
+    s->free(memory);
+    block = next;
+  }
+  allBlocks = 0;
+  s->free(this);
+}
+
+bool GlobalHandleStorage::onList(Block* block)
+{
+  return block->allocationPrev != 0 or block->allocationNext != 0
+         or allocationHead == block;
+}
+
+void GlobalHandleStorage::unlink(Block* block)
+{
+  Block* prev = block->allocationPrev;
+  Block* next = block->allocationNext;
+  if (prev) {
+    prev->allocationNext = next;
+  } else {
+    allocationHead = next;
+  }
+  if (next) {
+    next->allocationPrev = prev;
+  } else {
+    allocationTail = prev;
+  }
+  block->allocationPrev = 0;
+  block->allocationNext = 0;
+}
+
+void GlobalHandleStorage::pushFront(Block* block)
+{
+  block->allocationPrev = 0;
+  block->allocationNext = allocationHead;
+  if (allocationHead) {
+    allocationHead->allocationPrev = block;
+  } else {
+    allocationTail = block;
+  }
+  allocationHead = block;
+}
+
+void GlobalHandleStorage::pushBack(Block* block)
+{
+  block->allocationNext = 0;
+  block->allocationPrev = allocationTail;
+  if (allocationTail) {
+    allocationTail->allocationNext = block;
+  } else {
+    allocationHead = block;
+  }
+  allocationTail = block;
+}
+
+bool GlobalHandleStorage::tryAddBlock(Thread* t)
+{
+  // malloc stays outside the lock, same as HotSpot try_add_block.
+  allocationLock->release(t->systemThread);
+
+  const uintptr_t align = sizeof(Block::data);
+  void* raw = system->tryAllocate(sizeof(Block) + static_cast<size_t>(align));
+  Block* block = 0;
+  if (raw != 0) {
+    uintptr_t rawAddr = reinterpret_cast<uintptr_t>(raw);
+    uintptr_t aligned = (rawAddr + align - 1) & ~(align - 1);
+    block = reinterpret_cast<Block*>(aligned);
+    memset(block, 0, sizeof(Block));
+    block->ownerAddress = reinterpret_cast<intptr_t>(this);
+    block->memory = raw;
+  }
+
+  allocationLock->acquire(t->systemThread);
+  if (block == 0) {
+    return false;
+  }
+  block->nextAll = allBlocks;
+  allBlocks = block;
+  pushBack(block);
+  return true;
+}
+
+bool GlobalHandleStorage::reduceDeferred()
+{
+  Block* block = deferredUpdates;
+  while (true) {
+    if (block == 0) {
+      return false;
+    }
+    Block* tail = block->deferredNext;
+    if (block == tail) {
+      tail = 0;
+    }
+    Block* fetched
+        = __sync_val_compare_and_swap(&deferredUpdates, block, tail);
+    if (fetched == block) {
+      break;
+    }
+    block = fetched;
+  }
+
+  // Bitmask reads must not move above this pop. A releaser may still be
+  // publishing the bitmask change that caused the deferred push.
+  block->deferredNext = 0;
+  storeLoadMemoryBarrier();
+
+  uintptr_t allocated = loadMask(&block->allocatedBitmask);
+  if (fullMask(allocated)) {
+    assertT(system, not onList(block));
+  } else if (onList(block)) {
+    if (allocated == 0) {
+      unlink(block);
+      pushBack(block);
+    }
+  } else if (allocated == 0) {
+    pushBack(block);
+  } else {
+    pushFront(block);
+  }
+  return true;
+}
+
+GlobalHandleStorage::Block* GlobalHandleStorage::blockForAllocation(Thread* t)
+{
+  while (true) {
+    if (allocationHead != 0) {
+      return allocationHead;
+    } else if (reduceDeferred()) {
+      // A deferred block may now sit on the allocation list.
+    } else if (tryAddBlock(t)) {
+      // New empty block is at the tail.
+    } else if (allocationHead != 0) {
+      // Another thread published a block while malloc ran.
+    } else if (not reduceDeferred()) {
+      return 0;
+    }
+  }
+}
+
+object* GlobalHandleStorage::allocate(Thread* t)
+{
+  allocationLock->acquire(t->systemThread);
+  Block* block = blockForAllocation(t);
+  expect(t, block != 0);
+
+  uintptr_t allocated = loadMask(&block->allocatedBitmask);
+  expect(t, not fullMask(allocated));
+  unsigned index = trailingZeros(~allocated);
+  uintptr_t bit = uintptr_t(1) << index;
+  // Release clears bits concurrently, so the update itself is atomic.
+  // Only this thread allocates from the block; the bit was clear.
+  __sync_fetch_and_add(&block->allocatedBitmask, bit);
+  if (fullMask(loadMask(&block->allocatedBitmask))) {
+    unlink(block);
+  }
+  object* slot = &block->data[index];
+  allocationLock->release(t->systemThread);
+  return slot;
+}
+
+GlobalHandleStorage::Block* GlobalHandleStorage::blockFor(object* slot)
+{
+  const uintptr_t align = sizeof(Block::data);
+  uintptr_t base = reinterpret_cast<uintptr_t>(slot) & ~(align - 1);
+  Block* candidate = reinterpret_cast<Block*>(base);
+  if (candidate->ownerAddress != reinterpret_cast<intptr_t>(this)) {
+    return 0;
+  }
+  if (slot < candidate->data or slot >= candidate->data + Block::Slots) {
+    return 0;
+  }
+  return candidate;
+}
+
+void GlobalHandleStorage::releaseEntries(Thread* t,
+                                         Block* block,
+                                         uintptr_t releasing,
+                                         GlobalHandleStorage* owner)
+{
+  // Paired with a future empty-block delete. Avian keeps empty blocks and
+  // reuses them; the count still brackets the bitmask update so that delete
+  // can be added without a lock on this path.
+  __sync_add_and_fetch(&block->releaseRefcount, 1);
+
+  uintptr_t old = loadMask(&block->allocatedBitmask);
+  while (true) {
+    expect(t, (old & releasing) == releasing);
+    uintptr_t newValue = old ^ releasing;
+    uintptr_t fetched = __sync_val_compare_and_swap(
+        &block->allocatedBitmask, old, newValue);
+    if (fetched == old) {
+      break;
+    }
+    old = fetched;
+  }
+
+  if ((releasing == old) or fullMask(old)) {
+    Block* empty = 0;
+    if (__sync_bool_compare_and_swap(&block->deferredNext, empty, block)) {
+      Block* head = owner->deferredUpdates;
+      while (true) {
+        block->deferredNext = (head == 0) ? block : head;
+        Block* fetched = __sync_val_compare_and_swap(
+            &owner->deferredUpdates, head, block);
+        if (fetched == head) {
+          break;
+        }
+        head = fetched;
+      }
+    }
+  }
+
+  __sync_sub_and_fetch(&block->releaseRefcount, 1);
+}
+
+void GlobalHandleStorage::release(Thread* t, object* slot)
+{
+  expect(t, slot != 0 and *slot == 0);
+  Block* block = blockFor(slot);
+  expect(t, block != 0);
+  unsigned index = static_cast<unsigned>(slot - block->data);
+  releaseEntries(t, block, uintptr_t(1) << index, this);
+}
+
+void GlobalHandleStorage::visit(Heap::Visitor* v)
+{
+  for (Block* block = allBlocks; block != 0; block = block->nextAll) {
+    uintptr_t mask = loadMask(&block->allocatedBitmask);
+    while (mask) {
+      unsigned index = trailingZeros(mask);
+      mask &= mask - 1;
+      v->visit(&block->data[index]);
+    }
+  }
+}
+
+void GlobalHandleStorage::clearFinalizable(Thread* t)
+{
+  for (Block* block = allBlocks; block != 0; block = block->nextAll) {
+    uintptr_t mask = loadMask(&block->allocatedBitmask);
+    while (mask) {
+      unsigned index = trailingZeros(mask);
+      mask &= mask - 1;
+      object target = block->data[index];
+      if (target != 0
+          and ::isFinalizable(
+              t, static_cast<object>(t->m->heap->follow(target)))) {
+        block->data[index] = 0;
+      }
+    }
+  }
+}
+
+void GlobalHandleStorage::postVisit(Thread* t, Heap::Visitor* v)
+{
+  for (Block* block = allBlocks; block != 0; block = block->nextAll) {
+    uintptr_t mask = loadMask(&block->allocatedBitmask);
+    while (mask) {
+      unsigned index = trailingZeros(mask);
+      mask &= mask - 1;
+      object* slot = &block->data[index];
+      if (t->m->heap->status(*slot) == Heap::Unreachable) {
+        *slot = 0;
+      } else {
+        v->visit(slot);
+      }
+    }
+  }
+}
+
 Machine::Machine(System* system,
                  Heap* heap,
                  Finder* bootFinder,
@@ -3981,7 +4309,9 @@ Machine::Machine(System* system,
       edenCapacity(0),
       tlabMinWords(0),
       tlabMaxWords(0),
-      allocatingThreads()
+      allocatingThreads(),
+      globalHandles(0),
+      weakGlobalHandles(0)
 {
   configureTlabs(this);
 
@@ -4019,6 +4349,9 @@ Machine::Machine(System* system,
       or not system->success(system->load(&libraries, bootstrapPropertyDup))) {
     system->abort();
   }
+
+  globalHandles = GlobalHandleStorage::make(system);
+  weakGlobalHandles = GlobalHandleStorage::make(system);
 
   System::Library* additionalLibrary = 0;
   while (codeLibraryNameEnd && codeLibraryNameEnd + 1 < bootstrapPropertyEnd) {
@@ -4059,6 +4392,15 @@ void Machine::dispose()
     Reference* tmp = r;
     r = r->next;
     heap->free(tmp, sizeof(*tmp));
+  }
+
+  if (globalHandles) {
+    globalHandles->dispose();
+    globalHandles = 0;
+  }
+  if (weakGlobalHandles) {
+    weakGlobalHandles->dispose();
+    weakGlobalHandles = 0;
   }
 
   freeEden(this);
@@ -5880,10 +6222,8 @@ void visitRoots(Machine* m, Heap::Visitor* v)
     ::visitRoots(t, v);
   }
 
-  for (Reference* r = m->jniReferences; r; r = r->next) {
-    if (not r->weak) {
-      v->visit(&(r->target));
-    }
+  if (m->globalHandles) {
+    m->globalHandles->visit(v);
   }
 
   debug::visit(v);

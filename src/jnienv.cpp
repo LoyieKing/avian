@@ -2261,26 +2261,17 @@ jobject JNICALL newGlobalRef(Thread* t, jobject o, bool weak)
 {
   ENTER(t, Thread::ActiveState);
 
-  ACQUIRE(t, t->m->referenceLock);
-
-  if (o) {
-    for (Reference* r = t->m->jniReferences; r; r = r->next) {
-      if (r->target == *o and r->weak == weak) {
-        acquire(t, r);
-
-        return &(r->target);
-      }
-    }
-
-    Reference* r = new (t->m->heap->allocate(sizeof(Reference)))
-        Reference(*o, &(t->m->jniReferences), weak);
-
-    acquire(t, r);
-
-    return &(r->target);
-  } else {
+  if (o == 0) {
     return 0;
   }
+
+  // One slot per call, same as HotSpot JNIHandles::make_global. The
+  // referent is published only after allocate() has dropped its lock.
+  GlobalHandleStorage* storage
+      = weak ? t->m->weakGlobalHandles : t->m->globalHandles;
+  object* slot = storage->allocate(t);
+  *slot = *o;
+  return slot;
 }
 
 jobject JNICALL NewGlobalRef(Thread* t, jobject o)
@@ -2292,10 +2283,10 @@ void JNICALL DeleteGlobalRef(Thread* t, jobject r)
 {
   ENTER(t, Thread::ActiveState);
 
-  ACQUIRE(t, t->m->referenceLock);
-
   if (r) {
-    release(t, reinterpret_cast<Reference*>(r));
+    object* slot = reinterpret_cast<object*>(r);
+    *slot = 0;
+    t->m->globalHandles->release(t, slot);
   }
 }
 
@@ -2306,7 +2297,13 @@ jobject JNICALL NewWeakGlobalRef(Thread* t, jobject o)
 
 void JNICALL DeleteWeakGlobalRef(Thread* t, jobject r)
 {
-  DeleteGlobalRef(t, r);
+  ENTER(t, Thread::ActiveState);
+
+  if (r) {
+    object* slot = reinterpret_cast<object*>(r);
+    *slot = 0;
+    t->m->weakGlobalHandles->release(t, slot);
+  }
 }
 
 jint JNICALL EnsureLocalCapacity(Thread*, jint)
