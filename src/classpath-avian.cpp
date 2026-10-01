@@ -640,6 +640,22 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
 }
 
 extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_sun_misc_Unsafe_allocateInstance(Thread* t,
+                                           object,
+                                           uintptr_t* arguments)
+{
+  object classObject = reinterpret_cast<object>(arguments[1]);
+  if (classObject == 0) {
+    throwNew(t, GcNullPointerException::Type);
+  }
+
+  GcClass* c = cast<GcJclass>(t, classObject)->vmClass();
+  PROTECT(t, c);
+  initClass(t, c);
+  return reinterpret_cast<int64_t>(make(t, c));
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
     Avian_avian_Atomic_compareAndSwapObject(Thread* t,
                                             object,
                                             uintptr_t* arguments)

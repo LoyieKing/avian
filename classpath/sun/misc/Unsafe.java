@@ -88,12 +88,60 @@ public final class Unsafe {
 
   public native void putLongVolatile(Object o, long offset, long x);
 
+  public byte getByte(Object o, long offset) {
+    return getByteVolatile(o, offset);
+  }
+
+  public void putByte(Object o, long offset, byte x) {
+    putByteVolatile(o, offset, x);
+  }
+
+  public short getShort(Object o, long offset) {
+    return getShortVolatile(o, offset);
+  }
+
+  public void putShort(Object o, long offset, short x) {
+    putShortVolatile(o, offset, x);
+  }
+
+  public char getChar(Object o, long offset) {
+    return getCharVolatile(o, offset);
+  }
+
+  public void putChar(Object o, long offset, char x) {
+    putCharVolatile(o, offset, x);
+  }
+
+  public int getInt(Object o, long offset) {
+    return getIntVolatile(o, offset);
+  }
+
+  public void putInt(Object o, long offset, int x) {
+    putIntVolatile(o, offset, x);
+  }
+
   public long getLong(Object o, long offset) {
     return getLongVolatile(o, offset);
   }
 
   public void putLong(Object o, long offset, long x) {
     putLongVolatile(o, offset, x);
+  }
+
+  public float getFloat(Object o, long offset) {
+    return getFloatVolatile(o, offset);
+  }
+
+  public void putFloat(Object o, long offset, float x) {
+    putFloatVolatile(o, offset, x);
+  }
+
+  public boolean getBoolean(Object o, long offset) {
+    return getBooleanVolatile(o, offset);
+  }
+
+  public void putBoolean(Object o, long offset, boolean x) {
+    putBooleanVolatile(o, offset, x);
   }
 
   public double getDouble(Object o, long offset) {
@@ -150,4 +198,6 @@ public final class Unsafe {
   }
 
   public native void throwException(Throwable t);
+
+  public native Object allocateInstance(Class<?> c) throws InstantiationException;
 }

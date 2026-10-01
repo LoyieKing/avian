@@ -157,6 +157,23 @@ public class UnsafeTest {
     expect(u.getDouble(data, doubleOffset) == 1.23456789012345D);
   }
 
+  private static final class Unconstructed {
+    public int value = 7;
+
+    public Unconstructed() {
+      throw new RuntimeException("constructor");
+    }
+  }
+
+  private static void unsafeAllocate(Unsafe u) throws Exception {
+    expect(Unsafe.class.getMethod("allocateInstance", Class.class) != null);
+    Unconstructed instance
+      = (Unconstructed) u.allocateInstance(Unconstructed.class);
+    expect(instance.value == 0);
+    instance.value = 3;
+    expect(instance.value == 3);
+  }
+
   public static void main(String[] args) throws Exception {
     System.out.println("method count is "
                        + Unsafe.class.getDeclaredMethods().length);
@@ -167,5 +184,6 @@ public class UnsafeTest {
     unsafeMemory(u);
     unsafeArray(u);
     unsafeObject(u);
+    unsafeAllocate(u);
   }
 }
