@@ -515,6 +515,11 @@ class Compiler implements PikeVMOpcodes {
       case '$':
         current.push(LINE_END);
         continue;
+      case ']':
+      case '}':
+        // Outside a character class or a {n,m} quantifier these are literals.
+        current.push(c);
+        continue;
       default:
         throw new RuntimeException("Parse error @" + index + ": " + regex);
       }

@@ -1,3 +1,4 @@
+import java.util.regex.MatchResult;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -55,6 +56,15 @@ public class Regex {
   }
 
   public static void main(String[] args) {
+    Matcher found = getMatcher("a(\\w+)", "abc");
+    expect(found.find());
+    MatchResult result = (MatchResult) found;
+    expect(result.groupCount() == 1);
+    expect("abc".equals(result.group()));
+    expect("bc".equals(result.group(1)));
+    expect(result.start() == 0 && result.end() == 3);
+    expect(result.start(1) == 1 && result.end(1) == 3);
+
     expectMatch("a(bb)?a", "abba");
     expectNoMatch("a(bb)?a", "abbba");
     expectNoMatch("a(bb)?a", "abbaa");
@@ -98,5 +108,16 @@ public class Regex {
     expectGroups("a??(a{3}?)", "aaaa", "aaa");
     expectNoMatch("a(a{3}?)", "aaaaa");
     expectMatch("a(a{3,}?)", "aaaaa");
+    expectMatch("a]b", "a]b");
+    expectMatch("a}b", "a}b");
+    String classOf =
+      "^(((?![0-9])\\w+\\.)*((?![0-9])\\w+\\$)?(?![0-9])\\w+)((\\[\\])*)$";
+    expectGroups(classOf, "java.lang.String",
+      "java.lang.String", "lang.", null, "", null);
+    expectGroups(classOf, "String[]",
+      "String", null, null, "[]", "[]");
+    expectGroups(classOf, "com.foo.Bar$Inner[][]",
+      "com.foo.Bar$Inner", "foo.", "Bar$", "[][]", "[]");
+    expectNoMatch(classOf, "1Foo");
   }
 }

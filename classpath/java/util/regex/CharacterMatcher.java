@@ -256,25 +256,37 @@ class CharacterMatcher {
 
       int previous = -1;
       boolean firstCharacter = true;
+      boolean afterRange = false;
       for (;;) {
         if (offset >= description.length) {
           unsupported("short regex");
         }
         char c = description[offset++];
-        if (c == '-' && !firstCharacter && description[offset] != ']') {
-          if (previous < 0) {
-            unsupported("invalid range");
-          }
-          int rangeEnd = description[offset];
-          if ('\\' == rangeEnd) {
-            rangeEnd = parseEscapedCharacter();
-            if (rangeEnd < 0) {
+        if (c == '-' && !firstCharacter && offset < description.length && description[offset] != ']') {
+          // A hyphen immediately after a range is a literal, as in [a-c-e].
+          if (afterRange || previous < 0) {
+            previous = '-';
+            matcher.setMatch(previous);
+            afterRange = false;
+          } else {
+            int rangeEnd = description[offset];
+            if ('\\' == rangeEnd) {
+              rangeEnd = parseEscapedCharacter();
+              if (rangeEnd < 0) {
+                unsupported("invalid range");
+              }
+            } else {
+              ++ offset;
+            }
+            if (rangeEnd < previous) {
               unsupported("invalid range");
             }
-          }
-          matcher.ensureCapacity(rangeEnd + 1);
-          for (int j = previous + 1; j <= rangeEnd; j++) {
-            matcher.map[j] = true;
+            matcher.ensureCapacity(rangeEnd + 1);
+            for (int j = previous + 1; j <= rangeEnd; j++) {
+              matcher.map[j] = true;
+            }
+            previous = rangeEnd;
+            afterRange = true;
           }
         } else if (c == '\\') {
           int saved = offset;
@@ -289,6 +301,7 @@ class CharacterMatcher {
           } else {
             matcher.setMatch(previous);
           }
+          afterRange = false;
         } else if (c == '[') {
           Parser parser = new Parser(description);
           CharacterMatcher other = parser.parseClass(offset - 1);
@@ -298,6 +311,7 @@ class CharacterMatcher {
           matcher.merge(other);
           offset = parser.getEndOffset();
           previous = -1;
+          afterRange = false;
         } else if (c == '&') {
           if (offset + 2 > description.length || description[offset] != '&'
               || description[offset + 1] != '[') {
@@ -311,11 +325,13 @@ class CharacterMatcher {
           matcher.intersect(other);
           offset = parser.getEndOffset();
           previous = -1;
+          afterRange = false;
         } else if (c == ']') {
           break;
         } else {
           previous = c;
           matcher.setMatch(previous);
+          afterRange = false;
         }
         firstCharacter = false;
       }

@@ -15,7 +15,7 @@ package java.util.regex;
  * 
  * @author zsombor and others
  */
-public abstract class Matcher {
+public abstract class Matcher implements MatchResult {
   protected CharSequence input;
   protected int start;
   protected int end;
