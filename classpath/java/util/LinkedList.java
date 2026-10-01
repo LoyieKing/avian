@@ -412,12 +412,22 @@ public class LinkedList<T> extends AbstractSequentialList<T> implements Deque<T>
   private class MyIterator implements ListIterator<T> {
     private Cell<T> toRemove;
     private Cell<T> current;
+    private int nextIndex;
+
+    public int nextIndex() {
+      return nextIndex;
+    }
+
+    public int previousIndex() {
+      return nextIndex - 1;
+    }
 
     public T previous() {
       if (hasPrevious()) {
         T v = current.value;
         toRemove = current;
         current = current.prev;
+        nextIndex--;
         return v;
       } else {
         throw new NoSuchElementException();
@@ -432,6 +442,7 @@ public class LinkedList<T> extends AbstractSequentialList<T> implements Deque<T>
           current = current.next;
         }
         toRemove = current;
+        nextIndex++;
         return current.value;
       } else {
         throw new NoSuchElementException();
@@ -455,9 +466,23 @@ public class LinkedList<T> extends AbstractSequentialList<T> implements Deque<T>
         current = toRemove.prev;
         LinkedList.this.remove(toRemove);
         toRemove = null;
+        nextIndex--;
       } else {
         throw new IllegalStateException();
       }
+    }
+
+    public void set(T value) {
+      if (toRemove == null) {
+        throw new IllegalStateException();
+      }
+      toRemove.value = value;
+    }
+
+    public void add(T value) {
+      LinkedList.this.add(nextIndex, value);
+      nextIndex++;
+      toRemove = null;
     }
   }
 }

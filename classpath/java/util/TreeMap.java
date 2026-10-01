@@ -38,7 +38,17 @@ public class TreeMap<K,V> implements NavigableMap<K,V> {
   }
 
   public TreeMap() {
-    this(null);
+    this((Comparator<K>) null);
+  }
+
+  public TreeMap(Map<? extends K, ? extends V> map) {
+    this();
+    putAll(map);
+  }
+
+  public TreeMap(SortedMap<K, ? extends V> map) {
+    this((Comparator<K>) map.comparator());
+    putAll(map);
   }
 
   public String toString() {

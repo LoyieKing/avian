@@ -415,6 +415,12 @@ public class Collections {
       // as described in the javadocs, user should be synchronized on list before calling
       return list.listIterator();
     }
+
+    public List<T> subList(int fromIndex, int toIndex) {
+      synchronized (lock) {
+        return new SynchronizedList<T>(list.subList(fromIndex, toIndex));
+      }
+    }
   }
   
   static class RandomAccessSynchronizedList<T>
@@ -499,6 +505,14 @@ public class Collections {
       return index + 1 < list.size();
     }
 
+    public int nextIndex() {
+      return index + 1;
+    }
+
+    public int previousIndex() {
+      return index;
+    }
+
     public void remove() {
       if (toRemove != -1) {
         list.remove(toRemove);
@@ -507,6 +521,20 @@ public class Collections {
       } else {
         throw new IllegalStateException();
       }
+    }
+
+    public void set(T value) {
+      if (toRemove == -1) {
+        throw new IllegalStateException();
+      }
+      list.set(toRemove, value);
+    }
+
+    public void add(T value) {
+      int insert = index + 1;
+      list.add(insert, value);
+      index = insert;
+      toRemove = -1;
     }
   }
 
@@ -604,6 +632,21 @@ public class Collections {
 
     public boolean containsAll(Collection<?> c) {
       return inner.containsAll(c);
+    }
+
+    public List<T> subList(int fromIndex, int toIndex) {
+      return new UnmodifiableList<T>(inner.subList(fromIndex, toIndex));
+    }
+
+    public boolean equals(Object o) {
+      if (o == this) {
+        return true;
+      }
+      return inner.equals(o);
+    }
+
+    public int hashCode() {
+      return inner.hashCode();
     }
   }
 
@@ -710,6 +753,22 @@ public class Collections {
     public T previous() {
       return innerListIterator.previous();
     }
+
+    public int nextIndex() {
+      return innerListIterator.nextIndex();
+    }
+
+    public int previousIndex() {
+      return innerListIterator.previousIndex();
+    }
+
+    public void set(T value) {
+      throw new UnsupportedOperationException();
+    }
+
+    public void add(T value) {
+      throw new UnsupportedOperationException();
+    }
   }
   
   static class UnmodifiableCollection<T> implements Collection<T> {
@@ -780,7 +839,7 @@ public class Collections {
     }
   }
   
-  public static <T> UnmodifiableCollection<T> unmodifiableCollection(Collection<T> collection) {
+  public static <T> Collection<T> unmodifiableCollection(Collection<T> collection) {
     return new UnmodifiableCollection<T>(collection);
   }
 
@@ -812,5 +871,122 @@ public class Collections {
     ArrayList<T> list = new ArrayList<T>(1);
     list.add(o);
     return new UnmodifiableList(list);
+  }
+
+  public static <T> Set<T> singleton(T o) {
+    return new SingletonSet<T>(o);
+  }
+
+  public static <K, V> Map<K, V> singletonMap(K key, V value) {
+    HashMap<K, V> map = new HashMap<K, V>(1);
+    map.put(key, value);
+    return new UnmodifiableMap<K, V>(map);
+  }
+
+  public static <T> boolean addAll(Collection<? super T> c, T... elements) {
+    boolean changed = false;
+    for (int i = 0; i < elements.length; ++i) {
+      changed |= c.add(elements[i]);
+    }
+    return changed;
+  }
+
+  public static <T> void fill(List<? super T> list, T obj) {
+    int size = list.size();
+    for (int i = 0; i < size; ++i) {
+      list.set(i, obj);
+    }
+  }
+
+  public static <T> ArrayList<T> list(Enumeration<T> e) {
+    ArrayList<T> result = new ArrayList<T>();
+    while (e.hasMoreElements()) {
+      result.add(e.nextElement());
+    }
+    return result;
+  }
+
+  private static final class SingletonSet<T> extends AbstractSet<T> {
+    private final T element;
+
+    SingletonSet(T element) {
+      this.element = element;
+    }
+
+    public int size() {
+      return 1;
+    }
+
+    public Iterator<T> iterator() {
+      return new SingletonIterator<T>(element);
+    }
+  }
+
+  private static final class SingletonIterator<T> implements Iterator<T> {
+    private final T element;
+    private boolean done;
+
+    SingletonIterator(T element) {
+      this.element = element;
+    }
+
+    public boolean hasNext() {
+      return !done;
+    }
+
+    public T next() {
+      if (done) {
+        throw new NoSuchElementException();
+      }
+      done = true;
+      return element;
+    }
+
+    public void remove() {
+      throw new UnsupportedOperationException();
+    }
+  }
+
+  public static <E> Set<E> newSetFromMap(Map<E, Boolean> map) {
+    if (!map.isEmpty()) {
+      throw new IllegalArgumentException("Map is non-empty");
+    }
+    return new SetFromMap<E>(map);
+  }
+
+  private static final class SetFromMap<E> extends AbstractSet<E> {
+    private final Map<E, Boolean> map;
+
+    SetFromMap(Map<E, Boolean> map) {
+      this.map = map;
+    }
+
+    public int size() {
+      return map.size();
+    }
+
+    public boolean isEmpty() {
+      return map.isEmpty();
+    }
+
+    public boolean contains(Object o) {
+      return map.containsKey(o);
+    }
+
+    public boolean add(E e) {
+      return map.put(e, Boolean.TRUE) == null;
+    }
+
+    public boolean remove(Object o) {
+      return map.remove(o) != null;
+    }
+
+    public void clear() {
+      map.clear();
+    }
+
+    public Iterator<E> iterator() {
+      return map.keySet().iterator();
+    }
   }
 }

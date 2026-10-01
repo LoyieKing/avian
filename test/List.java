@@ -189,5 +189,38 @@ public class List {
     testIterators2(new LinkedList());
     testGrow();
     testRemove();
+    testEquals();
+  }
+
+  private static void testEquals() {
+    ArrayList<String> a = new ArrayList<String>();
+    a.add("x");
+    ArrayList<String> b = new ArrayList<String>();
+    b.add("x");
+    expect(a.equals(b));
+    expect(b.equals(a));
+    expect(a.hashCode() == b.hashCode());
+
+    ArrayList<String> c = new ArrayList<String>();
+    c.add("y");
+    expect(!a.equals(c));
+    expect(!a.equals("x"));
+    expect(!a.equals(null));
+
+    java.util.List<String> one = java.util.Collections.singletonList("x");
+    java.util.List<String> two = java.util.Collections.singletonList("x");
+    expect(one.equals(two));
+    expect(one.equals(a));
+    expect(a.equals(one));
+    expect(one.hashCode() == a.hashCode());
+
+    java.util.List<String> empty = new ArrayList<String>();
+    expect(java.util.Collections.emptyList().equals(empty));
+    expect(empty.equals(java.util.Collections.emptyList()));
+
+    ArrayList<String> withNull = new ArrayList<String>();
+    withNull.add(null);
+    expect(withNull.equals(java.util.Collections.singletonList(null)));
+    expect(withNull.hashCode() == java.util.Collections.singletonList(null).hashCode());
   }
 }

@@ -13,23 +13,26 @@ package java.util;
 import avian.PersistentSet;
 import avian.Cell;
 
-public class TreeSet<T> extends AbstractSet<T> implements Collection<T> {
+public class TreeSet<T> extends AbstractSet<T> implements SortedSet<T> {
   private PersistentSet<Cell<T>> set;
+  private final Comparator<? super T> comparator;
 
   public TreeSet(final Comparator<T> comparator) {
+    this.comparator = comparator;
+    final Comparator<T> order = comparator != null ? comparator : new Comparator<T>() {
+      public int compare(T a, T b) {
+        return ((Comparable) a).compareTo(b);
+      }
+    };
     set = new PersistentSet(new Comparator<Cell<T>>() {
       public int compare(Cell<T> a, Cell<T> b) {
-        return comparator.compare(a.value, b.value);
+        return order.compare(a.value, b.value);
       }
     });
   }
 
   public TreeSet() {
-    this(new Comparator<T>() {
-        public int compare(T a, T b) {
-          return ((Comparable) a).compareTo(b);
-        }
-    });
+    this((Comparator<T>) null);
   }
 
   public TreeSet(Collection<? extends T> collection) {
@@ -50,6 +53,22 @@ public class TreeSet<T> extends AbstractSet<T> implements Collection<T> {
     if (isEmpty()) throw new NoSuchElementException();
 
     return set.last().value().value;
+  }
+
+  public Comparator<? super T> comparator() {
+    return comparator;
+  }
+
+  public SortedSet<T> headSet(T toElement) {
+    throw new UnsupportedOperationException();
+  }
+
+  public SortedSet<T> subSet(T fromElement, T toElement) {
+    throw new UnsupportedOperationException();
+  }
+
+  public SortedSet<T> tailSet(T fromElement) {
+    throw new UnsupportedOperationException();
   }
   
   public Iterator<T> iterator() {

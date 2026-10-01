@@ -47,14 +47,24 @@ public class ArrayDeque<T> extends AbstractDeque<T>
   }
   
   private void ensureCapacity(int newSize) {
-    if (dataArray.length < newSize) {
-      Object[] newArray = new Object[dataArray.length * 2];
-      copyInto(newArray);
-      
-      dataArray = newArray;
-      startIndex = 0;
-      endIndex = size - 1;
+    if (dataArray.length >= newSize) {
+      return;
     }
+    int cap = dataArray.length < 16 ? 16 : dataArray.length;
+    while (cap < newSize) {
+      if (cap > Integer.MAX_VALUE / 2) {
+        cap = Integer.MAX_VALUE;
+        break;
+      }
+      cap *= 2;
+    }
+    Object[] newArray = new Object[cap];
+    if (size > 0) {
+      copyInto(newArray);
+    }
+    dataArray = newArray;
+    startIndex = 0;
+    endIndex = size == 0 ? 0 : size - 1;
   }
 
   @Override

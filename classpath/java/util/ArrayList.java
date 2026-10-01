@@ -73,6 +73,12 @@ public class ArrayList<T> extends AbstractList<T> implements java.io.Serializabl
     grow(capacity);
   }
 
+  public void trimToSize() {
+    if (array != null && array.length != size) {
+      resize(size);
+    }
+  }
+
   public boolean contains(Object element) {
     for (int i = 0; i < size; ++i) {
       if (equal(element, array[i])) {
@@ -91,7 +97,12 @@ public class ArrayList<T> extends AbstractList<T> implements java.io.Serializabl
   }
 
   public boolean add(T element) {
-    add(size, element);
+    // Append directly. add(int, T) is overridable, and subclasses such as
+    // dom4j BackedList.addLocal call super.add(T) expecting storage-only.
+    int index = size;
+    grow(index + 1);
+    size = index + 1;
+    array[index] = element;
     return true;
   }
 
@@ -138,29 +149,29 @@ public class ArrayList<T> extends AbstractList<T> implements java.io.Serializabl
 
   public T remove(int index) {
     T v = get(index);
-
-    int newSize = size - 1;
-
-    if (index == newSize) {
-      array[index] = null;
-    } else {
-      System.arraycopy(array, index + 1, array, index, newSize - index);
-    }
-
-    shrink(newSize);
-    size = newSize;
-
+    removeAt(index);
     return v;
   }
 
   public boolean remove(Object element) {
     for (int i = 0; i < size; ++i) {
       if (equal(element, array[i])) {
-        remove(i);
+        removeAt(i);
         return true;
       }
     }
     return false;
+  }
+
+  private void removeAt(int index) {
+    int newSize = size - 1;
+    if (index == newSize) {
+      array[index] = null;
+    } else {
+      System.arraycopy(array, index + 1, array, index, newSize - index);
+    }
+    shrink(newSize);
+    size = newSize;
   }
 
   public boolean isEmpty() {

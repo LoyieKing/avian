@@ -32,4 +32,20 @@ public interface List<T> extends Collection<T> {
   public ListIterator<T> listIterator(int index);
 
   public ListIterator<T> listIterator();
+
+  public List<T> subList(int fromIndex, int toIndex);
+
+  public default void sort(Comparator<? super T> c) {
+    Object[] a = toArray();
+    if (c == null) {
+      Arrays.sort(a);
+    } else {
+      Arrays.sort(a, (Comparator) c);
+    }
+    ListIterator<T> it = listIterator();
+    for (int i = 0; i < a.length; ++i) {
+      it.next();
+      it.set((T) a[i]);
+    }
+  }
 }

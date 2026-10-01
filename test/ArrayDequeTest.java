@@ -31,6 +31,19 @@ public class ArrayDequeTest {
     DequeHelper.removeFirstTest(new ArrayDeque<Object>());
     DequeHelper.removeLastTest(new ArrayDeque<Object>());
     
+    ArrayDeque<Object> emptyCap = new ArrayDeque<Object>(0);
+    emptyCap.add("a");
+    verify(emptyCap.size() == 1);
+    verify("a".equals(emptyCap.peek()));
+    ArrayDeque<Object> fromEmpty = new ArrayDeque<Object>(new LinkedList<Object>());
+    LinkedList<Object> more = new LinkedList<Object>();
+    more.add("b");
+    more.add("c");
+    fromEmpty.addAll(more);
+    verify(fromEmpty.size() == 2);
+    verify("b".equals(fromEmpty.poll()));
+    verify("c".equals(fromEmpty.poll()));
+
     iterateTest(false);
     iterateTest(true);
     iteratorRemoveTest(false);

@@ -80,6 +80,14 @@ public final class Objects {
       return value;
   }
 
+  public static boolean isNull(Object obj) {
+    return obj == null;
+  }
+
+  public static boolean nonNull(Object obj) {
+    return obj != null;
+  }
+
   public static String toString(final Object value) {
     return String.valueOf(value);
   }

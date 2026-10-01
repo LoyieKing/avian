@@ -13,4 +13,8 @@ package java.util;
 public interface ListIterator<E> extends Iterator<E> {
   public boolean hasPrevious();
   public E previous();
+  public int nextIndex();
+  public int previousIndex();
+  public void set(E value);
+  public void add(E value);
 }
