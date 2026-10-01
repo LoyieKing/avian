@@ -14,6 +14,8 @@
 #include <avian/system/system.h>
 #include <avian/util/allocator.h>
 
+#include <stdint.h>
+
 namespace vm {
 
 // an object must survive TenureThreshold + 2 garbage collections
@@ -60,8 +62,8 @@ class Heap : public avian::util::Allocator {
 
   virtual void setClient(Client* client) = 0;
   virtual void setImmortalHeap(uintptr_t* start, unsigned sizeInWords) = 0;
-  virtual unsigned remaining() = 0;
-  virtual unsigned limit() = 0;
+  virtual uint64_t remaining() = 0;
+  virtual uint64_t limit() = 0;
   virtual bool limitExceeded(int pendingAllocation = 0) = 0;
   virtual void collect(CollectionType type,
                        unsigned footprint,
@@ -86,7 +88,7 @@ class Heap : public avian::util::Allocator {
   virtual void dispose() = 0;
 };
 
-Heap* makeHeap(System* system, unsigned limit);
+Heap* makeHeap(System* system, uint64_t limit);
 
 }  // namespace vm
 

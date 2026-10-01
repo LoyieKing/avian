@@ -87,18 +87,25 @@ struct TlabSize {
     return refills;
   }
 
-  static unsigned edenCapacity(unsigned heapLimit)
+  // Machine::edenCapacity is a 32-bit byte count. Heaps above 12GB
+  // saturate the young budget instead of truncating the heap limit.
+  static unsigned edenCapacity(uint64_t heapLimit)
   {
-    unsigned third = heapLimit / TlabEdenDivisor;
-    unsigned half = heapLimit / 2;
-    unsigned floorBytes = TlabEdenFloorBytes;
+    uint64_t third = heapLimit / TlabEdenDivisor;
+    uint64_t half = heapLimit / 2;
+    uint64_t floorBytes = TlabEdenFloorBytes;
     if (floorBytes > half) {
       floorBytes = half;
     }
-    if (third > floorBytes) {
-      return third;
+    uint64_t result = floorBytes;
+    if (third > result) {
+      result = third;
     }
-    return floorBytes;
+    const uint64_t maxEden = 0xffffffffu;
+    if (result > maxEden) {
+      result = maxEden;
+    }
+    return static_cast<unsigned>(result);
   }
 
   static unsigned minWords(unsigned edenBytes)

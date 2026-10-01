@@ -412,7 +412,7 @@ class Segment {
 
       while (data == 0) {
         data = static_cast<uintptr_t*>(local::allocate(
-            context, (footprint(capacity_)) * BytesPerWord, false));
+            context, byteFootprint(capacity_), false));
 
         if (data == 0) {
           if (capacity_ > minimum) {
@@ -422,7 +422,7 @@ class Segment {
             }
           } else {
             data = static_cast<uintptr_t*>(local::allocate(
-                context, (footprint(capacity_)) * BytesPerWord));
+                context, byteFootprint(capacity_)));
           }
         }
       }
@@ -455,6 +455,11 @@ class Segment {
            + (map and capacity ? map->calculateFootprint(capacity) : 0);
   }
 
+  size_t byteFootprint(unsigned capacity)
+  {
+    return static_cast<size_t>(footprint(capacity)) * BytesPerWord;
+  }
+
   unsigned capacity()
   {
     return capacity_;
@@ -473,7 +478,7 @@ class Segment {
   void replaceWith(Segment* s)
   {
     if (data) {
-      free(context, data, (footprint(capacity())) * BytesPerWord);
+      free(context, data, byteFootprint(capacity()));
     }
     data = s->data;
     s->data = 0;
@@ -531,7 +536,7 @@ class Segment {
   void dispose()
   {
     if (data) {
-      free(context, data, (footprint(capacity())) * BytesPerWord);
+      free(context, data, byteFootprint(capacity()));
     }
     data = 0;
     map = 0;
@@ -696,7 +701,7 @@ void free(Context* c, Fixie** fixies, bool resetImmortal = false);
 
 class Context {
  public:
-  Context(System* system, unsigned limit)
+  Context(System* system, uint64_t limit)
       : system(system),
         client(0),
         count(0),
@@ -770,8 +775,8 @@ class Context {
   System* system;
   Heap::Client* client;
 
-  unsigned count;
-  unsigned limit;
+  uint64_t count;
+  uint64_t limit;
 
   System::Mutex* lock;
 
@@ -1760,19 +1765,24 @@ void collect2(Context* c)
 
 bool limitExceeded(Context* c, int pendingAllocation)
 {
-  unsigned count = c->count + pendingAllocation
-                   - (c->gen2.remaining() * BytesPerWord);
+  uint64_t count = c->count + static_cast<uint64_t>(pendingAllocation)
+                   - (static_cast<uint64_t>(c->gen2.remaining()) * BytesPerWord);
 
   if (Verbose) {
     if (count > c->limit) {
       if (not c->limitWasExceeded) {
         c->limitWasExceeded = true;
-        fprintf(stderr, "heap limit %d exceeded: %d\n", c->limit, count);
+        fprintf(stderr,
+                "heap limit %llu exceeded: %llu\n",
+                static_cast<unsigned long long>(c->limit),
+                static_cast<unsigned long long>(count));
       }
     } else if (c->limitWasExceeded) {
       c->limitWasExceeded = false;
-      fprintf(
-          stderr, "heap limit %d no longer exceeded: %d\n", c->limit, count);
+      fprintf(stderr,
+              "heap limit %llu no longer exceeded: %llu\n",
+              static_cast<unsigned long long>(c->limit),
+              static_cast<unsigned long long>(count));
     }
   }
 
@@ -1933,7 +1943,7 @@ void free_(Context* c, const void* p, size_t size)
 
 class MyHeap : public Heap {
  public:
-  MyHeap(System* system, unsigned limit) : c(system, limit)
+  MyHeap(System* system, uint64_t limit) : c(system, limit)
   {
   }
 
@@ -1949,12 +1959,12 @@ class MyHeap : public Heap {
     c.immortalHeapEnd = start + sizeInWords;
   }
 
-  virtual unsigned remaining()
+  virtual uint64_t remaining()
   {
     return c.limit - c.count;
   }
 
-  virtual unsigned limit()
+  virtual uint64_t limit()
   {
     return c.limit;
   }
@@ -2180,7 +2190,7 @@ class MyHeap : public Heap {
 
 namespace vm {
 
-Heap* makeHeap(System* system, unsigned limit)
+Heap* makeHeap(System* system, uint64_t limit)
 {
   return new (system->tryAllocate(sizeof(local::MyHeap)))
       local::MyHeap(system, limit);

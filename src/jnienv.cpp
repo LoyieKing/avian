@@ -3284,7 +3284,7 @@ struct JavaVMInitArgs {
   jboolean ignoreUnrecognized;
 };
 
-int parseSize(const char* s)
+uint64_t parseSize(const char* s)
 {
   unsigned length = strlen(s);
   RUNTIME_ARRAY(char, buffer, length + 1);
@@ -3293,25 +3293,23 @@ int parseSize(const char* s)
     return 0;
 
   char suffix = s[length - 1];
-  if (suffix== 'k' or suffix == 'K') {
+  uint64_t multiplier = 1;
+  const char* number = s;
+  if (suffix == 'k' or suffix == 'K' or suffix == 'm' or suffix == 'M'
+      or suffix == 'g' or suffix == 'G') {
     memcpy(RUNTIME_ARRAY_BODY(buffer), s, length - 1);
     RUNTIME_ARRAY_BODY(buffer)[length - 1] = 0;
-    return atoi(RUNTIME_ARRAY_BODY(buffer)) * 1024;
+    number = RUNTIME_ARRAY_BODY(buffer);
+    if (suffix == 'k' or suffix == 'K') {
+      multiplier = 1024ull;
+    } else if (suffix == 'm' or suffix == 'M') {
+      multiplier = 1024ull * 1024ull;
+    } else {
+      multiplier = 1024ull * 1024ull * 1024ull;
+    }
   }
 
-  if (suffix == 'm' or suffix == 'M') {
-    memcpy(RUNTIME_ARRAY_BODY(buffer), s, length - 1);
-    RUNTIME_ARRAY_BODY(buffer)[length - 1] = 0;
-    return atoi(RUNTIME_ARRAY_BODY(buffer)) * 1024 * 1024;
-  }
-
-  if (suffix == 'g' or suffix == 'G') {
-    memcpy(RUNTIME_ARRAY_BODY(buffer), s, length - 1);
-    RUNTIME_ARRAY_BODY(buffer)[length - 1] = 0;
-    return atoi(RUNTIME_ARRAY_BODY(buffer)) * 1024 * 1024 * 1024;
-  }
-
-  return atoi(s);
+  return strtoull(number, 0, 10) * multiplier;
 }
 
 void append(char** p, const char* value, unsigned length, char tail)
@@ -3616,7 +3614,7 @@ extern "C" AVIAN_EXPORT jint JNICALL
 {
   local::JavaVMInitArgs* a = static_cast<local::JavaVMInitArgs*>(args);
 
-  unsigned heapLimit = 0;
+  uint64_t heapLimit = 0;
   unsigned stackLimit = 0;
   const char* bootLibraries = 0;
   const char* classpath = 0;
@@ -3642,7 +3640,7 @@ extern "C" AVIAN_EXPORT jint JNICALL
       if (strncmp(p, "mx", 2) == 0) {
         heapLimit = local::parseSize(p + 2);
       } else if (strncmp(p, "ss", 2) == 0) {
-        stackLimit = local::parseSize(p + 2);
+        stackLimit = static_cast<unsigned>(local::parseSize(p + 2));
       } else if (strncmp(p,
                          BOOTCLASSPATH_PREPEND_OPTION ":",
                          sizeof(BOOTCLASSPATH_PREPEND_OPTION)) == 0) {
