@@ -15,12 +15,14 @@ import avian.PersistentSet;
 import avian.PersistentSet.Path;
 
 import sun.misc.Unsafe;
+import java.util.AbstractSet;
 import java.util.AbstractMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
+import java.util.function.Function;
 
 public class ConcurrentHashMap<K,V>
   extends AbstractMap<K,V>
@@ -103,8 +105,8 @@ public class ConcurrentHashMap<K,V>
     return cell == null ? null : cell.value;
   }
 
-  public boolean remove(K key, V value) {
-    Cell<K,V> cell = remove(key, RemoveCondition.IfEqual, value);
+  public boolean remove(Object key, Object value) {
+    Cell<K,V> cell = remove(key, RemoveCondition.IfEqual, (V) value);
     return cell != null && cell.value.equals(value);
   }
 
@@ -126,6 +128,29 @@ public class ConcurrentHashMap<K,V>
   public V remove(Object key) {
     Cell<K,V> cell = remove(key, RemoveCondition.Always, null);
     return cell == null ? null : cell.value;
+  }
+
+  public V getOrDefault(Object key, V defaultValue) {
+    V value = get(key);
+    return value == null ? defaultValue : value;
+  }
+
+  public V computeIfAbsent(K key, Function<? super K, ? extends V> mapping) {
+    V existing = get(key);
+    if (existing != null) return existing;
+    V computed = mapping.apply(key);
+    if (computed == null) return null;
+    V raced = putIfAbsent(key, computed);
+    return raced == null ? computed : raced;
+  }
+
+  public static <K> KeySetView<K, Boolean> newKeySet() {
+    return newKeySet(16);
+  }
+
+  public static <K> KeySetView<K, Boolean> newKeySet(int initialCapacity) {
+    return new KeySetView<K, Boolean>
+      (new ConcurrentHashMap<K, Boolean>(initialCapacity), Boolean.TRUE);
   }
 
   private enum PutCondition {
@@ -293,8 +318,8 @@ public class ConcurrentHashMap<K,V>
     return new Data.EntrySet(new MyEntryMap());
   }
 
-  public Set<K> keySet() {
-    return new Data.KeySet(new MyEntryMap());
+  public KeySetView<K, V> keySet() {
+    return new KeySetView<K, V>(this, null);
   }
 
   public Collection<V> values() {
@@ -436,6 +461,57 @@ public class ConcurrentHashMap<K,V>
     }
   }
 
-  public static class KeySetView<K, V> {
+  public static class KeySetView<K, V> extends AbstractSet<K> {
+    private final ConcurrentHashMap<K, V> map;
+    private final V value;
+
+    KeySetView(ConcurrentHashMap<K, V> map, V value) {
+      this.map = map;
+      this.value = value;
+    }
+
+    public ConcurrentHashMap<K, V> getMap() {
+      return map;
+    }
+
+    public int size() {
+      return map.size();
+    }
+
+    public boolean contains(Object o) {
+      return map.containsKey(o);
+    }
+
+    public boolean add(K e) {
+      if (value == null) {
+        throw new UnsupportedOperationException();
+      }
+      return map.putIfAbsent(e, value) == null;
+    }
+
+    public boolean remove(Object o) {
+      return map.remove(o) != null;
+    }
+
+    public void clear() {
+      map.clear();
+    }
+
+    public Iterator<K> iterator() {
+      final Iterator<Map.Entry<K, V>> entries = map.entrySet().iterator();
+      return new Iterator<K>() {
+        public boolean hasNext() {
+          return entries.hasNext();
+        }
+
+        public K next() {
+          return entries.next().getKey();
+        }
+
+        public void remove() {
+          entries.remove();
+        }
+      };
+    }
   }
 }

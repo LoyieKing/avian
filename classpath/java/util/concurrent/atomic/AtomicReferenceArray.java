@@ -24,6 +24,10 @@ public class AtomicReferenceArray<T> {
   public AtomicReferenceArray(int length) {
     array = new Object[length];
   }
+
+  public AtomicReferenceArray(T[] values) {
+    array = values.clone();
+  }
   
   public T get(int index) {
     return (T) unsafe.getObjectVolatile
