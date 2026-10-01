@@ -31,6 +31,10 @@ public final class Byte extends Number implements Comparable<Byte> {
   }
 
   public int hashCode() {
+    return hashCode(value);
+  }
+
+  public static int hashCode(byte value) {
     return value;
   }
 

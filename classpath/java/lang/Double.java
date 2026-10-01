@@ -43,8 +43,11 @@ public final class Double extends Number {
   }
 
   public int hashCode() {
-    long v = doubleToRawLongBits(value);
-    return (int) ((v >> 32) ^ (v & 0xFF));
+    return hashCode(value);
+  }
+
+  public static int hashCode(double value) {
+    return Long.hashCode(doubleToRawLongBits(value));
   }
 
   public String toString() {

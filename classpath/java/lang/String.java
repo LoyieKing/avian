@@ -90,6 +90,22 @@ public final class String
     this(data, 0, data.length, charset);
   }
 
+  public String(byte[] data, java.nio.charset.Charset charset) {
+    this(data, 0, data.length, charset);
+  }
+
+  public String(byte[] data, int offset, int length, java.nio.charset.Charset charset) {
+    this(data, offset, length);
+    if (charset == null) throw new NullPointerException();
+    String name = charset.name();
+    if (!(name.equalsIgnoreCase(UTF_8_ENCODING)
+          || name.equalsIgnoreCase(ISO_8859_1_ENCODING)
+          || name.equalsIgnoreCase("US-ASCII")
+          || name.equalsIgnoreCase("ASCII"))) {
+      throw new java.nio.charset.UnsupportedCharsetException(name);
+    }
+  }
+
   public String(byte bytes[], int highByte, int offset, int length) {
     if (offset < 0 )
       throw new StringIndexOutOfBoundsException(offset);
@@ -189,6 +205,14 @@ public final class String
     } else {
       return s != null && s.length == length && compareToIgnoreCase(s) == 0;
     }
+  }
+
+  public boolean contentEquals(CharSequence cs) {
+    if (cs.length() != length) return false;
+    for (int i = 0; i < length; ++i) {
+      if (charAt(i) != cs.charAt(i)) return false;
+    }
+    return true;
   }
 
   @Override
@@ -401,11 +425,10 @@ public final class String
   }
 
   public boolean startsWith(String s, int start) {
-    if (length >= s.length + start) {
-      return substring(start, s.length).compareTo(s) == 0;
-    } else {
+    if (start < 0 || (long) start > (long) length - s.length) {
       return false;
     }
+    return substring(start, start + s.length).compareTo(s) == 0;
   }
 
   public boolean endsWith(String s) {
@@ -467,9 +490,41 @@ public final class String
       return Utf8.encode((char[])data, offset, length);
     } else if (ISO_8859_1_ENCODING.equals(fmt) || LATIN_1_ENCODING.equals(fmt)) {
       return Iso88591.encode((char[])data, offset, length);
+    } else if ("US-ASCII".equals(fmt) || "ASCII".equals(fmt)) {
+      return Iso88591.encode((char[]) data, offset, length);
+    } else if ("UTF-16BE".equals(fmt) || "UTF-16LE".equals(fmt) || "UTF-16".equals(fmt)) {
+      char[] chars = (char[]) data;
+      boolean little = "UTF-16LE".equals(fmt);
+      boolean bom = "UTF-16".equals(fmt);
+      byte[] out = new byte[length * 2 + (bom ? 2 : 0)];
+      int p = 0;
+      if (bom) {
+        out[p++] = (byte) 0xFE;
+        out[p++] = (byte) 0xFF;
+      }
+      for (int i = 0; i < length; ++i) {
+        char c = chars[offset + i];
+        if (little) {
+          out[p++] = (byte) c;
+          out[p++] = (byte) (c >>> 8);
+        } else {
+          out[p++] = (byte) (c >>> 8);
+          out[p++] = (byte) c;
+        }
+      }
+      return out;
     } else {
       throw new java.io.UnsupportedEncodingException(
         "Encoding " + format + " not supported");
+    }
+  }
+
+  public byte[] getBytes(java.nio.charset.Charset charset) {
+    if (charset == null) throw new NullPointerException();
+    try {
+      return getBytes(charset.name());
+    } catch (java.io.UnsupportedEncodingException e) {
+      throw new java.nio.charset.UnsupportedCharsetException(charset.name());
     }
   }
 
@@ -655,6 +710,11 @@ public final class String
   public boolean regionMatches(boolean ignoreCase, int thisOffset,
                                String match, int matchOffset, int length)
   {
+    if (thisOffset < 0 || matchOffset < 0 || length < 0
+        || (long) thisOffset > (long) this.length - length
+        || (long) matchOffset > (long) match.length - length) {
+      return false;
+    }
     String a = substring(thisOffset, thisOffset + length);
     String b = match.substring(matchOffset, matchOffset + length);
     if (ignoreCase) {
@@ -680,8 +740,13 @@ public final class String
     return Character.codePointCount(this, start, end);
   }
 
+  private static boolean simpleCase(Locale locale) {
+    // ENGLISH, US, and ROOT share Unicode's default case mapping.
+    return locale == Locale.ENGLISH || locale == Locale.US || locale == Locale.ROOT;
+  }
+
   public String toUpperCase(Locale locale) {
-    if (locale == Locale.ENGLISH) {
+    if (simpleCase(locale)) {
       return toUpperCase();
     } else {
       throw new UnsupportedOperationException("toUpperCase("+locale+')');
@@ -689,7 +754,7 @@ public final class String
   }
 
   public String toLowerCase(Locale locale) {
-    if (locale == Locale.ENGLISH) {
+    if (simpleCase(locale)) {
       return toLowerCase();
     } else {
       throw new UnsupportedOperationException("toLowerCase("+locale+')');

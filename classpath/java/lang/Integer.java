@@ -39,6 +39,10 @@ public final class Integer extends Number implements Comparable<Integer> {
   }
 
   public int hashCode() {
+    return hashCode(value);
+  }
+
+  public static int hashCode(int value) {
     return value;
   }
 
@@ -148,5 +152,56 @@ public final class Integer extends Number implements Comparable<Integer> {
     i |= i >> 8;
     i |= i >> 16;
     return bitCount(~i);
+  }
+
+  public static int numberOfTrailingZeros(int i) {
+    if (i == 0) return 32;
+    int n = 31;
+    int y = i << 16; if (y != 0) { n -= 16; i = y; }
+    y = i << 8; if (y != 0) { n -= 8; i = y; }
+    y = i << 4; if (y != 0) { n -= 4; i = y; }
+    y = i << 2; if (y != 0) { n -= 2; i = y; }
+    return n - ((i << 1) >>> 31);
+  }
+
+  public static int highestOneBit(int i) {
+    i |= i >> 1;
+    i |= i >> 2;
+    i |= i >> 4;
+    i |= i >> 8;
+    i |= i >> 16;
+    return i - (i >>> 1);
+  }
+
+  public static int lowestOneBit(int i) {
+    return i & -i;
+  }
+
+  public static int rotateLeft(int i, int distance) {
+    return (i << distance) | (i >>> -distance);
+  }
+
+  public static int rotateRight(int i, int distance) {
+    return (i >>> distance) | (i << -distance);
+  }
+
+  public static int compare(int x, int y) {
+    return (x < y) ? -1 : ((x == y) ? 0 : 1);
+  }
+
+  public static int compareUnsigned(int x, int y) {
+    return compare(x + MIN_VALUE, y + MIN_VALUE);
+  }
+
+  public static long toUnsignedLong(int x) {
+    return ((long) x) & 0xffffffffL;
+  }
+
+  public static int divideUnsigned(int dividend, int divisor) {
+    return (int) (toUnsignedLong(dividend) / toUnsignedLong(divisor));
+  }
+
+  public static int remainderUnsigned(int dividend, int divisor) {
+    return (int) (toUnsignedLong(dividend) % toUnsignedLong(divisor));
   }
 }

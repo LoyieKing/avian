@@ -18,6 +18,7 @@ public class Throwable implements Serializable {
   private String message;
   private Object trace;
   private Throwable cause;
+  private Throwable[] suppressed;
 
   public Throwable(String message, Throwable cause) {
     this.message = message;
@@ -61,8 +62,9 @@ public class Throwable implements Serializable {
   public String toString() {
     StringBuilder sb = new StringBuilder();
     sb.append(getClass().getName());
-    if (message != null) {
-      sb.append(": ").append(message);
+    String text = getLocalizedMessage();
+    if (text != null) {
+      sb.append(": ").append(text);
     }
     return sb.toString();
   }
@@ -124,6 +126,23 @@ public class Throwable implements Serializable {
     return this;
   }
   
-  public void addSuppressed(Throwable exception) {
+  public final void addSuppressed(Throwable exception) {
+    if (exception == this) throw new IllegalArgumentException("Self-suppression");
+    if (exception == null) throw new NullPointerException();
+    if (suppressed == null) {
+      suppressed = new Throwable[] { exception };
+      return;
+    }
+    Throwable[] next = new Throwable[suppressed.length + 1];
+    System.arraycopy(suppressed, 0, next, 0, suppressed.length);
+    next[suppressed.length] = exception;
+    suppressed = next;
+  }
+
+  public final Throwable[] getSuppressed() {
+    if (suppressed == null) return new Throwable[0];
+    Throwable[] copy = new Throwable[suppressed.length];
+    System.arraycopy(suppressed, 0, copy, 0, suppressed.length);
+    return copy;
   }
 }

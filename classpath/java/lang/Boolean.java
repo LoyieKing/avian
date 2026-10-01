@@ -44,7 +44,11 @@ public final class Boolean implements Comparable<Boolean> {
   }
 
   public int hashCode() {
-    return (value ? 1 : 0);
+    return hashCode(value);
+  }
+
+  public static int hashCode(boolean value) {
+    return value ? 1231 : 1237;
   }
 
   public String toString() {

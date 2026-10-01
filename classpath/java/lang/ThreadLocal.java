@@ -43,4 +43,8 @@ public class ThreadLocal<T> {
     }
     map.put(this, o);
   }
+
+  public void remove() {
+    Thread.currentThread().locals().remove(this);
+  }
 }

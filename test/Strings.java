@@ -115,6 +115,25 @@ public class Strings {
   }
 
   public static void main(String[] args) throws Exception {
+    expect("abcdef".startsWith("cd", 2));
+    expect(!"abcdef".startsWith("cd", 1));
+    expect(!"ab".startsWith("abcdef", 2));
+    expect(!"ab".startsWith("a", -1));
+    expect("ab".startsWith("", 2));
+    expect(!"ab".startsWith("", 3));
+    expect("abcdef".regionMatches(2, "xxcdyy", 2, 2));
+    expect(!"abcdef".regionMatches(4, "xxcdyy", 2, 4));
+    expect(!"abcdef".regionMatches(true, -1, "A", 0, 1));
+
+    expect(java.util.Locale.ROOT.getLanguage().equals(""));
+    expect(java.util.Locale.ROOT.getCountry().equals(""));
+    expect(java.util.Locale.ROOT.toString().equals(""));
+    expect(java.util.Locale.US.getLanguage().equals("en"));
+    expect(java.util.Locale.US.getCountry().equals("US"));
+    expect("AbC".toLowerCase(java.util.Locale.ROOT).equals("abc"));
+    expect("AbC".toUpperCase(java.util.Locale.US).equals("ABC"));
+    expect("AbC".toLowerCase(java.util.Locale.ENGLISH).equals("abc"));
+
     expect(new String(new byte[] { 99, 111, 109, 46, 101, 99, 111, 118, 97,
                                    116, 101, 46, 110, 97, 116, 46, 98, 117,
                                    115, 46, 83, 121, 109, 98, 111, 108 })
@@ -187,6 +206,19 @@ public class Strings {
     expect(Character.forDigit(Character.digit('b', 16), 16) == 'b');
     expect(Character.forDigit(Character.digit('f', 16), 16) == 'f');
     expect(Character.forDigit(Character.digit('z', 36), 36) == 'z');
+    expect(Character.digit('A', 16) == 10);
+    expect(Character.digit((int) 'a', 16) == 10);
+    expect(Character.digit((int) '9', 10) == 9);
+    expect(Character.digit((int) 'g', 16) == -1);
+    expect(Character.digit(0x10000, 10) == -1);
+    expect(Character.toTitleCase('a') == 'A');
+    expect(Character.toTitleCase('A') == 'A');
+    expect(Character.compare('b', 'a') > 0);
+    expect(Character.reverseBytes((char) 0x1234) == (char) 0x3412);
+    char[] title = new char[2];
+    expect(Character.toChars('Z', title, 1) == 1 && title[1] == 'Z');
+    expect(Character.getType('A') == 1 && Character.getType(' ') == 12);
+    expect(! Character.isTitleCase('A'));
 
     testDecode(false);
     testDecode(true);

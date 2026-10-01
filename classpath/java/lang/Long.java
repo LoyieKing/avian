@@ -43,7 +43,11 @@ public final class Long extends Number implements Comparable<Long> {
   }
 
   public int hashCode() {
-    return (int) ((value >> 32) ^ (value & 0xFF));
+    return hashCode(value);
+  }
+
+  public static int hashCode(long value) {
+    return (int) (value ^ (value >>> 32));
   }
 
   public String toString() {
@@ -170,5 +174,118 @@ public final class Long extends Number implements Comparable<Long> {
     }
 
     return number;
+  }
+
+  public static int compare(long x, long y) {
+    return (x < y) ? -1 : ((x == y) ? 0 : 1);
+  }
+
+  public static int compareUnsigned(long x, long y) {
+    return compare(x + MIN_VALUE, y + MIN_VALUE);
+  }
+
+  public static int numberOfLeadingZeros(long i) {
+    int x = (int) (i >>> 32);
+    return x == 0
+      ? 32 + Integer.numberOfLeadingZeros((int) i)
+      : Integer.numberOfLeadingZeros(x);
+  }
+
+  public static int numberOfTrailingZeros(long i) {
+    int x = (int) i;
+    return x == 0
+      ? 32 + Integer.numberOfTrailingZeros((int) (i >>> 32))
+      : Integer.numberOfTrailingZeros(x);
+  }
+
+  public static int bitCount(long i) {
+    i = i - ((i >>> 1) & 0x5555555555555555L);
+    i = (i & 0x3333333333333333L) + ((i >>> 2) & 0x3333333333333333L);
+    i = (i + (i >>> 4)) & 0x0f0f0f0f0f0f0f0fL;
+    i = i + (i >>> 8);
+    i = i + (i >>> 16);
+    i = i + (i >>> 32);
+    return (int) i & 0x7f;
+  }
+
+  public static long highestOneBit(long i) {
+    i |= i >> 1;
+    i |= i >> 2;
+    i |= i >> 4;
+    i |= i >> 8;
+    i |= i >> 16;
+    i |= i >> 32;
+    return i - (i >>> 1);
+  }
+
+  public static long lowestOneBit(long i) {
+    return i & -i;
+  }
+
+  public static long reverseBytes(long i) {
+    i = (i & 0x00ff00ff00ff00ffL) << 8 | (i >>> 8) & 0x00ff00ff00ff00ffL;
+    return (i << 48) | ((i & 0xffff0000L) << 16)
+        | ((i >>> 16) & 0xffff0000L) | (i >>> 48);
+  }
+
+  public static long rotateLeft(long i, int distance) {
+    return (i << distance) | (i >>> -distance);
+  }
+
+  public static long rotateRight(long i, int distance) {
+    return (i >>> distance) | (i << -distance);
+  }
+
+  public static long divideUnsigned(long dividend, long divisor) {
+    if (divisor < 0L) {
+      return compareUnsigned(dividend, divisor) < 0 ? 0L : 1L;
+    }
+    if (dividend >= 0L) {
+      return dividend / divisor;
+    }
+    long quotient = 0L;
+    long remainder = 0L;
+    for (int bit = 63; bit >= 0; --bit) {
+      remainder = (remainder << 1) | ((dividend >>> bit) & 1L);
+      if (compareUnsigned(remainder, divisor) >= 0) {
+        remainder -= divisor;
+        quotient |= 1L << bit;
+      }
+    }
+    return quotient;
+  }
+
+  public static long remainderUnsigned(long dividend, long divisor) {
+    if (divisor < 0L) {
+      return compareUnsigned(dividend, divisor) < 0 ? dividend : dividend - divisor;
+    }
+    if (dividend >= 0L) {
+      return dividend % divisor;
+    }
+    long remainder = 0L;
+    for (int bit = 63; bit >= 0; --bit) {
+      remainder = (remainder << 1) | ((dividend >>> bit) & 1L);
+      if (compareUnsigned(remainder, divisor) >= 0) {
+        remainder -= divisor;
+      }
+    }
+    return remainder;
+  }
+
+  public static Long decode(String string) {
+    if (string.startsWith("-")) {
+      if (string.startsWith("-0") || string.startsWith("-#")) {
+        return valueOf(-decode(string.substring(1)).longValue());
+      }
+    } else if (string.startsWith("0")) {
+      char c = string.length() < 2 ? (char) -1 : string.charAt(1);
+      if (c == 'x' || c == 'X') {
+        return valueOf(parseLong(string.substring(2), 16));
+      }
+      return valueOf(parseLong(string, 8));
+    } else if (string.startsWith("#")) {
+      return valueOf(parseLong(string.substring(1), 16));
+    }
+    return valueOf(parseLong(string, 10));
   }
 }

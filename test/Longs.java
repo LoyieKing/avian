@@ -389,6 +389,33 @@ public class Longs {
     { long b = 0xFFFFFFFFFFFFFFFFL; int s = 20;
       expect((b >>> -s) == 0xFFFFF);
     }
+
+    expect(Long.highestOneBit(0L) == 0L);
+    expect(Long.highestOneBit(9L) == 8L);
+    expect(Long.highestOneBit(-1L) == Long.MIN_VALUE);
+    expect(Long.lowestOneBit(12L) == 4L);
+    expect(Long.numberOfLeadingZeros(0L) == 64);
+    expect(Long.numberOfLeadingZeros(1L) == 63);
+    expect(Long.numberOfLeadingZeros(-1L) == 0);
+    expect(Long.numberOfTrailingZeros(0L) == 64);
+    expect(Long.numberOfTrailingZeros(12L) == 2);
+    expect(Long.bitCount(0L) == 0);
+    expect(Long.bitCount(-1L) == 64);
+    expect(Long.bitCount(0x1111111111111111L) == 16);
+    expect(Long.reverseBytes(0x0102030405060708L) == 0x0807060504030201L);
+    expect(Long.rotateLeft(0x1234567890ABCDEFL, 8) == 0x34567890ABCDEF12L);
+    expect(Long.rotateRight(0x1234567890ABCDEFL, 8) == 0xEF1234567890ABCDL);
+    expect(Long.compare(-1L, 1L) < 0);
+    expect(Long.compareUnsigned(-1L, 1L) > 0);
+    expect(Long.divideUnsigned(-1L, 2L) == Long.MAX_VALUE);
+    expect(Long.remainderUnsigned(-1L, 2L) == 1L);
+    expect(Long.divideUnsigned(-1L, -1L) == 1L);
+    expect(Long.remainderUnsigned(-2L, -1L) == -2L);
+    expect(Long.divideUnsigned(-1L, Long.MIN_VALUE) == 1L);
+    expect(Long.remainderUnsigned(-1L, Long.MIN_VALUE) == Long.MAX_VALUE);
+    expect(Long.decode("123").longValue() == 123L);
+    expect(Long.decode("-0x10").longValue() == -16L);
+    expect(Long.decode("#10").longValue() == 16L);
   }
 
 }

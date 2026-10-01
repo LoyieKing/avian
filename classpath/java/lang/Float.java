@@ -45,6 +45,10 @@ public final class Float extends Number {
   }
 
   public int hashCode() {
+    return hashCode(value);
+  }
+
+  public static int hashCode(float value) {
     return floatToRawIntBits(value);
   }
 

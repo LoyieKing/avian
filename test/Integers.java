@@ -366,5 +366,25 @@ public class Integers {
     expect(291 == Integer.decode("#123").intValue());
 
     testNumberOfLeadingZeros();
+
+    expect(Integer.highestOneBit(0) == 0);
+    expect(Integer.highestOneBit(1) == 1);
+    expect(Integer.highestOneBit(8) == 8);
+    expect(Integer.highestOneBit(9) == 8);
+    expect(Integer.highestOneBit(-1) == Integer.MIN_VALUE);
+    expect(Integer.lowestOneBit(0) == 0);
+    expect(Integer.lowestOneBit(12) == 4);
+    expect(Integer.numberOfTrailingZeros(0) == 32);
+    expect(Integer.numberOfTrailingZeros(12) == 2);
+    expect(Integer.numberOfTrailingZeros(-2) == 1);
+    expect(Integer.rotateLeft(0x12345678, 8) == 0x34567812);
+    expect(Integer.rotateRight(0x12345678, 8) == 0x78123456);
+    expect(Integer.compare(1, 2) < 0);
+    expect(Integer.compare(2, 2) == 0);
+    expect(Integer.compare(-1, 1) < 0);
+    expect(Integer.compareUnsigned(-1, 1) > 0);
+    expect(Integer.divideUnsigned(-1, 2) == 0x7FFFFFFF);
+    expect(Integer.remainderUnsigned(-1, 2) == 1);
+    expect(Integer.toUnsignedLong(-1) == 0xFFFFFFFFL);
   }
 }

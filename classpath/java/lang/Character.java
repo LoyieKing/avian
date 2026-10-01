@@ -35,7 +35,11 @@ public final class Character implements Comparable<Character> {
   }
 
   public int hashCode() {
-    return (int) value;
+    return hashCode(value);
+  }
+
+  public static int hashCode(char value) {
+    return value;
   }
 
   public String toString() {
@@ -107,6 +111,87 @@ public final class Character implements Comparable<Character> {
     } else {
       return -1;
     }
+  }
+
+  public static int digit(int codePoint, int radix) {
+    if (radix < MIN_RADIX || radix > MAX_RADIX || codePoint < 0 || codePoint > 0xFFFF) {
+      return -1;
+    }
+    return digit((char) codePoint, radix);
+  }
+
+  public static int compare(char x, char y) {
+    return x - y;
+  }
+
+  public static char toTitleCase(char c) {
+    return toUpperCase(c);
+  }
+
+  public static boolean isTitleCase(char c) {
+    return false;
+  }
+
+  public static boolean isAlphabetic(int codePoint) {
+    return isLetter(codePoint);
+  }
+
+  public static boolean isDefined(char c) {
+    return c <= 0x7F || isSurrogate(c);
+  }
+
+  public static boolean isIdentifierIgnorable(char ch) {
+    return ch <= 0x08 || (ch >= 0x0E && ch <= 0x1B) || (ch >= 0x7F && ch <= 0x9F);
+  }
+
+  public static char reverseBytes(char c) {
+    return (char) (((c & 0xFF) << 8) | (c >>> 8));
+  }
+
+  public static int toChars(int codePoint, char[] dst, int index) {
+    if (dst == null) {
+      throw new NullPointerException();
+    }
+    char[] chars = toChars(codePoint);
+    if (index < 0 || index > dst.length - chars.length) {
+      throw new IndexOutOfBoundsException();
+    }
+    for (int i = 0; i < chars.length; ++i) {
+      dst[index + i] = chars[i];
+    }
+    return chars.length;
+  }
+
+  public static int getType(char c) {
+    if (c <= 0x1F || c == 0x7F) return 15;
+    if (c >= 'A' && c <= 'Z') return 1;
+    if (c >= 'a' && c <= 'z') return 2;
+    if (c >= '0' && c <= '9') return 9;
+    if (c == ' ') return 12;
+    if (c == '-') return 20;
+    if (c == '(' || c == '[' || c == '{') return 21;
+    if (c == ')' || c == ']' || c == '}') return 22;
+    if (c == '_') return 23;
+    if (c == '$') return 26;
+    if (c == '+' || c == '<' || c == '=' || c == '>' || c == '|' || c == '~') return 25;
+    if (c <= 0x7E) return 24;
+    if (isSurrogate(c)) return 19;
+    return 0;
+  }
+
+  public static byte getDirectionality(char c) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) return 0;
+    if (c >= '0' && c <= '9') return 3;
+    if (c == '\n' || c == '\r') return 10;
+    if (c == '\t' || c == 0x0B || c == 0x0C) return 11;
+    if (c == ' ') return 12;
+    if (c < 0x20 || c == 0x7F) return 9;
+    if (c <= 0x7E) return 13;
+    return -1;
+  }
+
+  private static boolean isSurrogate(char c) {
+    return c >= '\uD800' && c <= '\uDFFF';
   }
 
   public static char forDigit(int digit, int radix) {

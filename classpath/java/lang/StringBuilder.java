@@ -381,4 +381,41 @@ public class StringBuilder implements CharSequence, Appendable {
   public void ensureCapacity(int capacity) {
     // ignore
   }
+
+  public void trimToSize() {
+  }
+
+  public StringBuilder reverse() {
+    if (length <= 1) return this;
+    char[] chars = new char[length];
+    getChars(0, length, chars, 0);
+    boolean surrogates = false;
+    for (int j = 0, k = length - 1; j < k; ++j, --k) {
+      char a = chars[j];
+      char b = chars[k];
+      chars[j] = b;
+      chars[k] = a;
+      if (Character.isHighSurrogate(a) || Character.isLowSurrogate(a)
+          || Character.isHighSurrogate(b) || Character.isLowSurrogate(b)) {
+        surrogates = true;
+      }
+    }
+    if (surrogates) {
+      for (int i = 0; i < length - 1; ++i) {
+        char low = chars[i];
+        if (Character.isLowSurrogate(low)) {
+          char high = chars[i + 1];
+          if (Character.isHighSurrogate(high)) {
+            chars[i++] = high;
+            chars[i] = low;
+          }
+        }
+      }
+    }
+    chain = null;
+    buffer = null;
+    position = 0;
+    length = 0;
+    return append(new String(chars, 0, chars.length, false));
+  }
 }

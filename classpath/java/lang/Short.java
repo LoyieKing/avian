@@ -35,6 +35,10 @@ public final class Short extends Number implements Comparable<Short> {
   }
 
   public int hashCode() {
+    return hashCode(value);
+  }
+
+  public static int hashCode(short value) {
     return value;
   }
 
