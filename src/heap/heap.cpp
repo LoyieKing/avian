@@ -2100,17 +2100,25 @@ class MyHeap : public Heap {
 
   virtual void pad(void* p)
   {
+    // hashCode no longer holds heapLock, so several mutators can account
+    // for different objects at once. GC resets these only at a safepoint.
+    unsigned* counter;
     if (c.gen1.contains(p)) {
       if (c.ageMap.get(p) == TenureThreshold) {
-        ++c.tenurePadding;
+        counter = &c.tenurePadding;
       } else {
-        ++c.gen1Padding;
+        counter = &c.gen1Padding;
       }
     } else if (c.gen2.contains(p)) {
-      ++c.gen2Padding;
+      counter = &c.gen2Padding;
     } else {
-      ++c.gen1Padding;
+      counter = &c.gen1Padding;
     }
+#ifdef USE_ATOMIC_OPERATIONS
+    __sync_fetch_and_add(counter, 1u);
+#else
+    ++(*counter);
+#endif
   }
 
   virtual void* follow(void* p)

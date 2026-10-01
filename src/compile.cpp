@@ -3301,7 +3301,7 @@ void gcIfNecessary(MyThread* t)
 
 void idleIfNecessary(MyThread* t)
 {
-  if (UNLIKELY(t->m->exclusive)) {
+  if (UNLIKELY(loadExclusive(t->m))) {
     ENTER(t, Thread::IdleState);
   }
   if (UNLIKELY(debug::enabled()))

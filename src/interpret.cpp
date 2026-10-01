@@ -760,7 +760,7 @@ void pushField(Thread* t, object target, GcField* field)
 
 void safePoint(Thread* t)
 {
-  if (UNLIKELY(t->m->exclusive)) {
+  if (UNLIKELY(loadExclusive(t->m))) {
     ENTER(t, Thread::IdleState);
   }
   if (UNLIKELY(vm::debug::enabled()))

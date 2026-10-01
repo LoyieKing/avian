@@ -37,15 +37,6 @@ const bool DebugClassReader = false;
 
 const unsigned NoByte = 0xFFFF;
 
-#ifdef USE_ATOMIC_OPERATIONS
-void atomicIncrement(uint32_t* p, int v)
-{
-  for (uint32_t old = *p; not atomicCompareAndSwap32(p, old, old + v);
-       old = *p) {
-  }
-}
-#endif
-
 void join(Thread* t, Thread* o)
 {
   if (t != o) {
@@ -4660,6 +4651,30 @@ void shutDown(Thread* t)
   }
 }
 
+namespace {
+
+// True when some other thread may still touch the Java heap.
+// TransitionState is included: the thread has not finished the
+// native→Java check, so a scan that ignored it could miss a later
+// Active store. Same rule as HotSpot's _thread_in_native_trans.
+bool otherThreadRunning(Thread* self, Thread* node)
+{
+  for (Thread* child = node->child; child; child = child->peer) {
+    if (otherThreadRunning(self, child)) {
+      return true;
+    }
+  }
+
+  if (node == self) {
+    return false;
+  }
+
+  Thread::State state = loadState(node);
+  return state == Thread::ActiveState or state == Thread::TransitionState;
+}
+
+}  // namespace
+
 void enter(Thread* t, Thread::State s)
 {
   stress(t);
@@ -4673,11 +4688,9 @@ void enter(Thread* t, Thread::State s)
   }
 
 #ifdef USE_ATOMIC_OPERATIONS
-#define INCREMENT atomicIncrement
 #define ACQUIRE_LOCK ACQUIRE_RAW(t, t->m->stateLock)
 #define STORE_LOAD_MEMORY_BARRIER storeLoadMemoryBarrier()
 #else
-#define INCREMENT(pointer, value) *(pointer) += value;
 #define ACQUIRE_LOCK
 #define STORE_LOAD_MEMORY_BARRIER
 
@@ -4688,7 +4701,7 @@ void enter(Thread* t, Thread::State s)
   case Thread::ExclusiveState: {
     ACQUIRE_LOCK;
 
-    while (t->m->exclusive) {
+    while (loadExclusive(t->m)) {
       // another thread got here first.
       ENTER(t, Thread::IdleState);
       t->m->stateLock->wait(t->systemThread, 0);
@@ -4696,45 +4709,40 @@ void enter(Thread* t, Thread::State s)
 
     switch (t->state) {
     case Thread::ActiveState:
+    case Thread::IdleState:
       break;
-
-    case Thread::IdleState: {
-      INCREMENT(&(t->m->activeCount), 1);
-    } break;
 
     default:
       abort(t);
     }
 
-    t->state = Thread::ExclusiveState;
-    t->m->exclusive = t;
+    storeState(t, Thread::ExclusiveState);
+    storeExclusive(t->m, t);
 
     STORE_LOAD_MEMORY_BARRIER;
 
-    while (t->m->activeCount > 1) {
+    while (t->m->rootThread and otherThreadRunning(t, t->m->rootThread)) {
       t->m->stateLock->wait(t->systemThread, 0);
     }
   } break;
 
   case Thread::IdleState:
     if (LIKELY(t->state == Thread::ActiveState)) {
-      // fast path
-      assertT(t, t->m->activeCount > 0);
-      INCREMENT(&(t->m->activeCount), -1);
-
-      t->state = s;
+      // Java→native. Publishing Idle makes this thread safe for GC.
+      // The fence then makes the exclusive flag visible, so a scanner
+      // that already observed Active is woken instead of waiting on a
+      // counter this thread no longer updates.
+      storeState(t, Thread::IdleState);
 
       STORE_LOAD_MEMORY_BARRIER;
 
-      if (t->m->exclusive) {
+      if (loadExclusive(t->m)) {
         ACQUIRE_LOCK;
 
         t->m->stateLock->notifyAll(t->systemThread);
       }
 
       break;
-    } else {
-      // fall through to slow path
     }
     /* fallthrough */
 
@@ -4743,8 +4751,8 @@ void enter(Thread* t, Thread::State s)
 
     switch (t->state) {
     case Thread::ExclusiveState: {
-      assertT(t, t->m->exclusive == t);
-      t->m->exclusive = 0;
+      assertT(t, loadExclusive(t->m) == t);
+      storeExclusive(t->m, 0);
     } break;
 
     case Thread::ActiveState:
@@ -4753,9 +4761,6 @@ void enter(Thread* t, Thread::State s)
     default:
       abort(t);
     }
-
-    assertT(t, t->m->activeCount > 0);
-    INCREMENT(&(t->m->activeCount), -1);
 
     if (s == Thread::ZombieState) {
       assertT(t, t->m->liveCount > 0);
@@ -4766,54 +4771,63 @@ void enter(Thread* t, Thread::State s)
       }
     }
 
-    t->state = s;
+    storeState(t, s);
 
     t->m->stateLock->notifyAll(t->systemThread);
   } break;
 
   case Thread::ActiveState:
-    if (LIKELY(t->state == Thread::IdleState and t->m->exclusive == 0)) {
-      // fast path
-      INCREMENT(&(t->m->activeCount), 1);
-
-      t->state = s;
+    if (LIKELY(t->state == Thread::IdleState)) {
+      // Native→Java. TransitionState is published before the safepoint
+      // flag is read. The scanner waits on it, so it cannot decide this
+      // thread is Idle and then lose the race to the Active store.
+      storeState(t, Thread::TransitionState);
 
       STORE_LOAD_MEMORY_BARRIER;
 
-      if (t->m->exclusive) {
-        // another thread has entered the exclusive state, so we
-        // return to idle and use the slow path to become active
-        enter(t, Thread::IdleState);
-      } else {
+      if (LIKELY(loadExclusive(t->m) == 0)) {
+        storeState(t, Thread::ActiveState);
         break;
+      }
+
+      storeState(t, Thread::IdleState);
+
+      STORE_LOAD_MEMORY_BARRIER;
+
+      {
+        ACQUIRE_LOCK;
+
+        t->m->stateLock->notifyAll(t->systemThread);
       }
     }
 
     {
       ACQUIRE_LOCK;
 
-      switch (t->state) {
+      switch (loadState(t)) {
       case Thread::ExclusiveState: {
-        assertT(t, t->m->exclusive == t);
+        assertT(t, loadExclusive(t->m) == t);
 
-        t->state = s;
-        t->m->exclusive = 0;
+        storeState(t, s);
+        storeExclusive(t->m, 0);
+
+        STORE_LOAD_MEMORY_BARRIER;
 
         t->m->stateLock->notifyAll(t->systemThread);
       } break;
 
       case Thread::NoState:
       case Thread::IdleState: {
-        while (t->m->exclusive) {
+        Thread::State state = loadState(t);
+        while (loadExclusive(t->m)) {
           t->m->stateLock->wait(t->systemThread, 0);
         }
 
-        INCREMENT(&(t->m->activeCount), 1);
-        if (t->state == Thread::NoState) {
+        if (state == Thread::NoState) {
           ++t->m->liveCount;
           ++t->m->threadCount;
         }
-        t->state = s;
+        storeState(t, s);
       } break;
 
       default:
@@ -4827,7 +4841,7 @@ void enter(Thread* t, Thread::State s)
 
     switch (t->state) {
     case Thread::ExclusiveState: {
-      assertT(t, t->m->exclusive == t);
+      assertT(t, loadExclusive(t->m) == t);
       // exit state should also be exclusive, so don't set exclusive = 0
 
       t->m->stateLock->notifyAll(t->systemThread);
@@ -4840,10 +4854,7 @@ void enter(Thread* t, Thread::State s)
       abort(t);
     }
 
-    assertT(t, t->m->activeCount > 0);
-    INCREMENT(&(t->m->activeCount), -1);
-
-    t->state = s;
+    storeState(t, s);
 
     while (t->m->liveCount - t->m->daemonCount > 1) {
       t->m->stateLock->wait(t->systemThread, 0);
@@ -4854,6 +4865,9 @@ void enter(Thread* t, Thread::State s)
     abort(t);
   }
 }
+
+#undef ACQUIRE_LOCK
+#undef STORE_LOAD_MEMORY_BARRIER
 
 object allocate2(Thread* t, unsigned sizeInBytes, bool objectMask)
 {
@@ -4888,12 +4902,13 @@ object allocate3(Thread* t,
 
   ACQUIRE_RAW(t, t->m->stateLock);
 
-  while (t->m->exclusive and t->m->exclusive != t) {
+  for (Thread* exclusive = loadExclusive(t->m); exclusive and exclusive != t;
+       exclusive = loadExclusive(t->m)) {
     // another thread wants to enter the exclusive state, either for a
     // collection or some other reason.  We give it a chance here.
     ENTER(t, Thread::IdleState);
 
-    while (t->m->exclusive) {
+    while (loadExclusive(t->m)) {
       t->m->stateLock->wait(t->systemThread, 0);
     }
   }

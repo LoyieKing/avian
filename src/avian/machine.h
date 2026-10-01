@@ -1111,6 +1111,9 @@ class Machine {
   const char** arguments;
   unsigned argumentCount;
   unsigned threadCount;
+  // Unused by the safepoint protocol. Left in place so later Machine
+  // offsets (classLock, referenceLock, handleBlockLock) stay put.
+  // Threads publish Thread::state instead of bumping this counter.
   unsigned activeCount;
   unsigned liveCount;
   unsigned daemonCount;
@@ -1200,7 +1203,11 @@ class Thread {
     ZombieState,
     JoinedState,
     ExclusiveState,
-    ExitState
+    ExitState,
+    // Native→Java. Not safe for GC. Closes the window where a thread
+    // has observed no safepoint but not yet stored ActiveState.
+    // HotSpot's _thread_in_native_trans.
+    TransitionState
   };
 
   enum Flag {
@@ -1576,6 +1583,29 @@ inline unsigned stackSizeInWords(Thread* t)
 
 void enter(Thread* t, Thread::State state);
 
+// Per-thread safepoint word. Release store / acquire load so a scanner
+// synchronizes with Active↔Idle transitions without a global counter.
+inline Thread::State loadState(Thread* t)
+{
+  return __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+}
+
+inline void storeState(Thread* t, Thread::State s)
+{
+  __atomic_store_n(&t->state, s, __ATOMIC_RELEASE);
+}
+
+// Safepoint flag. Same publication rules as HotSpot's polling word.
+inline Thread* loadExclusive(Machine* m)
+{
+  return __atomic_load_n(&m->exclusive, __ATOMIC_ACQUIRE);
+}
+
+inline void storeExclusive(Machine* m, Thread* value)
+{
+  __atomic_store_n(&m->exclusive, value, __ATOMIC_RELEASE);
+}
+
 inline void enterActiveState(Thread* t)
 {
   enter(t, Thread::ActiveState);
@@ -1771,7 +1801,7 @@ inline object allocate(Thread* t, unsigned sizeInBytes, bool objectMask)
   stress(t);
 
   if (UNLIKELY(not tlabHasRoom(t, ceilingDivide(sizeInBytes, BytesPerWord))
-               or t->m->exclusive)) {
+               or loadExclusive(t->m))) {
     return allocate2(t, sizeInBytes, objectMask);
   } else {
     assertT(t, t->criticalLevel == 0);
@@ -2267,10 +2297,27 @@ inline void markHashTaken(Thread* t, object o)
   assertT(t, not objectExtended(t, o));
   assertT(t, not objectFixed(t, o));
 
+  uintptr_t* header = reinterpret_cast<uintptr_t*>(&alias(o, 0));
+
+#ifdef USE_ATOMIC_OPERATIONS
+  // One winner publishes HashTakenMark. Only that thread accounts for
+  // the extra word; a later hashCode sees the bit and does not pad again.
+  uintptr_t old = *header;
+  while ((old & ~PointerMask) == 0) {
+    if (atomicCompareAndSwap(header, old, old | HashTakenMark)) {
+      t->m->heap->pad(o);
+      return;
+    }
+    old = *header;
+  }
+#else
   ACQUIRE_RAW(t, t->m->heapLock);
 
-  alias(o, 0) |= HashTakenMark;
-  t->m->heap->pad(o);
+  if ((alias(o, 0) & ~PointerMask) == 0) {
+    alias(o, 0) |= HashTakenMark;
+    t->m->heap->pad(o);
+  }
+#endif
 }
 
 inline uint32_t takeHash(Thread*, object o)
@@ -2287,7 +2334,7 @@ inline uint32_t objectHash(Thread* t, object o)
   if (objectExtended(t, o)) {
     return extendedWord(t, o, baseSize(t, o, objectClass(t, o)));
   } else {
-    if (not objectFixed(t, o)) {
+    if (not objectFixed(t, o) and not hashTaken(t, o)) {
       markHashTaken(t, o);
     }
     return takeHash(t, o);
