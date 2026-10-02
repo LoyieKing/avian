@@ -933,7 +933,19 @@ struct JNIEnvVTable {
   void*(JNICALL* GetDirectBufferAddress)(JNIEnv* env, jobject);
 
   jlong(JNICALL* GetDirectBufferCapacity)(JNIEnv*, jobject);
+
+  // JNI 1.6 and JNI 9. Left null. A custom slot must not occupy them.
+  jint(JNICALL* GetObjectRefType)(JNIEnv*, jobject);
+
+  jobject(JNICALL* GetModule)(JNIEnv*, jclass);
+
+  // header is unmanaged and immovable: a big-endian u2 byte length,
+  // then that many Modified UTF-8 bytes. The string stores the address.
+  jstring(JNICALL* NewStringFromUnmanagedMutf8)(JNIEnv*, const void*);
 };
+
+// Slot of NewStringFromUnmanagedMutf8. include/avian/jni.h uses the same index.
+enum { AvianJniNewStringFromUnmanagedMutf8 = 234 };
 
 inline void atomicOr(uint32_t* p, int v)
 {

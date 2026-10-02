@@ -1,5 +1,6 @@
 #include <jni.h>
 #include "jni-util.h"
+#include "avian/jni.h"
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*)
 {
@@ -209,6 +210,29 @@ extern "C" JNIEXPORT jobject JNICALL
     Java_JNI_testLocalRef(JNIEnv* e, jclass, jobject o)
 {
   return e->NewLocalRef(o);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+    Java_JNI_newUnmanaged(JNIEnv* e, jclass, jbyteArray bytes)
+{
+  if (bytes == 0) {
+    return reinterpret_cast<AvianJniEnv*>(e)->NewStringFromUnmanagedMutf8(0);
+  }
+
+  jsize n = e->GetArrayLength(bytes);
+  if (n < 0 || n > 65535) {
+    return 0;
+  }
+  uint8_t* header = static_cast<uint8_t*>(malloc(static_cast<size_t>(n) + 2));
+  if (header == 0) {
+    return 0;
+  }
+  header[0] = static_cast<uint8_t>(static_cast<unsigned>(n) >> 8);
+  header[1] = static_cast<uint8_t>(n);
+  if (n) {
+    e->GetByteArrayRegion(bytes, 0, n, reinterpret_cast<jbyte*>(header + 2));
+  }
+  return reinterpret_cast<AvianJniEnv*>(e)->NewStringFromUnmanagedMutf8(header);
 }
 
 extern "C" JNIEXPORT jobject JNICALL

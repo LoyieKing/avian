@@ -76,6 +76,8 @@ public class JNI {
 
   private static native Object testLocalRef(Object o);
 
+  private static native String newUnmanaged(byte[] bytes);
+
   public static int method242() { return 242; }
   
   public static final int field950 = 950;
@@ -137,5 +139,16 @@ public class JNI {
     { Object o = new Object();
       expect(testLocalRef(o) == o);
     }
+
+    expect(newUnmanaged(null) == null);
+    String unmanaged = newUnmanaged(new byte[] { 'a', 'b', 'c' });
+    expect(unmanaged.equals("abc") && unmanaged.hashCode() == 96354
+           && unmanaged.charAt(1) == 'b');
+    Field data = String.class.getDeclaredField("unsafe_data");
+    data.setAccessible(true);
+    expect(data.getLong(unmanaged) != 0);
+    String unmanagedNul = newUnmanaged(new byte[] { (byte) 0xC0, (byte) 0x80 });
+    expect(unmanagedNul.length() == 1 && unmanagedNul.equals("\u0000")
+           && data.getLong(unmanagedNul) != 0);
   }
 }

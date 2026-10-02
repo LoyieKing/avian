@@ -9,6 +9,8 @@
    details. */
 
 #include "avian/jnienv.h"
+
+#include <stddef.h>
 #include "avian/machine.h"
 #include "avian/debug.h"
 #include "avian/util.h"
@@ -306,6 +308,30 @@ jstring JNICALL NewStringUTF(Thread* t, const char* chars)
   uintptr_t arguments[] = {reinterpret_cast<uintptr_t>(chars)};
 
   return reinterpret_cast<jstring>(run(t, newStringUTF, arguments));
+}
+
+uint64_t newStringFromUnmanagedMutf8(Thread* t, uintptr_t* arguments)
+{
+  const uint8_t* header = reinterpret_cast<const uint8_t*>(arguments[0]);
+#ifdef HAVE_StringUnsafe_data
+  GcString* s = makeStringFromMutf8Header(t, header);
+#else
+  unsigned n = (static_cast<unsigned>(header[0]) << 8) | header[1];
+  object array = parseUtf8(t, reinterpret_cast<const char*>(header + 2), n);
+  PROTECT(t, array);
+  GcString* s = t->m->classpath->makeString(t, array, 0, static_cast<int32_t>(n));
+#endif
+  PROTECT(t, s);
+  return reinterpret_cast<uint64_t>(makeLocalReference(t, s));
+}
+
+jstring JNICALL NewStringFromUnmanagedMutf8(Thread* t, const void* header)
+{
+  if (header == 0)
+    return 0;
+
+  uintptr_t arguments[] = {reinterpret_cast<uintptr_t>(header)};
+  return reinterpret_cast<jstring>(run(t, newStringFromUnmanagedMutf8, arguments));
 }
 
 void replace(int a, int b, const char* in, int8_t* out)
@@ -3394,6 +3420,11 @@ uint64_t boot(Thread* t, uintptr_t*)
 
 namespace vm {
 
+static_assert(offsetof(JNIEnvVTable, NewStringFromUnmanagedMutf8)
+                      / sizeof(void*)
+                  == AvianJniNewStringFromUnmanagedMutf8,
+              "include/avian/jni.h slot");
+
 void populateJNITables(JavaVMVTable* vmTable, JNIEnvVTable* envTable)
 {
   memset(vmTable, 0, sizeof(JavaVMVTable));
@@ -3420,6 +3451,7 @@ void populateJNITables(JavaVMVTable* vmTable, JNIEnvVTable* envTable)
   envTable->GetArrayLength = local::GetArrayLength;
   envTable->NewString = local::NewString;
   envTable->NewStringUTF = local::NewStringUTF;
+  envTable->NewStringFromUnmanagedMutf8 = local::NewStringFromUnmanagedMutf8;
   envTable->DefineClass = local::DefineClass;
   envTable->FindClass = local::FindClass;
   envTable->ThrowNew = local::ThrowNew;
