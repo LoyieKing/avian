@@ -7,12 +7,16 @@
 
    There is NO WARRANTY for this software.  See license.txt for
    details. */
-
 package java.io;
 
 public class PrintStream extends OutputStream {
   private final OutputStream out;
   private final boolean autoFlush;
+  // Protects only the shared OutputStream. Encoding happens before this
+  // lock is taken, so a line's allocation and UTF-8 conversion do not
+  // keep every other printer parked, and do not run while this monitor
+  // is held across a safepoint.
+  private final Object bufferLock = new Object();
 
   private static class Static {
     private static final byte[] newline
@@ -39,11 +43,32 @@ public class PrintStream extends OutputStream {
     this(out, false);
   }
 
-  public synchronized void print(String s) {
+  private static byte[] withNewline(byte[] text) {
+    byte[] nl = Static.newline;
+    byte[] line = new byte[text.length + nl.length];
+    System.arraycopy(text, 0, line, 0, text.length);
+    System.arraycopy(nl, 0, line, text.length, nl.length);
+    return line;
+  }
+
+  private void writeLocked(byte[] b) throws IOException {
+    out.write(b);
+  }
+
+  private void flushLocked() {
     try {
-      out.write(s.getBytes());
-      if (autoFlush) flush();
+      out.flush();
     } catch (IOException e) { }
+  }
+
+  public void print(String s) {
+    byte[] text = s.getBytes();
+    synchronized (bufferLock) {
+      try {
+        writeLocked(text);
+        if (autoFlush) flushLocked();
+      } catch (IOException e) { }
+    }
   }
 
   public void print(Object o) {
@@ -78,16 +103,20 @@ public class PrintStream extends OutputStream {
     print(String.valueOf(s));
   }
 
-  public synchronized PrintStream printf(java.util.Locale locale, String format, Object... args) {
+  public PrintStream printf(java.util.Locale locale, String format, Object... args) {
     // should this be cached in an instance variable??
     final java.util.Formatter formatter = new java.util.Formatter(this);
-    formatter.format(locale, format, args);
+    synchronized (bufferLock) {
+      formatter.format(locale, format, args);
+    }
     return this;
   }
 
-  public synchronized PrintStream printf(String format, Object... args) {
+  public PrintStream printf(String format, Object... args) {
     final java.util.Formatter formatter = new java.util.Formatter(this);
-    formatter.format(format, args);
+    synchronized (bufferLock) {
+      formatter.format(format, args);
+    }
     return this;
   }
 
@@ -99,19 +128,24 @@ public class PrintStream extends OutputStream {
     return printf(locale, format, args);
   }
 
-  public synchronized void println(String s) {
-    try {
-      out.write(s.getBytes());    
-      out.write(Static.newline);
-      if (autoFlush) flush();
-    } catch (IOException e) { }
+  public void println(String s) {
+    byte[] line = withNewline(s.getBytes());
+    synchronized (bufferLock) {
+      try {
+        writeLocked(line);
+        if (autoFlush) flushLocked();
+      } catch (IOException e) { }
+    }
   }
 
-  public synchronized void println() {
-    try {
-      out.write(Static.newline);
-      if (autoFlush) flush();
-    } catch (IOException e) { }
+  public void println() {
+    byte[] nl = Static.newline;
+    synchronized (bufferLock) {
+      try {
+        writeLocked(nl);
+        if (autoFlush) flushLocked();
+      } catch (IOException e) { }
+    }
   }
 
   public void println(Object o) {
@@ -145,26 +179,32 @@ public class PrintStream extends OutputStream {
   public void println(char[] s) {
     println(String.valueOf(s));
   }
-  
+
   public void write(int c) throws IOException {
-    out.write(c);
-    if (autoFlush && c == '\n') flush();
+    synchronized (bufferLock) {
+      out.write(c);
+      if (autoFlush && c == '\n') flushLocked();
+    }
   }
 
   public void write(byte[] buffer, int offset, int length) throws IOException {
-    out.write(buffer, offset, length);
-    if (autoFlush) flush();
+    synchronized (bufferLock) {
+      out.write(buffer, offset, length);
+      if (autoFlush) flushLocked();
+    }
   }
 
   public void flush() {
-    try {
-      out.flush();
-    } catch (IOException e) { }
+    synchronized (bufferLock) {
+      flushLocked();
+    }
   }
 
   public void close() {
-    try {
-      out.close();
-    } catch (IOException e) { }
+    synchronized (bufferLock) {
+      try {
+        out.close();
+      } catch (IOException e) { }
+    }
   }
 }
