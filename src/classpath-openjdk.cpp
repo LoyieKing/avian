@@ -458,35 +458,23 @@ class MyClasspath : public Classpath {
                                int32_t length)
   {
     if (objectClass(t, oarray) == type(t, GcByteArray::Type)) {
+      // The bytes are Modified UTF-8. JDK's UTF-8 constructor rejects
+      // the overlong C0 80 encoding of U+0000, so decode here.
       GcByteArray* array = cast<GcByteArray>(t, oarray);
       PROTECT(t, array);
 
-      GcCharArray* charArray = makeCharArray(t, length);
-      for (int i = 0; i < length; ++i) {
-        if (array->body()[offset + i] & 0x80) {
-          GcMethod* constructor = resolveMethod(t,
-                                                type(t, GcString::Type),
-                                                "<init>",
-                                                "([BIILjava/lang/String;)V");
-          PROTECT(t, constructor);
-
-          GcString* utf8 = vm::makeString(t, "UTF8");
-          PROTECT(t, utf8);
-
-          object s = makeNew(t, type(t, GcString::Type));
-          PROTECT(t, s);
-
-          t->m->processor->invoke(
-              t, constructor, s, array, offset, length, utf8);
-
-          return cast<GcString>(t, s);
-        }
-
-        charArray->body()[i] = array->body()[offset + i];
+      unsigned byteCount = static_cast<unsigned>(length);
+      unsigned chars = mutf8Chars(
+          reinterpret_cast<const uint8_t*>(array->body().begin()) + offset,
+          byteCount);
+      GcCharArray* charArray = makeCharArray(t, chars);
+      PROTECT(t, charArray);
+      const uint8_t* p
+          = reinterpret_cast<const uint8_t*>(array->body().begin()) + offset;
+      for (unsigned i = 0; i < chars; ++i) {
+        charArray->body()[i] = mutf8Next(p);
       }
-
-      oarray = charArray;
-      offset = 0;
+      return vm::makeString(t, charArray, 0, static_cast<int32_t>(chars), 0);
     } else {
       expect(t, objectClass(t, oarray) == type(t, GcCharArray::Type));
     }
@@ -1012,7 +1000,7 @@ int64_t JNICALL
   GcString* path
       = cast<GcString>(t, fieldAtOffset<object>(file, cp->filePathField));
 
-  THREAD_RUNTIME_ARRAY(t, char, p, path->length(t) + 1);
+  THREAD_RUNTIME_ARRAY(t, char, p, stringCStringLength(t, path));
   stringChars(t, path, RUNTIME_ARRAY_BODY(p));
   replace('\\', '/', RUNTIME_ARRAY_BODY(p));
 
@@ -1071,7 +1059,7 @@ int64_t JNICALL
   GcString* path
       = cast<GcString>(t, fieldAtOffset<object>(file, cp->filePathField));
 
-  THREAD_RUNTIME_ARRAY(t, char, p, path->length(t) + 1);
+  THREAD_RUNTIME_ARRAY(t, char, p, stringCStringLength(t, path));
   stringChars(t, path, RUNTIME_ARRAY_BODY(p));
   replace('\\', '/', RUNTIME_ARRAY_BODY(p));
 
@@ -1125,7 +1113,7 @@ int64_t JNICALL getFileLength(Thread* t, GcMethod* method, uintptr_t* arguments)
   GcString* path
       = cast<GcString>(t, fieldAtOffset<object>(file, cp->filePathField));
 
-  THREAD_RUNTIME_ARRAY(t, char, p, path->length(t) + 1);
+  THREAD_RUNTIME_ARRAY(t, char, p, stringCStringLength(t, path));
   stringChars(t, path, RUNTIME_ARRAY_BODY(p));
   replace('\\', '/', RUNTIME_ARRAY_BODY(p));
 
@@ -1168,7 +1156,7 @@ void JNICALL openFile(Thread* t, GcMethod* method, uintptr_t* arguments)
 
   MyClasspath* cp = static_cast<MyClasspath*>(t->m->classpath);
 
-  THREAD_RUNTIME_ARRAY(t, char, p, path->length(t) + 1);
+  THREAD_RUNTIME_ARRAY(t, char, p, stringCStringLength(t, path));
   stringChars(t, path, RUNTIME_ARRAY_BODY(p));
   replace('\\', '/', RUNTIME_ARRAY_BODY(p));
 
@@ -1499,7 +1487,7 @@ int64_t JNICALL openZipFile(Thread* t, GcMethod* method, uintptr_t* arguments)
 
   MyClasspath* cp = static_cast<MyClasspath*>(t->m->classpath);
 
-  THREAD_RUNTIME_ARRAY(t, char, p, path->length(t) + 1);
+  THREAD_RUNTIME_ARRAY(t, char, p, stringCStringLength(t, path));
   stringChars(t, path, RUNTIME_ARRAY_BODY(p));
   replace('\\', '/', RUNTIME_ARRAY_BODY(p));
 
@@ -2025,7 +2013,7 @@ void JNICALL loadLibrary(Thread* t, object, uintptr_t* arguments)
           ->loader());
 
   GcString* name = cast<GcString>(t, reinterpret_cast<object>(arguments[1]));
-  THREAD_RUNTIME_ARRAY(t, char, n, name->length(t) + 1);
+  THREAD_RUNTIME_ARRAY(t, char, n, stringCStringLength(t, name));
   stringChars(t, name, RUNTIME_ARRAY_BODY(n));
 
   bool absolute = arguments[2];
@@ -3966,7 +3954,7 @@ uint64_t jvmGetSystemPackage(Thread* t, uintptr_t* arguments)
 
   ACQUIRE(t, t->m->classLock);
 
-  THREAD_RUNTIME_ARRAY(t, char, chars, (*s)->length(t) + 1);
+  THREAD_RUNTIME_ARRAY(t, char, chars, stringCStringLength(t, *s));
   stringChars(t, *s, RUNTIME_ARRAY_BODY(chars));
 
   object key = makeByteArray(t, RUNTIME_ARRAY_BODY(chars));
@@ -4444,7 +4432,7 @@ uint64_t jvmFindLoadedClass(Thread* t, uintptr_t* arguments)
   jobject loader = reinterpret_cast<jobject>(arguments[0]);
   jstring name = reinterpret_cast<jstring>(arguments[1]);
 
-  GcByteArray* spec = makeByteArray(t, (*name)->length(t) + 1);
+  GcByteArray* spec = makeByteArray(t, stringCStringLength(t, *name));
 
   {
     char* s = reinterpret_cast<char*>(spec->body().begin());
@@ -5159,15 +5147,16 @@ uint64_t jvmConstantPoolGetUTF8At(Thread* t, uintptr_t* arguments)
   jobject pool = reinterpret_cast<jobject>(arguments[0]);
   jint index = arguments[1];
 
-  object array = parseUtf8(
-      t,
-      cast<GcByteArray>(
-          t, singletonObject(t, cast<GcSingleton>(t, *pool), index - 1)));
+  GcByteArray* utf8 = cast<GcByteArray>(
+      t, singletonObject(t, cast<GcSingleton>(t, *pool), index - 1));
+  PROTECT(t, utf8);
+  unsigned n = utf8->length();
+  if (n) {
+    --n;
+  }
 
-  return reinterpret_cast<uint64_t>(makeLocalReference(
-      t,
-      t->m->classpath->makeString(
-          t, array, 0, fieldAtOffset<uintptr_t>(array, BytesPerWord) - 1)));
+  return reinterpret_cast<uint64_t>(
+      makeLocalReference(t, t->m->classpath->makeString(t, utf8, 0, n)));
 }
 
 extern "C" AVIAN_EXPORT jstring JNICALL EXPORT(
@@ -6097,7 +6086,7 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
 
   GcString* country = cast<GcString>(t, reinterpret_cast<object>(arguments[1]));
 
-  THREAD_RUNTIME_ARRAY(t, char, countryChars, country->length(t) + 1);
+  THREAD_RUNTIME_ARRAY(t, char, countryChars, stringCStringLength(t, country));
   stringChars(t, country, RUNTIME_ARRAY_BODY(countryChars));
 
   local::MyClasspath* cp = static_cast<local::MyClasspath*>(t->m->classpath);

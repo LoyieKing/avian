@@ -183,19 +183,32 @@ const jchar* JNICALL GetStringCritical(Thread* t, jstring s, jboolean* isCopy)
     *isCopy = true;
   }
 
+#ifdef HAVE_StringUnsafe_data
+  // There is no UTF-16 body to pin. Copy, and do not call GetStringChars:
+  // that enters the thread again.
+  jchar* chars = static_cast<jchar*>(
+      t->m->heap->allocate(((*s)->length(t) + 1) * sizeof(jchar)));
+  stringChars(t, *s, chars);
+  return chars;
+#else
   object data = (*s)->data();
   if (objectClass(t, data) == type(t, GcByteArray::Type)) {
     return GetStringChars(t, s, isCopy);
   } else {
     return &cast<GcCharArray>(t, data)->body()[(*s)->offset(t)];
   }
+#endif
 }
 
 void JNICALL ReleaseStringCritical(Thread* t, jstring s, const jchar* chars)
 {
+#ifdef HAVE_StringUnsafe_data
+  t->m->heap->free(chars, ((*s)->length(t) + 1) * sizeof(jchar));
+#else
   if (objectClass(t, (*s)->data()) == type(t, GcByteArray::Type)) {
     ReleaseStringChars(t, s, chars);
   }
+#endif
 
   if ((--t->criticalLevel) == 0) {
     enter(t, Thread::IdleState);
@@ -282,7 +295,7 @@ uint64_t newStringUTF(Thread* t, uintptr_t* arguments)
   return reinterpret_cast<uint64_t>(makeLocalReference(
       t,
       t->m->classpath->makeString(
-          t, array, 0, fieldAtOffset<uintptr_t>(array, BytesPerWord) - 1)));
+          t, array, 0, fieldAtOffset<uintptr_t>(array, BytesPerWord))));
 }
 
 jstring JNICALL NewStringUTF(Thread* t, const char* chars)

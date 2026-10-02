@@ -482,8 +482,7 @@ extern "C" AVIAN_EXPORT void JNICALL
 
   bool mapName = arguments[2];
 
-  unsigned length = name->length(t);
-  THREAD_RUNTIME_ARRAY(t, char, n, length + 1);
+  THREAD_RUNTIME_ARRAY(t, char, n, stringCStringLength(t, name));
   stringChars(t, name, RUNTIME_ARRAY_BODY(n));
 
   loadLibrary(t, "", RUNTIME_ARRAY_BODY(n), mapName, true);

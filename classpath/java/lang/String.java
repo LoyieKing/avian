@@ -17,9 +17,6 @@ import java.util.Formatter;
 import java.util.Locale;
 import java.util.regex.Pattern;
 
-import avian.Iso88591;
-import avian.Utf8;
-
 public final class String
   implements Comparable<String>, CharSequence, Serializable
 {
@@ -36,17 +33,37 @@ public final class String
     }
   };
 
-  private final Object data;
-  private final int offset;
+  // Modified UTF-8 payload. Exactly one of data and unsafe_data is live.
+  // unsafe_data is the address of a u2 big-endian byte length followed by
+  // that many Modified UTF-8 bytes, in memory the GC does not move.
+  private final byte[] data;
+  private final long unsafe_data;
   private final int length;
   private int hashCode;
 
+  private static final class Encoded {
+    final byte[] data;
+    final int length;
+
+    Encoded(byte[] data, int length) {
+      this.data = data;
+      this.length = length;
+    }
+  }
+
+  private String(Encoded encoded) {
+    this.data = encoded.data;
+    this.unsafe_data = 0;
+    this.length = encoded.length;
+    this.hashCode = 0;
+  }
+
   public String() {
-    this(new char[0], 0, 0);
+    this(new Encoded(new byte[0], 0));
   }
 
   public String(char[] data, int offset, int length, boolean copy) {
-    this((Object) data, offset, length, copy);
+    this(encode(data, offset, length));
   }
 
   public String(char[] data, int offset, int length) {
@@ -60,16 +77,13 @@ public final class String
   public String(byte bytes[], int offset, int length, String charsetName)
     throws UnsupportedEncodingException
   {
-    this(bytes, offset, length);
-    if (! (charsetName.equalsIgnoreCase(UTF_8_ENCODING)
-           || charsetName.equalsIgnoreCase(ISO_8859_1_ENCODING)))
-    {
-      throw new UnsupportedEncodingException(charsetName);
-    }
+    this(decodeCharset(bytes, offset, length, charsetName));
   }
 
+  // bytes are Modified UTF-8. copy == false shares the array when the
+  // range is the whole array, or the whole array except a trailing 0.
   public String(byte[] data, int offset, int length, boolean copy) {
-    this((Object) data, offset, length, copy);
+    this(copyMutf8(data, offset, length, copy));
   }
 
   public String(byte[] data, int offset, int length) {
@@ -77,11 +91,14 @@ public final class String
   }
 
   public String(byte[] data) {
-    this(data, 0, data.length);
+    this(decodeKnown(data, 0, data.length, DEFAULT_ENCODING));
   }
 
   public String(String s) {
-    this(s.toCharArray());
+    this.data = s.data;
+    this.unsafe_data = s.unsafe_data;
+    this.length = s.length;
+    this.hashCode = s.hashCode;
   }
 
   public String(byte[] data, String charset)
@@ -94,77 +111,14 @@ public final class String
     this(data, 0, data.length, charset);
   }
 
-  public String(byte[] data, int offset, int length, java.nio.charset.Charset charset) {
-    this(data, offset, length);
-    if (charset == null) throw new NullPointerException();
-    String name = charset.name();
-    if (!(name.equalsIgnoreCase(UTF_8_ENCODING)
-          || name.equalsIgnoreCase(ISO_8859_1_ENCODING)
-          || name.equalsIgnoreCase("US-ASCII")
-          || name.equalsIgnoreCase("ASCII"))) {
-      throw new java.nio.charset.UnsupportedCharsetException(name);
-    }
+  public String(byte[] data, int offset, int length,
+                java.nio.charset.Charset charset)
+  {
+    this(decodeCharsetObject(data, offset, length, charset));
   }
 
   public String(byte bytes[], int highByte, int offset, int length) {
-    if (offset < 0 )
-      throw new StringIndexOutOfBoundsException(offset);
-    else if (offset + length > bytes.length)
-      throw new StringIndexOutOfBoundsException(offset + length);
-    else if (length < 0)
-      throw new StringIndexOutOfBoundsException(length);
-
-    char[] c = new char[length];
-    int mask = highByte << 8;
-    for (int i = 0; i < length; ++i) {
-      c[i] = (char) ((bytes[offset + i] & 0xFF) | mask);
-    }
-
-    this.data = c;
-    this.offset = 0;
-    this.length = length;
-  }
-
-  private String(Object data, int offset, int length, boolean copy) {
-    int l;
-    if (data instanceof char[]) {
-      l = ((char[]) data).length;
-    } else {
-      l = ((byte[]) data).length;
-    }
-
-    if (offset < 0 )
-      throw new StringIndexOutOfBoundsException(offset);
-    else if (offset + length > l)
-      throw new StringIndexOutOfBoundsException(offset + length);
-    else if (length < 0)
-      throw new StringIndexOutOfBoundsException(length);
-
-    if(!copy && Utf8.test(data)) copy = true;
-
-    if (copy) {
-      Object c;
-      if (data instanceof char[]) {
-        c = new char[length];
-        System.arraycopy(data, offset, c, 0, length);
-      } else {
-        c = Utf8.decode((byte[])data, offset, length);
-        if(c instanceof char[]) length = ((char[])c).length;
-        if (c == null) {
-          throw new RuntimeException
-            ("unable to parse \"" + new String(data, offset, length, false)
-             + "\"");
-        }
-      }
-
-      this.data = c;
-      this.offset = 0;
-      this.length = length;
-    } else {
-      this.data = data;
-      this.offset = offset;
-      this.length = length;
-    }
+    this(encodeHigh(bytes, highByte, offset, length));
   }
 
   @Override
@@ -179,12 +133,23 @@ public final class String
 
   @Override
   public int hashCode() {
-    if (hashCode == 0) {
-      int h = 0;
-      for (int i = 0; i < length; ++i) h = (h * 31) + charAt(i);
+    int h = hashCode;
+    if (h == 0 && length != 0) {
+      byte[] b = bytes();
+      int n = payload(b);
+      if (n == length) {
+        for (int i = 0; i < n; ++i) {
+          h = (h * 31) + (b[i] & 0xff);
+        }
+      } else {
+        Seq seq = new Seq(b);
+        for (int i = 0; i < length; ++i) {
+          h = (h * 31) + seq.next();
+        }
+      }
       hashCode = h;
     }
-    return hashCode;
+    return h;
   }
 
   @Override
@@ -193,7 +158,21 @@ public final class String
       return true;
     } else if (o instanceof String) {
       String s = (String) o;
-      return s.length == length && compareTo(s) == 0;
+      if (s.length != length) {
+        return false;
+      }
+      byte[] a = bytes();
+      byte[] b = s.bytes();
+      int n = payload(a);
+      if (n != payload(b)) {
+        return false;
+      }
+      for (int i = 0; i < n; ++i) {
+        if (a[i] != b[i]) {
+          return false;
+        }
+      }
+      return true;
     } else {
       return false;
     }
@@ -209,8 +188,9 @@ public final class String
 
   public boolean contentEquals(CharSequence cs) {
     if (cs.length() != length) return false;
+    Seq seq = new Seq(bytes());
     for (int i = 0; i < length; ++i) {
-      if (charAt(i) != cs.charAt(i)) return false;
+      if (seq.next() != cs.charAt(i)) return false;
     }
     return true;
   }
@@ -219,16 +199,23 @@ public final class String
   public int compareTo(String s) {
     if (this == s) return 0;
 
-    int idx = 0;
-    int result;
-
-    int end = (length < s.length ? length : s.length);
-
-    while (idx < end) {
-      if ((result = charAt(idx) - s.charAt(idx)) != 0) {
-        return result;
+    byte[] a = bytes();
+    byte[] b = s.bytes();
+    int n = length < s.length ? length : s.length;
+    if (payload(a) == length && payload(b) == s.length) {
+      int m = n;
+      for (int i = 0; i < m; ++i) {
+        int d = (a[i] & 0xff) - (b[i] & 0xff);
+        if (d != 0) return d;
       }
-      idx++;
+      return length - s.length;
+    }
+
+    Seq sa = new Seq(a);
+    Seq sb = new Seq(b);
+    for (int i = 0; i < n; ++i) {
+      int d = sa.next() - sb.next();
+      if (d != 0) return d;
     }
     return length - s.length;
   }
@@ -236,71 +223,91 @@ public final class String
   public int compareToIgnoreCase(String s) {
     if (this == s) return 0;
 
-    int idx = 0;
-    int result;
-
-    int end = (length < s.length ? length : s.length);
-
-    while (idx < end) {
-      if ((result =
-           Character.toLowerCase(charAt(idx)) -
-           Character.toLowerCase(s.charAt(idx))) != 0) {
-        return result;
-      }
-      idx++;
+    int n = length < s.length ? length : s.length;
+    Seq sa = new Seq(bytes());
+    Seq sb = new Seq(s.bytes());
+    for (int i = 0; i < n; ++i) {
+      int d = Character.toLowerCase(sa.next())
+        - Character.toLowerCase(sb.next());
+      if (d != 0) return d;
     }
     return length - s.length;
   }
 
   public String trim() {
+    byte[] b = bytes();
+    Seq seq = new Seq(b);
     int start = -1;
+    int startByte = 0;
     for (int i = 0; i < length; ++i) {
-      char c = charAt(i);
-      if (start == -1 && ! Character.isWhitespace(c)) {
+      int at = seq.i;
+      char c = seq.next();
+      if (! Character.isWhitespace(c)) {
         start = i;
+        startByte = at;
         break;
       }
     }
 
-    int end = -1;
-    for (int i = length - 1; i >= 0; --i) {
-      char c = charAt(i);
-      if (end == -1 && ! Character.isWhitespace(c)) {
-        end = i + 1;
-        break;
-      }
-    }
+    if (start < 0) return "";
 
-    if (start >= end) {
-      return "";
+    int end = length;
+    int endByte = payload(b);
+    if (endByte == length) {
+      for (int i = length - 1; i >= start; --i) {
+        if (! Character.isWhitespace((char) (b[i] & 0xff))) {
+          end = i + 1;
+          endByte = end;
+          break;
+        }
+      }
     } else {
-      return substring(start, end);
+      int[] ends = new int[length + 1];
+      ends[0] = 0;
+      Seq walk = new Seq(b);
+      for (int i = 0; i < length; ++i) {
+        walk.next();
+        ends[i + 1] = walk.i;
+      }
+      for (int i = length - 1; i >= start; --i) {
+        Seq one = new Seq(b);
+        one.i = ends[i];
+        if (! Character.isWhitespace(one.next())) {
+          end = i + 1;
+          endByte = ends[end];
+          startByte = ends[start];
+          break;
+        }
+      }
     }
+
+    if (start >= end) return "";
+    if (start == 0 && end == length) return this;
+    return slice(b, startByte, endByte, end - start);
   }
 
   public String toLowerCase() {
-    for (int j = 0; j < length; ++j) {
-      char ch = charAt(j);
-      if (Character.toLowerCase(ch) != ch) {
-        char[] b = new char[length];
-        for (int i = 0; i < length; ++i) {
-          b[i] = Character.toLowerCase(charAt(i));
-        }
-        return new String(b, 0, length, false);
-      }
-    }
-    return this;
+    return changeCase(false);
   }
 
   public String toUpperCase() {
-    for (int j = 0; j < length; ++j) {
-      char ch = charAt(j);
-      if (Character.toUpperCase(ch) != ch) {
-        char[] b = new char[length];
-        for (int i = 0; i < length; ++i) {
-          b[i] = Character.toUpperCase(charAt(i));
+    return changeCase(true);
+  }
+
+  private String changeCase(boolean upper) {
+    byte[] b = bytes();
+    Seq seq = new Seq(b);
+    for (int i = 0; i < length; ++i) {
+      char ch = seq.next();
+      char mapped = upper ? Character.toUpperCase(ch) : Character.toLowerCase(ch);
+      if (mapped != ch) {
+        char[] chars = new char[length];
+        Seq again = new Seq(b);
+        for (int j = 0; j < length; ++j) {
+          char c = again.next();
+          chars[j] = upper ? Character.toUpperCase(c) : Character.toLowerCase(c);
         }
-        return new String(b, 0, length, false);
+        return new String(chars, 0, length, false);
       }
     }
     return this;
@@ -311,17 +318,25 @@ public final class String
   }
 
   public int indexOf(int c, int start) {
-    for (int i = start; i < length; ++i) {
-      if (charAt(i) == c) {
-        return i;
+    if (start < 0) start = 0;
+    if (c < 0 || c > 0xffff) return -1;
+    byte[] b = bytes();
+    if (payload(b) == length && c < 0x80) {
+      for (int i = start; i < length; ++i) {
+        if ((b[i] & 0xff) == c) return i;
       }
+      return -1;
     }
-
+    Seq seq = new Seq(b);
+    for (int i = 0; i < start && i < length; ++i) seq.next();
+    for (int i = start; i < length; ++i) {
+      if (seq.next() == c) return i;
+    }
     return -1;
   }
 
   public int lastIndexOf(int ch) {
-    return lastIndexOf(ch, length-1);
+    return lastIndexOf(ch, length - 1);
   }
 
   public int indexOf(String s) {
@@ -330,19 +345,26 @@ public final class String
 
   public int indexOf(String s, int start) {
     if (s.length == 0) return start;
+    if (start < 0) start = 0;
+    if (start > length - s.length) return -1;
 
-    for (int i = start; i < length - s.length + 1; ++i) {
-      int j = 0;
-      for (; j < s.length; ++j) {
-        if (charAt(i + j) != s.charAt(j)) {
-          break;
+    byte[] a = bytes();
+    byte[] b = s.bytes();
+    if (payload(a) == length && payload(b) == s.length) {
+      int last = length - s.length;
+      for (int i = start; i <= last; ++i) {
+        int j = 0;
+        for (; j < s.length; ++j) {
+          if (a[i + j] != b[j]) break;
         }
+        if (j == s.length) return i;
       }
-      if (j == s.length) {
-        return i;
-      }
+      return -1;
     }
 
+    for (int i = start; i <= length - s.length; ++i) {
+      if (regionEquals(a, i, b, s.length)) return i;
+    }
     return -1;
   }
 
@@ -352,47 +374,51 @@ public final class String
 
   public int lastIndexOf(String s, int lastIndex) {
     if (s.length == 0) return lastIndex;
-
-    for (int i = Math.min(length - s.length, lastIndex); i >= 0; --i) {
-      int j = 0;
-      for (; j < s.length && i + j < length; ++j) {
-        if (charAt(i + j) != s.charAt(j)) {
-          break;
-        }
-      }
-      if (j == s.length) {
-        return i;
-      }
+    int i = length - s.length;
+    if (lastIndex < i) i = lastIndex;
+    byte[] a = bytes();
+    byte[] b = s.bytes();
+    for (; i >= 0; --i) {
+      if (regionEquals(a, i, b, s.length)) return i;
     }
-
     return -1;
   }
 
   public String replace(char oldChar, char newChar) {
-    if (data instanceof char[]) {
-      char[] buf = new char[length];
-      for (int i=0; i < length; i++) {
-        if (charAt(i) == oldChar) {
-          buf[i] = newChar;
-        } else {
-          buf[i] = charAt(i);
-        }
-      }
-      return new String(buf, 0, length, false);
-    } else {
+    if (oldChar == newChar) return this;
+    byte[] b = bytes();
+    if (payload(b) == length && oldChar != 0 && newChar != 0
+        && oldChar < 0x80 && newChar < 0x80) {
       byte[] buf = new byte[length];
-      byte[] orig = (byte[])data;
-      byte oldByte = (byte)oldChar;
-      byte newByte = (byte)newChar;
-      for (int i=0; i < length; i++) {
-        if (orig[i+offset] == oldByte) {
+      byte oldByte = (byte) oldChar;
+      byte newByte = (byte) newChar;
+      boolean changed = false;
+      for (int i = 0; i < length; ++i) {
+        if (b[i] == oldByte) {
           buf[i] = newByte;
+          changed = true;
         } else {
-          buf[i] = orig[i+offset];
+          buf[i] = b[i];
         }
       }
-      return new String(buf, 0, length, false);
+      if (! changed) return this;
+      return new String(new Encoded(buf, length));
     }
+
+    char[] chars = new char[length];
+    Seq seq = new Seq(b);
+    boolean changed = false;
+    for (int i = 0; i < length; ++i) {
+      char c = seq.next();
+      if (c == oldChar) {
+        chars[i] = newChar;
+        changed = true;
+      } else {
+        chars[i] = c;
+      }
+    }
+    if (! changed) return this;
+    return new String(chars, 0, length, false);
   }
 
   public String substring(int start) {
@@ -410,33 +436,34 @@ public final class String
 
     if (start == 0 && end == length)
       return this;
-    else if (end - start == 0)
+    else if (newLen == 0)
       return "";
-    else
-      return new String(data, offset + start, newLen, false);
+
+    byte[] b = bytes();
+    if (payload(b) == length) {
+      return slice(b, start, end, newLen);
+    }
+    Seq seq = new Seq(b);
+    for (int i = 0; i < start; ++i) seq.next();
+    int from = seq.i;
+    for (int i = start; i < end; ++i) seq.next();
+    return slice(b, from, seq.i, newLen);
   }
 
   public boolean startsWith(String s) {
-    if (length >= s.length) {
-      return substring(0, s.length).compareTo(s) == 0;
-    } else {
-      return false;
-    }
+    return startsWith(s, 0);
   }
 
   public boolean startsWith(String s, int start) {
     if (start < 0 || (long) start > (long) length - s.length) {
       return false;
     }
-    return substring(start, start + s.length).compareTo(s) == 0;
+    return regionEquals(bytes(), start, s.bytes(), s.length);
   }
 
   public boolean endsWith(String s) {
-    if (length >= s.length) {
-      return substring(length - s.length).compareTo(s) == 0;
-    } else {
-      return false;
-    }
+    if (length < s.length) return false;
+    return regionEquals(bytes(), length - s.length, s.bytes(), s.length);
   }
 
   public String concat(String s) {
@@ -447,8 +474,7 @@ public final class String
     }
   }
 
-  public void getBytes(int srcOffset, int srcLength,
-                       byte[] dst, int dstOffset)
+  public void getBytes(int srcOffset, int srcLength, byte[] dst, int dstOffset)
   {
     if (srcOffset < 0)
       throw new StringIndexOutOfBoundsException(srcOffset);
@@ -457,14 +483,17 @@ public final class String
     else if (srcLength < 0)
       throw new StringIndexOutOfBoundsException(srcLength);
 
-    if (data instanceof char[]) {
-      char[] src = (char[]) data;
+    byte[] b = bytes();
+    if (payload(b) == length) {
       for (int i = 0; i < srcLength; ++i) {
-        dst[i + dstOffset] = (byte) src[i + offset + srcOffset];
+        dst[dstOffset + i] = b[srcOffset + i];
       }
-    } else {
-      byte[] src = (byte[]) data;
-      System.arraycopy(src, offset + srcOffset, dst, dstOffset, srcLength);
+      return;
+    }
+    Seq seq = new Seq(b);
+    for (int i = 0; i < srcOffset; ++i) seq.next();
+    for (int i = 0; i < srcLength; ++i) {
+      dst[dstOffset + i] = (byte) seq.next();
     }
   }
 
@@ -480,20 +509,28 @@ public final class String
   public byte[] getBytes(String format)
     throws java.io.UnsupportedEncodingException
   {
-    if(data instanceof byte[]) {
-      byte[] b = new byte[length];
-      getBytes(0, length, b, 0);
-      return b;
-    }
     String fmt = format.trim().toUpperCase();
+    byte[] b = bytes();
+    int n = payload(b);
     if (DEFAULT_ENCODING.equals(fmt)) {
-      return Utf8.encode((char[])data, offset, length);
-    } else if (ISO_8859_1_ENCODING.equals(fmt) || LATIN_1_ENCODING.equals(fmt)) {
-      return Iso88591.encode((char[])data, offset, length);
-    } else if ("US-ASCII".equals(fmt) || "ASCII".equals(fmt)) {
-      return Iso88591.encode((char[]) data, offset, length);
-    } else if ("UTF-16BE".equals(fmt) || "UTF-16LE".equals(fmt) || "UTF-16".equals(fmt)) {
-      char[] chars = (char[]) data;
+      if (isUtf8Compatible(b)) {
+        byte[] out = new byte[n];
+        System.arraycopy(b, 0, out, 0, n);
+        return out;
+      }
+      return encodeUtf8(b);
+    } else if (ISO_8859_1_ENCODING.equals(fmt) || LATIN_1_ENCODING.equals(fmt)
+               || "US-ASCII".equals(fmt) || "ASCII".equals(fmt)) {
+      byte[] out = new byte[length];
+      if (n == length) {
+        System.arraycopy(b, 0, out, 0, length);
+      } else {
+        Seq seq = new Seq(b);
+        for (int i = 0; i < length; ++i) out[i] = (byte) seq.next();
+      }
+      return out;
+    } else if ("UTF-16BE".equals(fmt) || "UTF-16LE".equals(fmt)
+               || "UTF-16".equals(fmt)) {
       boolean little = "UTF-16LE".equals(fmt);
       boolean bom = "UTF-16".equals(fmt);
       byte[] out = new byte[length * 2 + (bom ? 2 : 0)];
@@ -502,8 +539,9 @@ public final class String
         out[p++] = (byte) 0xFE;
         out[p++] = (byte) 0xFF;
       }
+      Seq seq = new Seq(b);
       for (int i = 0; i < length; ++i) {
-        char c = chars[offset + i];
+        char c = seq.next();
         if (little) {
           out[p++] = (byte) c;
           out[p++] = (byte) (c >>> 8);
@@ -528,24 +566,24 @@ public final class String
     }
   }
 
-  public void getChars(int srcOffset, int srcEnd,
-                       char[] dst, int dstOffset)
+  public void getChars(int srcOffset, int srcEnd, char[] dst, int dstOffset)
   {
     if (srcOffset < 0)
       throw new StringIndexOutOfBoundsException(srcOffset);
     else if (srcEnd > length)
       throw new StringIndexOutOfBoundsException(srcEnd);
 
-    int srcLength = srcEnd-srcOffset;
-    if (data instanceof char[]) {
-      char[] src = (char[]) data;
-      System.arraycopy(src, offset + srcOffset, dst, dstOffset, srcLength);
-    } else {
-      byte[] src = (byte[]) data;
+    int srcLength = srcEnd - srcOffset;
+    byte[] b = bytes();
+    if (payload(b) == length) {
       for (int i = 0; i < srcLength; ++i) {
-        dst[i + dstOffset] = (char) src[i + offset + srcOffset];
+        dst[dstOffset + i] = (char) (b[srcOffset + i] & 0xff);
       }
+      return;
     }
+    Seq seq = new Seq(b);
+    for (int i = 0; i < srcOffset; ++i) seq.next();
+    for (int i = 0; i < srcLength; ++i) dst[dstOffset + i] = seq.next();
   }
 
   public char[] toCharArray() {
@@ -556,15 +594,17 @@ public final class String
 
   @Override
   public char charAt(int index) {
-    if (index < 0 || index > length) {
+    if (index < 0 || index >= length) {
       throw new StringIndexOutOfBoundsException(index);
     }
-
-    if (data instanceof char[]) {
-      return ((char[]) data)[index + offset];
-    } else {
-      return (char) ((byte[]) data)[index + offset];
+    if (data != null) {
+      if (payload(data) == length) return (char) (data[index] & 0xff);
+      return charAt(data, index);
     }
+    if (unsafeByteLength(unsafe_data) == length) {
+      return (char) (unsafeByte(unsafe_data, index) & 0xff);
+    }
+    return charAt(bytes(), index);
   }
 
   public String[] split(String regex) {
@@ -599,7 +639,6 @@ public final class String
 
     String targetString = target.toString();
     String replaceString = replace.toString();
-
     int targetSize = target.length();
 
     StringBuilder returnValue = new StringBuilder();
@@ -608,8 +647,7 @@ public final class String
     int index = -1;
     while ((index = unhandled.indexOf(targetString)) != -1) {
       returnValue.append(unhandled.substring(0, index)).append(replaceString);
-      unhandled = unhandled.substring(index + targetSize,
-                                      unhandled.length());
+      unhandled = unhandled.substring(index + targetSize, unhandled.length());
     }
 
     returnValue.append(unhandled);
@@ -618,12 +656,9 @@ public final class String
 
   private String infuse(String infuseWith) {
     StringBuilder retVal = new StringBuilder();
-
-    String me = this;
-    for (int i = 0; i < me.length(); i++) {
-      retVal.append(infuseWith).append(me.substring(i, i + 1));
+    for (int i = 0; i < length; i++) {
+      retVal.append(infuseWith).append(substring(i, i + 1));
     }
-
     retVal.append(infuseWith);
     return retVal.toString();
   }
@@ -689,15 +724,18 @@ public final class String
   }
 
   public int lastIndexOf(int ch, int lastIndex) {
-    if (lastIndex >= length) {
-      lastIndex = length - 1;
-    }
-    for (int i = lastIndex ; i >= 0; --i) {
-      if (charAt(i) == ch) {
-        return i;
+    if (ch < 0 || ch > 0xffff) return -1;
+    if (lastIndex >= length) lastIndex = length - 1;
+    byte[] b = bytes();
+    if (payload(b) == length && ch < 0x80) {
+      for (int i = lastIndex; i >= 0; --i) {
+        if ((b[i] & 0xff) == ch) return i;
       }
+      return -1;
     }
-
+    for (int i = lastIndex; i >= 0; --i) {
+      if (charAt(b, i) == ch) return i;
+    }
     return -1;
   }
 
@@ -741,7 +779,6 @@ public final class String
   }
 
   private static boolean simpleCase(Locale locale) {
-    // ENGLISH, US, and ROOT share Unicode's default case mapping.
     return locale == Locale.ENGLISH || locale == Locale.US || locale == Locale.ROOT;
   }
 
@@ -759,5 +796,372 @@ public final class String
     } else {
       throw new UnsupportedOperationException("toLowerCase("+locale+')');
     }
+  }
+
+  private static native byte unsafeByte(long pointer, int index);
+
+  private static native int unsafeByteLength(long pointer);
+
+  private byte[] bytes() {
+    if (data != null) return data;
+    int n = unsafeByteLength(unsafe_data);
+    byte[] b = new byte[n];
+    for (int i = 0; i < n; ++i) b[i] = unsafeByte(unsafe_data, i);
+    return b;
+  }
+
+  // Symbol arrays count a trailing 0. A string may share that array.
+  // Valid Modified UTF-8 has no raw 0, so the extra byte is not a character.
+  private static int payload(byte[] b) {
+    int n = b.length;
+    if (n > 0 && b[n - 1] == 0) return n - 1;
+    return n;
+  }
+
+  private static char charAt(byte[] b, int index) {
+    int end = payload(b);
+    if (end == index || index < 0) {
+      throw new StringIndexOutOfBoundsException(index);
+    }
+    int i = 0;
+    int seen = 0;
+    while (seen < index) {
+      i = skip(b, i, end);
+      seen++;
+    }
+    Seq seq = new Seq(b);
+    seq.i = i;
+    return seq.next();
+  }
+
+  private static String slice(byte[] b, int from, int to, int charLength) {
+    byte[] dst = new byte[to - from];
+    System.arraycopy(b, from, dst, 0, dst.length);
+    return new String(new Encoded(dst, charLength));
+  }
+
+  private static boolean regionEquals(byte[] a, int charOffset, byte[] b,
+                                      int charLength)
+  {
+    int aBytes = payload(a);
+    int aChars = countChars(a, 0, aBytes);
+    if (aBytes == aChars && payload(b) == charLength) {
+      for (int i = 0; i < charLength; ++i) {
+        if (a[charOffset + i] != b[i]) return false;
+      }
+      return true;
+    }
+    Seq sa = new Seq(a);
+    for (int i = 0; i < charOffset; ++i) sa.next();
+    Seq sb = new Seq(b);
+    for (int i = 0; i < charLength; ++i) {
+      if (sa.next() != sb.next()) return false;
+    }
+    return true;
+  }
+
+  private static final class Seq {
+    final byte[] b;
+    int i;
+
+    Seq(byte[] b) {
+      this.b = b;
+    }
+
+    char next() {
+      int a = b[i++] & 0xff;
+      if ((a & 0x80) == 0) return (char) a;
+      if ((a & 0xe0) == 0xc0) {
+        return (char) (((a & 0x1f) << 6) | (b[i++] & 0x3f));
+      }
+      return (char) (((a & 0x0f) << 12)
+                     | ((b[i++] & 0x3f) << 6)
+                     | (b[i++] & 0x3f));
+    }
+  }
+
+  private static int skip(byte[] b, int i, int end) {
+    if (i >= end) return end;
+    int a = b[i] & 0xff;
+    int n = 1;
+    if ((a & 0x80) != 0) n = ((a & 0xe0) == 0xc0) ? 2 : 3;
+    if (i + n > end) return end;
+    return i + n;
+  }
+
+  private static int countChars(byte[] b, int offset, int length) {
+    int end = offset + length;
+    int n = 0;
+    for (int i = offset; i < end; i = skip(b, i, end)) n++;
+    return n;
+  }
+
+  private static void checkRange(int offset, int length, int size) {
+    if (offset < 0)
+      throw new StringIndexOutOfBoundsException(offset);
+    else if (length < 0)
+      throw new StringIndexOutOfBoundsException(length);
+    else if ((long) offset + length > size)
+      throw new StringIndexOutOfBoundsException(offset + length);
+  }
+
+  private static Encoded encodeHigh(byte[] bytes, int highByte, int offset,
+                                     int length)
+  {
+    if (bytes == null) throw new NullPointerException();
+    checkRange(offset, length, bytes.length);
+    char[] chars = new char[length];
+    int mask = highByte << 8;
+    for (int i = 0; i < length; ++i) {
+      chars[i] = (char) ((bytes[offset + i] & 0xFF) | mask);
+    }
+    return encode(chars, 0, length);
+  }
+
+  private static Encoded encode(char[] chars, int offset, int length) {
+    if (chars == null) throw new NullPointerException();
+    checkRange(offset, length, chars.length);
+    int n = 0;
+    for (int i = 0; i < length; ++i) {
+      char c = chars[offset + i];
+      if (c == 0 || c >= 0x80) n += (c >= 0x800 ? 3 : 2);
+      else n += 1;
+    }
+    byte[] out = new byte[n];
+    int j = 0;
+    for (int i = 0; i < length; ++i) {
+      char c = chars[offset + i];
+      if (c == 0) {
+        out[j++] = (byte) 0xC0;
+        out[j++] = (byte) 0x80;
+      } else if (c < 0x80) {
+        out[j++] = (byte) c;
+      } else if (c < 0x800) {
+        out[j++] = (byte) (0xC0 | (c >> 6));
+        out[j++] = (byte) (0x80 | (c & 0x3f));
+      } else {
+        out[j++] = (byte) (0xE0 | (c >> 12));
+        out[j++] = (byte) (0x80 | ((c >> 6) & 0x3f));
+        out[j++] = (byte) (0x80 | (c & 0x3f));
+      }
+    }
+    return new Encoded(out, length);
+  }
+
+  private static Encoded copyMutf8(byte[] data, int offset, int length,
+                                   boolean copy)
+  {
+    if (data == null) throw new NullPointerException();
+    checkRange(offset, length, data.length);
+    int chars = countChars(data, offset, length);
+    if (! copy && offset == 0
+        && (length == data.length
+            || (length + 1 == data.length && data[length] == 0))) {
+      return new Encoded(data, chars);
+    }
+    byte[] b = new byte[length];
+    System.arraycopy(data, offset, b, 0, length);
+    return new Encoded(b, chars);
+  }
+
+  private static boolean knownCharset(String name) {
+    return name.equalsIgnoreCase(UTF_8_ENCODING)
+      || name.equalsIgnoreCase(ISO_8859_1_ENCODING)
+      || name.equalsIgnoreCase(LATIN_1_ENCODING)
+      || name.equalsIgnoreCase("US-ASCII")
+      || name.equalsIgnoreCase("ASCII");
+  }
+
+  private static Encoded decodeCharset(byte[] data, int offset, int length,
+                                       String charsetName)
+    throws UnsupportedEncodingException
+  {
+    if (charsetName == null) throw new UnsupportedEncodingException(null);
+    if (! knownCharset(charsetName)) {
+      throw new UnsupportedEncodingException(charsetName);
+    }
+    return decodeKnown(data, offset, length, charsetName);
+  }
+
+  private static Encoded decodeCharsetObject(byte[] data, int offset, int length,
+                                             java.nio.charset.Charset charset)
+  {
+    if (charset == null) throw new NullPointerException();
+    String name = charset.name();
+    if (! knownCharset(name)) {
+      throw new java.nio.charset.UnsupportedCharsetException(name);
+    }
+    return decodeKnown(data, offset, length, name);
+  }
+
+  private static Encoded decodeKnown(byte[] data, int offset, int length,
+                                     String charsetName)
+  {
+    if (data == null) throw new NullPointerException();
+    checkRange(offset, length, data.length);
+    if (charsetName.equalsIgnoreCase(ISO_8859_1_ENCODING)
+        || charsetName.equalsIgnoreCase(LATIN_1_ENCODING)
+        || charsetName.equalsIgnoreCase("US-ASCII")
+        || charsetName.equalsIgnoreCase("ASCII")) {
+      char[] chars = new char[length];
+      for (int i = 0; i < length; ++i) {
+        chars[i] = (char) (data[offset + i] & 0xff);
+      }
+      return encode(chars, 0, length);
+    }
+    if (isMutf8(data, offset, length)) {
+      return copyMutf8(data, offset, length, true);
+    }
+    return transcodeUtf8(data, offset, length);
+  }
+
+  // Modified UTF-8: no raw 0x00 and no 4-byte sequence. C0 80 is accepted.
+  private static boolean isMutf8(byte[] b, int offset, int length) {
+    int i = offset;
+    int end = offset + length;
+    while (i < end) {
+      int a = b[i] & 0xff;
+      if (a == 0) return false;
+      if (a < 0x80) {
+        i++;
+        continue;
+      }
+      if ((a & 0xe0) == 0xc0) {
+        if (i + 1 >= end || (b[i + 1] & 0xc0) != 0x80) return false;
+        i += 2;
+        continue;
+      }
+      if ((a & 0xf0) == 0xe0) {
+        if (i + 2 >= end || (b[i + 1] & 0xc0) != 0x80
+            || (b[i + 2] & 0xc0) != 0x80) return false;
+        i += 3;
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  private static Encoded transcodeUtf8(byte[] in, int offset, int length) {
+    char[] chars = new char[length];
+    int n = 0;
+    int i = offset;
+    int end = offset + length;
+    while (i < end) {
+      int a = in[i++] & 0xff;
+      if (a < 0x80) {
+        chars[n++] = (char) a;
+        continue;
+      }
+      if ((a & 0xe0) == 0xc0 && i < end && (in[i] & 0xc0) == 0x80) {
+        int b = in[i++] & 0xff;
+        chars[n++] = (char) (((a & 0x1f) << 6) | (b & 0x3f));
+        continue;
+      }
+      if ((a & 0xf0) == 0xe0 && i + 1 < end
+          && (in[i] & 0xc0) == 0x80 && (in[i + 1] & 0xc0) == 0x80) {
+        int b = in[i++] & 0xff;
+        int c = in[i++] & 0xff;
+        chars[n++] = (char) (((a & 0x0f) << 12) | ((b & 0x3f) << 6) | (c & 0x3f));
+        continue;
+      }
+      if ((a & 0xf8) == 0xf0 && i + 2 < end
+          && (in[i] & 0xc0) == 0x80 && (in[i + 1] & 0xc0) == 0x80
+          && (in[i + 2] & 0xc0) == 0x80) {
+        int b = in[i++] & 0xff;
+        int c = in[i++] & 0xff;
+        int d = in[i++] & 0xff;
+        int cp = ((a & 0x07) << 18) | ((b & 0x3f) << 12)
+          | ((c & 0x3f) << 6) | (d & 0x3f);
+        if (cp >= 0x10000 && cp <= 0x10ffff) {
+          cp -= 0x10000;
+          chars[n++] = (char) (0xD800 + (cp >> 10));
+          chars[n++] = (char) (0xDC00 + (cp & 0x3ff));
+          continue;
+        }
+      }
+      chars[n++] = '\ufffd';
+    }
+    return encode(chars, 0, n);
+  }
+
+  private static boolean isUtf8Compatible(byte[] b) {
+    int end = payload(b);
+    for (int i = 0; i < end; ) {
+      int a = b[i] & 0xff;
+      if (a < 0x80) {
+        i++;
+        continue;
+      }
+      if ((a & 0xe0) == 0xc0) {
+        if (a == 0xc0 && (b[i + 1] & 0xff) == 0x80) return false;
+        i += 2;
+        continue;
+      }
+      if (a == 0xed && (b[i + 1] & 0xff) >= 0xa0) return false;
+      i += 3;
+    }
+    return true;
+  }
+
+  private static int utf8Size(char c, boolean pair) {
+    if (pair) return 4;
+    if (c == 0 || c < 0x80) return 1;
+    if (c < 0x800) return 2;
+    return 3;
+  }
+
+  private static byte[] encodeUtf8(byte[] mutf8) {
+    int chars = countChars(mutf8, 0, payload(mutf8));
+    int n = 0;
+    Seq count = new Seq(mutf8);
+    for (int i = 0; i < chars; ++i) {
+      char c = count.next();
+      boolean pair = false;
+      if (c >= 0xD800 && c <= 0xDBFF && i + 1 < chars) {
+        int saved = count.i;
+        char d = count.next();
+        if (d >= 0xDC00 && d <= 0xDFFF) {
+          pair = true;
+          i++;
+        } else {
+          count.i = saved;
+        }
+      }
+      n += utf8Size(c, pair);
+    }
+    byte[] out = new byte[n];
+    Seq seq = new Seq(mutf8);
+    int j = 0;
+    for (int i = 0; i < chars; ++i) {
+      char c = seq.next();
+      if (c >= 0xD800 && c <= 0xDBFF && i + 1 < chars) {
+        int saved = seq.i;
+        char d = seq.next();
+        if (d >= 0xDC00 && d <= 0xDFFF) {
+          int cp = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+          out[j++] = (byte) (0xf0 | (cp >> 18));
+          out[j++] = (byte) (0x80 | ((cp >> 12) & 0x3f));
+          out[j++] = (byte) (0x80 | ((cp >> 6) & 0x3f));
+          out[j++] = (byte) (0x80 | (cp & 0x3f));
+          i++;
+          continue;
+        }
+        seq.i = saved;
+      }
+      if (c == 0) {
+        out[j++] = 0;
+      } else if (c < 0x80) {
+        out[j++] = (byte) c;
+      } else if (c < 0x800) {
+        out[j++] = (byte) (0xc0 | (c >> 6));
+        out[j++] = (byte) (0x80 | (c & 0x3f));
+      } else {
+        out[j++] = (byte) (0xe0 | (c >> 12));
+        out[j++] = (byte) (0x80 | ((c >> 6) & 0x3f));
+        out[j++] = (byte) (0x80 | (c & 0x3f));
+      }
+    }
+    return out;
   }
 }

@@ -2185,17 +2185,117 @@ GcByteArray* makeByteArray(Thread* t, const char* format, ...);
 
 GcString* makeString(Thread* t, const char* format, ...);
 
+// One Modified UTF-8 sequence is one Java char. U+0000 is the two bytes C0 80.
+inline uint16_t mutf8Next(const uint8_t*& p)
+{
+  uint8_t a = *p++;
+  if ((a & 0x80) == 0) {
+    return a;
+  }
+  if ((a & 0xE0) == 0xC0) {
+    uint8_t b = *p++;
+    return static_cast<uint16_t>(((a & 0x1F) << 6) | (b & 0x3F));
+  }
+  uint8_t b = *p++;
+  uint8_t c = *p++;
+  return static_cast<uint16_t>(((a & 0x0F) << 12) | ((b & 0x3F) << 6) | (c & 0x3F));
+}
+
+inline const uint8_t* mutf8Skip(const uint8_t* p, unsigned chars)
+{
+  for (unsigned i = 0; i < chars; ++i) {
+    mutf8Next(p);
+  }
+  return p;
+}
+
+inline unsigned mutf8Chars(const uint8_t* p, unsigned length)
+{
+  const uint8_t* end = p + length;
+  unsigned chars = 0;
+  while (p < end) {
+    uint8_t a = *p;
+    if ((a & 0x80) == 0) {
+      p += 1;
+    } else if ((a & 0xE0) == 0xC0) {
+      p += 2;
+    } else {
+      p += 3;
+    }
+    ++chars;
+  }
+  return chars;
+}
+
+inline uint32_t hashMutf8(const uint8_t* p, unsigned length, unsigned charLength)
+{
+  uint32_t h = 0;
+  if (length == charLength) {
+    for (unsigned i = 0; i < length; ++i) {
+      h = (h * 31) + p[i];
+    }
+    return h;
+  }
+  const uint8_t* end = p + length;
+  while (p < end) {
+    h = (h * 31) + mutf8Next(p);
+  }
+  return h;
+}
+
+inline GcByteArray* encodeMutf8(Thread* t, const uint16_t* chars, unsigned length)
+{
+  unsigned n = 0;
+  for (unsigned i = 0; i < length; ++i) {
+    uint16_t c = chars[i];
+    if (c != 0 and c < 0x80) {
+      n += 1;
+    } else if (c < 0x800) {
+      n += 2;
+    } else {
+      n += 3;
+    }
+  }
+  GcByteArray* bytes = makeByteArray(t, n);
+  unsigned j = 0;
+  for (unsigned i = 0; i < length; ++i) {
+    uint16_t c = chars[i];
+    if (c == 0) {
+      bytes->body()[j++] = static_cast<int8_t>(0xC0);
+      bytes->body()[j++] = static_cast<int8_t>(0x80);
+    } else if (c < 0x80) {
+      bytes->body()[j++] = static_cast<int8_t>(c);
+    } else if (c < 0x800) {
+      bytes->body()[j++] = static_cast<int8_t>(0xC0 | (c >> 6));
+      bytes->body()[j++] = static_cast<int8_t>(0x80 | (c & 0x3F));
+    } else {
+      bytes->body()[j++] = static_cast<int8_t>(0xE0 | (c >> 12));
+      bytes->body()[j++] = static_cast<int8_t>(0x80 | ((c >> 6) & 0x3F));
+      bytes->body()[j++] = static_cast<int8_t>(0x80 | (c & 0x3F));
+    }
+  }
+  return bytes;
+}
+
 #ifndef HAVE_StringOffset
+
+inline uint32_t GcString::offset(Thread*)
+{
+  return 0;
+}
+
+#endif  // not HAVE_StringOffset
+
+#ifndef HAVE_StringLength
 
 inline uint32_t GcString::length(Thread* t)
 {
   return cast<GcCharArray>(t, this->data())->length();
 }
 
-inline uint32_t GcString::offset(Thread*)
-{
-  return 0;
-}
+#endif  // not HAVE_StringLength
+
+#ifndef HAVE_StringUnsafe_data
 
 #ifndef HAVE_StringHash32
 
@@ -2226,7 +2326,99 @@ inline GcString* makeString(Thread* t,
   }
 }
 
-#endif  // not HAVE_StringOffset
+#else  // HAVE_StringUnsafe_data
+
+struct Mutf8View {
+  const uint8_t* bytes;
+  unsigned length;
+};
+
+inline Mutf8View mutf8View(Thread* t UNUSED, GcString* s)
+{
+  Mutf8View v;
+  GcByteArray* data = s->data();
+  if (data) {
+    v.bytes = reinterpret_cast<const uint8_t*>(data->body().begin());
+    unsigned n = data->length();
+    // A shared symbol array counts a trailing 0. Valid Modified UTF-8
+    // has no raw 0, so that byte is not a character.
+    if (n and v.bytes[n - 1] == 0) {
+      --n;
+    }
+    v.length = n;
+  } else {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(s->unsafe_data()));
+    v.length = (static_cast<unsigned>(p[0]) << 8) | p[1];
+    v.bytes = p + 2;
+  }
+  return v;
+}
+
+// array is a char[] (encode to Modified UTF-8) or a byte[] whose
+// [offset, offset+length) is already Modified UTF-8.
+inline GcString* makeString(Thread* t,
+                            object array,
+                            int32_t offset,
+                            int32_t length,
+                            int32_t hashCode)
+{
+  if (objectClass(t, array) == type(t, GcCharArray::Type)) {
+    GcCharArray* chars = cast<GcCharArray>(t, array);
+    PROTECT(t, chars);
+    GcByteArray* encoded = encodeMutf8(
+        t, reinterpret_cast<const uint16_t*>(&chars->body()[offset]), length);
+    return makeString(t,
+                      encoded,
+                      static_cast<uint64_t>(0),
+                      static_cast<uint32_t>(length),
+                      static_cast<uint32_t>(hashCode));
+  }
+
+  GcByteArray* bytes = cast<GcByteArray>(t, array);
+  unsigned n = static_cast<unsigned>(length);
+  const uint8_t* p
+      = reinterpret_cast<const uint8_t*>(bytes->body().begin()) + offset;
+  unsigned chars = mutf8Chars(p, n);
+  // Share the array when the range is the whole payload. A symbol's
+  // length counts one trailing 0; that byte stays in the array and
+  // mutf8View skips it.
+  if (offset == 0
+      and (n == bytes->length()
+           or (n + 1 == bytes->length() and bytes->body()[n] == 0))) {
+    return makeString(t,
+                      bytes,
+                      static_cast<uint64_t>(0),
+                      static_cast<uint32_t>(chars),
+                      static_cast<uint32_t>(hashCode));
+  }
+
+  PROTECT(t, bytes);
+  GcByteArray* copy = makeByteArray(t, n);
+  if (n) {
+    memcpy(copy->body().begin(), bytes->body().begin() + offset, n);
+  }
+  return makeString(t,
+                    copy,
+                    static_cast<uint64_t>(0),
+                    static_cast<uint32_t>(chars),
+                    static_cast<uint32_t>(hashCode));
+}
+
+// header points at a big-endian u2 byte length and then the bytes.
+// The address is unmanaged and is not moved by the GC.
+inline GcString* makeStringFromMutf8Header(Thread* t, const uint8_t* header)
+{
+  unsigned n = (static_cast<unsigned>(header[0]) << 8) | header[1];
+  unsigned chars = mutf8Chars(header + 2, n);
+  return makeString(t,
+                    static_cast<GcByteArray*>(0),
+                    static_cast<uint64_t>(reinterpret_cast<uintptr_t>(header)),
+                    static_cast<uint32_t>(chars),
+                    static_cast<uint32_t>(0));
+}
+
+#endif  // HAVE_StringUnsafe_data
 
 int stringUTFLength(Thread* t,
                     GcString* string,
@@ -2236,6 +2428,16 @@ int stringUTFLength(Thread* t,
 inline int stringUTFLength(Thread* t, GcString* string)
 {
   return stringUTFLength(t, string, 0, string->length(t));
+}
+
+// Bytes written by stringChars(char*), including the trailing NUL.
+inline unsigned stringCStringLength(Thread* t, GcString* string)
+{
+#ifdef HAVE_StringUnsafe_data
+  return static_cast<unsigned>(stringUTFLength(t, string)) + 1;
+#else
+  return string->length(t) + 1;
+#endif
 }
 
 void stringChars(Thread* t,
@@ -2368,6 +2570,46 @@ inline bool byteArrayEqual(Thread* t UNUSED, object ao, object bo)
                  == 0);
 }
 
+#ifdef HAVE_StringUnsafe_data
+
+inline uint32_t stringHash(Thread* t, object so)
+{
+  GcString* s = cast<GcString>(t, so);
+  if (s->hashCode() == 0 and s->length(t)) {
+    Mutf8View v = mutf8View(t, s);
+    s->hashCode() = hashMutf8(v.bytes, v.length, s->length(t));
+  }
+  return s->hashCode();
+}
+
+inline uint16_t stringCharAt(Thread* t, GcString* s, int i)
+{
+  Mutf8View v = mutf8View(t, s);
+  if (v.length == s->length(t)) {
+    return v.bytes[i];
+  }
+  const uint8_t* p = mutf8Skip(v.bytes, i);
+  return mutf8Next(p);
+}
+
+inline bool stringEqual(Thread* t, object ao, object bo)
+{
+  GcString* a = cast<GcString>(t, ao);
+  GcString* b = cast<GcString>(t, bo);
+  if (a == b) {
+    return true;
+  }
+  if (a->length(t) != b->length(t)) {
+    return false;
+  }
+  Mutf8View va = mutf8View(t, a);
+  Mutf8View vb = mutf8View(t, b);
+  return va.length == vb.length
+         and memcmp(va.bytes, vb.bytes, va.length) == 0;
+}
+
+#else  // not HAVE_StringUnsafe_data
+
 inline uint32_t stringHash(Thread* t, object so)
 {
   GcString* s = cast<GcString>(t, so);
@@ -2409,6 +2651,8 @@ inline bool stringEqual(Thread* t, object ao, object bo)
     return false;
   }
 }
+
+#endif  // HAVE_StringUnsafe_data
 
 inline uint32_t methodHash(Thread* t, object mo)
 {

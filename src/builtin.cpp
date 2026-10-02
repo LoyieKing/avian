@@ -15,6 +15,8 @@
 
 #include <avian/util/runtime-array.h>
 
+#include <stdlib.h>
+
 using namespace vm;
 
 namespace {
@@ -29,7 +31,7 @@ int64_t search(Thread* t,
     PROTECT(t, loader);
     PROTECT(t, name);
 
-    GcByteArray* n = makeByteArray(t, name->length(t) + 1);
+    GcByteArray* n = makeByteArray(t, stringCStringLength(t, name));
     char* s = reinterpret_cast<char*>(n->body().begin());
     stringChars(t, name, s);
 
@@ -193,6 +195,54 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
 }
 
 extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_avian_Classes_makeUnsafeString(Thread* t, object, uintptr_t* arguments)
+{
+  GcByteArray* array
+      = cast<GcByteArray>(t, reinterpret_cast<object>(arguments[0]));
+  PROTECT(t, array);
+  unsigned n = array->length();
+
+#if defined(HAVE_StringUnsafe_data)
+  // The header length is a u2.
+  if (n <= 65535) {
+    uint8_t* header = static_cast<uint8_t*>(malloc(n + 2));
+    if (header) {
+      header[0] = static_cast<uint8_t>(n >> 8);
+      header[1] = static_cast<uint8_t>(n);
+      if (n) {
+        memcpy(header + 2, array->body().begin(), n);
+      }
+      return reinterpret_cast<int64_t>(makeStringFromMutf8Header(t, header));
+    }
+  }
+#endif
+
+  return reinterpret_cast<int64_t>(
+      t->m->classpath->makeString(t, array, 0, array->length()));
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeByte(Thread*, object, uintptr_t* arguments)
+{
+  uint64_t address;
+  memcpy(&address, arguments, 8);
+  int32_t index = static_cast<int32_t>(arguments[2]);
+  const uint8_t* header
+      = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(address));
+  return header[2 + index];
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeByteLength(Thread*, object, uintptr_t* arguments)
+{
+  uint64_t address;
+  memcpy(&address, arguments, 8);
+  const uint8_t* header
+      = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(address));
+  return (static_cast<unsigned>(header[0]) << 8) | header[1];
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
     Avian_avian_SystemClassLoader_appLoader(Thread* t, object, uintptr_t*)
 {
   return reinterpret_cast<int64_t>(roots(t)->appLoader());
@@ -241,7 +291,7 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
   GcString* name = cast<GcString>(t, reinterpret_cast<object>(arguments[1]));
 
   if (LIKELY(name)) {
-    THREAD_RUNTIME_ARRAY(t, char, n, name->length(t) + 1);
+    THREAD_RUNTIME_ARRAY(t, char, n, stringCStringLength(t, name));
     stringChars(t, name, RUNTIME_ARRAY_BODY(n));
 
     const char* name
@@ -267,7 +317,7 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
       = cast<GcLongArray>(t, reinterpret_cast<object>(arguments[3]));
 
   if (LIKELY(name) && LIKELY(finderElementPtrPtr)) {
-    THREAD_RUNTIME_ARRAY(t, char, n, name->length(t) + 1);
+    THREAD_RUNTIME_ARRAY(t, char, n, stringCStringLength(t, name));
     stringChars(t, name, RUNTIME_ARRAY_BODY(n));
 
     void*& finderElementPtr
@@ -301,11 +351,12 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
 
   ACQUIRE(t, t->m->classLock);
 
-  THREAD_RUNTIME_ARRAY(t, char, chars, name->length(t) + 2);
+  unsigned packageLength = stringCStringLength(t, name) - 1;
+  THREAD_RUNTIME_ARRAY(t, char, chars, packageLength + 2);
   stringChars(t, name, RUNTIME_ARRAY_BODY(chars));
   replace('.', '/', RUNTIME_ARRAY_BODY(chars));
-  RUNTIME_ARRAY_BODY(chars)[name->length(t)] = '/';
-  RUNTIME_ARRAY_BODY(chars)[name->length(t) + 1] = 0;
+  RUNTIME_ARRAY_BODY(chars)[packageLength] = '/';
+  RUNTIME_ARRAY_BODY(chars)[packageLength + 1] = 0;
 
   GcByteArray* key = makeByteArray(t, RUNTIME_ARRAY_BODY(chars));
 
@@ -328,8 +379,7 @@ extern "C" AVIAN_EXPORT void JNICALL
   GcString* outputFile
       = static_cast<GcString*>(reinterpret_cast<object>(*arguments));
 
-  unsigned length = outputFile->length(t);
-  THREAD_RUNTIME_ARRAY(t, char, n, length + 1);
+  THREAD_RUNTIME_ARRAY(t, char, n, stringCStringLength(t, outputFile));
   stringChars(t, outputFile, RUNTIME_ARRAY_BODY(n));
   FILE* out = vm::fopen(RUNTIME_ARRAY_BODY(n), "wb");
   if (out) {
@@ -395,7 +445,7 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
   GcString* path = cast<GcString>(t, reinterpret_cast<object>(*arguments));
 
   if (LIKELY(path)) {
-    THREAD_RUNTIME_ARRAY(t, char, p, path->length(t) + 1);
+    THREAD_RUNTIME_ARRAY(t, char, p, stringCStringLength(t, path));
     stringChars(t, path, RUNTIME_ARRAY_BODY(p));
 
     System::Region* r = t->m->bootFinder->find(RUNTIME_ARRAY_BODY(p));
@@ -421,7 +471,7 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
   GcString* path = cast<GcString>(t, reinterpret_cast<object>(*arguments));
 
   if (LIKELY(path)) {
-    THREAD_RUNTIME_ARRAY(t, char, p, path->length(t) + 1);
+    THREAD_RUNTIME_ARRAY(t, char, p, stringCStringLength(t, path));
     stringChars(t, path, RUNTIME_ARRAY_BODY(p));
 
     System::Region* r = t->m->bootFinder->find(RUNTIME_ARRAY_BODY(p));

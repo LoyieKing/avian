@@ -61,8 +61,7 @@ void JNICALL loadLibrary(Thread* t, object, uintptr_t* arguments)
   Thread::LibraryLoadStack stack(
       t, cast<GcClassLoader>(t, reinterpret_cast<object>(arguments[2])));
 
-  unsigned length = name->length(t);
-  THREAD_RUNTIME_ARRAY(t, char, n, length + 1);
+  THREAD_RUNTIME_ARRAY(t, char, n, stringCStringLength(t, name));
   stringChars(t, name, RUNTIME_ARRAY_BODY(n));
 
   /* org_conscrypt_NativeCrypto.o is linked statically, and in Avian build
@@ -158,15 +157,22 @@ class MyClasspath : public Classpath {
 
       assertT(t, offset + length <= static_cast<int>(byteArray->length()));
 
-      GcCharArray* charArray = makeCharArray(t, length);
-      for (int i = 0; i < length; ++i) {
-        expect(t, (byteArray->body()[offset + i] & 0x80) == 0);
-
-        charArray->body()[i] = byteArray->body()[offset + i];
+      unsigned byteCount = static_cast<unsigned>(length);
+      unsigned chars = mutf8Chars(
+          reinterpret_cast<const uint8_t*>(byteArray->body().begin()) + offset,
+          byteCount);
+      GcCharArray* charArray = makeCharArray(t, chars);
+      PROTECT(t, charArray);
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(
+                             byteArray->body().begin())
+                         + offset;
+      for (unsigned i = 0; i < chars; ++i) {
+        charArray->body()[i] = mutf8Next(p);
       }
 
       array = charArray;
       offset = 0;
+      length = static_cast<int32_t>(chars);
     } else {
       expect(t, objectClass(t, array) == type(t, GcCharArray::Type));
 
@@ -893,8 +899,7 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
   GcString* name = cast<GcString>(t, reinterpret_cast<object>(arguments[0]));
   PROTECT(t, name);
 
-  unsigned length = name->length(t);
-  THREAD_RUNTIME_ARRAY(t, char, n, length + 1);
+  THREAD_RUNTIME_ARRAY(t, char, n, stringCStringLength(t, name));
   stringChars(t, name, RUNTIME_ARRAY_BODY(n));
 
   if (loadLibrary(t, "", RUNTIME_ARRAY_BODY(n), false, true)) {

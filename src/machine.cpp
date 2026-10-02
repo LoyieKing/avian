@@ -38,8 +38,6 @@ namespace {
 
 const bool DebugClassReader = false;
 
-const unsigned NoByte = 0xFFFF;
-
 void join(Thread* t, Thread* o)
 {
   if (t != o) {
@@ -944,112 +942,6 @@ void finalizeObject(Thread* t, object o, const char* name)
   abort(t);
 }
 
-unsigned readByte(AbstractStream& s, unsigned* value)
-{
-  if (*value == NoByte) {
-    return s.read1();
-  } else {
-    unsigned r = *value;
-    *value = NoByte;
-    return r;
-  }
-}
-
-GcCharArray* parseUtf8NonAscii(Thread* t,
-                               AbstractStream& s,
-                               GcByteArray* bytesSoFar,
-                               unsigned byteCount,
-                               unsigned sourceIndex,
-                               unsigned byteA,
-                               unsigned byteB)
-{
-  PROTECT(t, bytesSoFar);
-
-  unsigned length = bytesSoFar->length() - 1;
-  GcCharArray* value = makeCharArray(t, length + 1);
-
-  unsigned vi = 0;
-  for (; vi < byteCount; ++vi) {
-    value->body()[vi] = bytesSoFar->body()[vi];
-  }
-
-  for (unsigned si = sourceIndex; si < length; ++si) {
-    unsigned a = readByte(s, &byteA);
-    if (a & 0x80) {
-      if (a & 0x20) {
-        // 3 bytes
-        si += 2;
-        assertT(t, si < length);
-        unsigned b = readByte(s, &byteB);
-        unsigned c = s.read1();
-        value->body()[vi++] = ((a & 0xf) << 12) | ((b & 0x3f) << 6)
-                              | (c & 0x3f);
-      } else {
-        // 2 bytes
-        ++si;
-        assertT(t, si < length);
-        unsigned b = readByte(s, &byteB);
-
-        if (a == 0xC0 and b == 0x80) {
-          value->body()[vi++] = 0;
-        } else {
-          value->body()[vi++] = ((a & 0x1f) << 6) | (b & 0x3f);
-        }
-      }
-    } else {
-      value->body()[vi++] = a;
-    }
-  }
-
-  if (vi < length) {
-    PROTECT(t, value);
-
-    GcCharArray* v = makeCharArray(t, vi + 1);
-    memcpy(v->body().begin(), value->body().begin(), vi * 2);
-    value = v;
-  }
-
-  return value;
-}
-
-object parseUtf8(Thread* t, AbstractStream& s, unsigned length)
-{
-  GcByteArray* value = makeByteArray(t, length + 1);
-  unsigned vi = 0;
-  for (unsigned si = 0; si < length; ++si) {
-    unsigned a = s.read1();
-    if (a & 0x80) {
-      if (a & 0x20) {
-        // 3 bytes
-        return parseUtf8NonAscii(t, s, value, vi, si, a, NoByte);
-      } else {
-        // 2 bytes
-        unsigned b = s.read1();
-
-        if (a == 0xC0 and b == 0x80) {
-          ++si;
-          assertT(t, si < length);
-          value->body()[vi++] = 0;
-        } else {
-          return parseUtf8NonAscii(t, s, value, vi, si, a, b);
-        }
-      }
-    } else {
-      value->body()[vi++] = a;
-    }
-  }
-
-  if (vi < length) {
-    PROTECT(t, value);
-
-    GcByteArray* v = makeByteArray(t, vi + 1);
-    memcpy(v->body().begin(), value->body().begin(), vi);
-    value = v;
-  }
-
-  return value;
-}
-
 GcByteArray* makeByteArray(Thread* t, Stream& s, unsigned length)
 {
   GcByteArray* value = makeByteArray(t, length + 1);
@@ -1147,10 +1039,15 @@ unsigned parsePoolEntry(Thread* t,
       unsigned si = s.read2() - 1;
       parsePoolEntry(t, s, index, pool, invocations, si);
 
-      object value
-          = parseUtf8(t, cast<GcByteArray>(t, singletonObject(t, pool, si)));
-      value = t->m->classpath->makeString(
-          t, value, 0, fieldAtOffset<uintptr_t>(value, BytesPerWord) - 1);
+      // The pool Utf8 array is the string payload plus one counted 0.
+      // makeString shares that array; it does not copy the bytes.
+      GcByteArray* utf8 = cast<GcByteArray>(t, singletonObject(t, pool, si));
+      PROTECT(t, utf8);
+      unsigned n = utf8->length();
+      if (n) {
+        --n;
+      }
+      object value = t->m->classpath->makeString(t, utf8, 0, n);
       value = intern(t, value);
       pool->setBodyElement(t, i, reinterpret_cast<uintptr_t>(value));
 
@@ -5156,6 +5053,18 @@ int stringUTFLength(Thread* t,
                     unsigned start,
                     unsigned length)
 {
+#ifdef HAVE_StringUnsafe_data
+  if (length == 0) {
+    return 0;
+  }
+  Mutf8View v = mutf8View(t, string);
+  if (start == 0 and length == string->length(t)) {
+    return v.length;
+  }
+  const uint8_t* begin = mutf8Skip(v.bytes, start);
+  const uint8_t* end = mutf8Skip(begin, length);
+  return static_cast<int>(end - begin);
+#else
   unsigned result = 0;
 
   if (length) {
@@ -5179,6 +5088,7 @@ int stringUTFLength(Thread* t,
   }
 
   return result;
+#endif
 }
 
 void stringChars(Thread* t,
@@ -5187,6 +5097,16 @@ void stringChars(Thread* t,
                  unsigned length,
                  char* chars)
 {
+#ifdef HAVE_StringUnsafe_data
+  Mutf8View v = mutf8View(t, string);
+  const uint8_t* begin = mutf8Skip(v.bytes, start);
+  const uint8_t* end = mutf8Skip(begin, length);
+  unsigned n = static_cast<unsigned>(end - begin);
+  if (n) {
+    memcpy(chars, begin, n);
+  }
+  chars[n] = 0;
+#else
   if (length) {
     object data = string->data();
     if (objectClass(t, data) == type(t, GcByteArray::Type)) {
@@ -5200,6 +5120,7 @@ void stringChars(Thread* t,
     }
   }
   chars[length] = 0;
+#endif
 }
 
 void stringChars(Thread* t,
@@ -5208,6 +5129,14 @@ void stringChars(Thread* t,
                  unsigned length,
                  uint16_t* chars)
 {
+#ifdef HAVE_StringUnsafe_data
+  Mutf8View v = mutf8View(t, string);
+  const uint8_t* p = mutf8Skip(v.bytes, start);
+  for (unsigned i = 0; i < length; ++i) {
+    chars[i] = mutf8Next(p);
+  }
+  chars[length] = 0;
+#else
   if (length) {
     object data = string->data();
     if (objectClass(t, data) == type(t, GcByteArray::Type)) {
@@ -5223,6 +5152,7 @@ void stringChars(Thread* t,
     }
   }
   chars[length] = 0;
+#endif
 }
 
 void stringUTFChars(Thread* t,
@@ -5236,6 +5166,16 @@ void stringUTFChars(Thread* t,
           static_cast<unsigned>(stringUTFLength(t, string, start, length))
           == charsLength);
 
+#ifdef HAVE_StringUnsafe_data
+  Mutf8View v = mutf8View(t, string);
+  const uint8_t* begin = mutf8Skip(v.bytes, start);
+  const uint8_t* end = mutf8Skip(begin, length);
+  unsigned n = static_cast<unsigned>(end - begin);
+  if (n) {
+    memcpy(chars, begin, n);
+  }
+  chars[n] = 0;
+#else
   object data = string->data();
   if (objectClass(t, data) == type(t, GcByteArray::Type)) {
     GcByteArray* b = cast<GcByteArray>(t, data);
@@ -5261,6 +5201,7 @@ void stringUTFChars(Thread* t,
     }
     chars[j] = 0;
   }
+#endif
 }
 
 uint64_t resolveBootstrap(Thread* t, uintptr_t* arguments)
@@ -6445,7 +6386,7 @@ void printTrace(Thread* t, GcThrowable* exception)
 
     if (e->message()) {
       GcString* m = e->message();
-      THREAD_RUNTIME_ARRAY(t, char, message, m->length(t) + 1);
+      THREAD_RUNTIME_ARRAY(t, char, message, stringCStringLength(t, m));
       stringChars(t, m, RUNTIME_ARRAY_BODY(message));
       logTrace(errorLog(t), ": %s\n", RUNTIME_ARRAY_BODY(message));
     } else {
@@ -6582,87 +6523,27 @@ void runFinalizeThread(Thread* t)
 
 object parseUtf8(Thread* t, const char* data, unsigned length)
 {
-  class Client : public Stream::Client {
-   public:
-    Client(Thread* t) : t(t)
-    {
-    }
-
-    virtual void handleError()
-    {
-      if (false)
-        abort(t);
-    }
-
-   private:
-    Thread* t;
-  } client(t);
-
-  Stream s(&client, reinterpret_cast<const uint8_t*>(data), length);
-
-  return ::parseUtf8(t, s, length);
+  GcByteArray* array = makeByteArray(t, length);
+  if (length) {
+    memcpy(array->body().begin(), data, length);
+  }
+  return array;
 }
 
 object parseUtf8(Thread* t, GcByteArray* array)
 {
-  for (unsigned i = 0; i < array->length() - 1; ++i) {
-    if (array->body()[i] & 0x80) {
-      goto slow_path;
-    }
+  // Symbol arrays are NUL-terminated. The string payload is the bytes
+  // before that NUL, including a C0 80 null character.
+  unsigned n = array->length();
+  if (n) {
+    --n;
   }
-
-  return array;
-
-slow_path:
-  class Client : public Stream::Client {
-   public:
-    Client(Thread* t) : t(t)
-    {
-    }
-
-    virtual void handleError()
-    {
-      if (false)
-        abort(t);
-    }
-
-   private:
-    Thread* t;
-  } client(t);
-
-  class MyStream : public AbstractStream {
-   public:
-    class MyProtector : public Thread::Protector {
-     public:
-      MyProtector(Thread* t, MyStream* s) : Protector(t), s(s)
-      {
-      }
-
-      virtual void visit(Heap::Visitor* v)
-      {
-        v->visit(&(s->array));
-      }
-
-      MyStream* s;
-    };
-
-    MyStream(Thread* t, Client* client, GcByteArray* array)
-        : AbstractStream(client, array->length() - 1),
-          array(array),
-          protector(t, this)
-    {
-    }
-
-    virtual void copy(uint8_t* dst, unsigned offset, unsigned size)
-    {
-      memcpy(dst, &array->body()[offset], size);
-    }
-
-    GcByteArray* array;
-    MyProtector protector;
-  } s(t, &client, array);
-
-  return ::parseUtf8(t, s, array->length() - 1);
+  PROTECT(t, array);
+  GcByteArray* copy = makeByteArray(t, n);
+  if (n) {
+    memcpy(copy->body().begin(), array->body().begin(), n);
+  }
+  return copy;
 }
 
 GcMethod* getCaller(Thread* t, unsigned target, bool skipMethodInvoke)

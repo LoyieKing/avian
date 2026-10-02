@@ -107,8 +107,14 @@ public final class Class <T>
       }
     }
 
-    return Classes.makeString
-      (replace('/', '.', c.name, 0, c.name.length - 1), 0, c.name.length - 1);
+    byte[] name = c.name;
+    int n = name.length - 1;
+    for (int i = 0; i < n; ++i) {
+      if (name[i] == '/') {
+        return Classes.makeString(replace('/', '.', name, 0, n), 0, n);
+      }
+    }
+    return Classes.makeString(name, 0, n);
   }
 
   public String getCanonicalName() {
@@ -442,7 +448,7 @@ public final class Class <T>
           {
             try {
               result[--count] = getClassLoader().loadClass
-                (new String(reference.inner, 0, reference.inner.length - 1));
+                (new String(reference.inner, 0, reference.inner.length - 1, false));
             } catch (ClassNotFoundException e) {
               throw new Error(e);
             }
@@ -466,7 +472,7 @@ public final class Class <T>
             if (reference.outer != null) {
               try {
                 return getClassLoader().loadClass
-                  (new String(reference.outer, 0, reference.outer.length - 1));
+                  (new String(reference.outer, 0, reference.outer.length - 1, false));
               } catch (ClassNotFoundException e) {
                 throw new Error(e);
               }

@@ -841,6 +841,8 @@ class InlineNewSlowPath;
 
 class YoungObjectStoreSlowPath;
 
+class StringSlowPath;
+
 class TraceElement : public avian::codegen::TraceHandler {
  public:
   static const unsigned VirtualCall = 1 << 0;
@@ -1253,6 +1255,8 @@ class Context {
         sideIpsReady(false),
         youngStoreSlowPaths(0),
         youngStoreSlowPathTail(0),
+        stringSlowPaths(0),
+        stringSlowPathTail(0),
         eventLog(t->m->system, t->m->heap, 1024),
         protector(this),
         resource(this),
@@ -1296,6 +1300,8 @@ class Context {
         sideIpsReady(false),
         youngStoreSlowPaths(0),
         youngStoreSlowPathTail(0),
+        stringSlowPaths(0),
+        stringSlowPathTail(0),
         eventLog(t->m->system, t->m->heap, 0),
         protector(this),
         resource(this),
@@ -1394,6 +1400,10 @@ class Context {
   // method to the native call.
   YoungObjectStoreSlowPath* youngStoreSlowPaths;
   YoungObjectStoreSlowPath* youngStoreSlowPathTail;
+  // charAt and hashCode slow paths. Flushed with the other side calls
+  // so restoring the edge does not attach the rest of the method.
+  StringSlowPath* stringSlowPaths;
+  StringSlowPath* stringSlowPathTail;
   Vector eventLog;
   MyProtector protector;
   MyResource resource;
@@ -3417,6 +3427,40 @@ void fieldWatch(MyThread* t, uintptr_t field, uintptr_t instance, uintptr_t writ
                  reinterpret_cast<void*>(method), static_cast<int32_t>(bci));
 }
 
+uint64_t stringCharAtSlow(MyThread* t, GcString* s, int32_t index)
+{
+  if (UNLIKELY(s == 0)) {
+    throwNew(t, GcNullPointerException::Type);
+  }
+  if (UNLIKELY(index < 0
+               or static_cast<uint32_t>(index) >= s->length(t))) {
+    throwNew(t, GcStringIndexOutOfBoundsException::Type);
+  }
+  return stringCharAt(t, s, index);
+}
+
+uint64_t stringHashCodeSlow(MyThread* t, GcString* s)
+{
+  if (UNLIKELY(s == 0)) {
+    throwNew(t, GcNullPointerException::Type);
+  }
+  return stringHash(t, s);
+}
+
+uint64_t stringEquals(MyThread* t, object a, object b)
+{
+  if (UNLIKELY(a == 0)) {
+    throwNew(t, GcNullPointerException::Type);
+  }
+  if (a == b) {
+    return 1;
+  }
+  if (b == 0 or objectClass(t, b) != type(t, GcString::Type)) {
+    return 0;
+  }
+  return stringEqual(t, a, b) ? 1 : 0;
+}
+
 // A watch may suspend and collect.  The instance and the stored value have
 // already been popped, so put them back in the Java frame map for the call
 // and reload them afterwards.  That restores the pre-pop depth, which fits
@@ -3866,6 +3910,7 @@ void compileBackwardGotoSafePoint(MyThread* t,
 #include "compile/youngObjectStore.cpp"
 #include "compile/objectStore.cpp"
 #include "compile/trivialConstructor.cpp"
+#include "compile/stringIntrinsic.cpp"
 #undef AVIAN_COMPILE_CPP_INCLUDE
 
 
@@ -4498,7 +4543,7 @@ bool intrinsic(MyThread* t UNUSED, Frame* frame, GcMethod* target)
       return true;
     }
   }
-  return false;
+  return tryStringIntrinsic(t, frame, target);
 }
 
 unsigned targetFieldOffset(Context* context, GcField* field)
@@ -7465,7 +7510,8 @@ GcLineNumberTable* translateLineNumberTable(MyThread* t,
     PROTECT(t, oldTable);
 
     unsigned length = oldTable->length();
-    GcLineNumberTable* newTable = makeLineNumberTable(t, length);
+    unsigned extra = stringSlowPathLineCount(context);
+    GcLineNumberTable* newTable = makeLineNumberTable(t, length + extra);
     unsigned ni = 0;
     for (unsigned oi = 0; oi < length; ++oi) {
       uint64_t oldLine = oldTable->body()[oi];
@@ -7483,7 +7529,10 @@ GcLineNumberTable* translateLineNumberTable(MyThread* t,
       }
     }
 
-    if (UNLIKELY(ni < length)) {
+    ni = appendStringSlowPathLines(
+        t, context, newTable->body().begin(), ni, start);
+
+    if (UNLIKELY(ni < length + extra)) {
       newTable = truncateLineNumberTable(t, newTable, ni);
     }
 
@@ -8223,6 +8272,7 @@ void compile(MyThread* t, Context* context)
   // edge earlier would put the rest of the method on the slow target.
   InlineNew::flush(t, context);
   YoungObjectStore::flush(t, context);
+  flushStringIntrinsics(t, context);
 
   free(stackMap);
 }

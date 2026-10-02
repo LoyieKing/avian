@@ -220,6 +220,8 @@
 
 (type arrayIndexOutOfBoundsException java/lang/ArrayIndexOutOfBoundsException)
 
+(type stringIndexOutOfBoundsException java/lang/StringIndexOutOfBoundsException)
+
 (type arrayStoreException java/lang/ArrayStoreException)
 
 (type negativeArraySizeException java/lang/NegativeArraySizeException)

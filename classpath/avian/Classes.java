@@ -105,7 +105,7 @@ public class Classes {
     case 's': {
       byte[] data = (byte[]) Singleton.getObject(pool, read2(in) - 1);
 
-      return new String(data, 0, data.length - 1);
+      return new String(data, 0, data.length - 1, false);
     }
 
     case 'e': {
@@ -115,7 +115,7 @@ public class Classes {
       return Enum.valueOf
         (SystemClassLoader.getClass
          (loadVMClass(loader, typeName, 1, typeName.length - 3)),
-         new String(name, 0, name.length - 1));
+         new String(name, 0, name.length - 1, false));
     }
 
     case 'c': {
@@ -161,7 +161,7 @@ public class Classes {
 
     for (int i = 2; i < annotation.length; i += 2) {
       byte[] name = (byte[]) Singleton.getObject(pool, read2(in) - 1);
-      annotation[i] = new String(name, 0, name.length - 1);
+      annotation[i] = new String(name, 0, name.length - 1, false);
       annotation[i + 1] = parseAnnotationValue(loader, pool, in);
     }
 
@@ -399,7 +399,7 @@ public class Classes {
   }
 
   public static String toString(byte[] array) {
-    return new String(array, 0, array.length - 1);
+    return new String(array, 0, array.length - 1, false);
   }
 
   private static boolean match(VMClass a, VMClass b) {
@@ -622,7 +622,7 @@ public class Classes {
     if (c.source != null) {
       try {
         source = new CodeSource
-          (new URL(new String(c.source, 0, c.source.length - 1)),
+          (new URL(new String(c.source, 0, c.source.length - 1, false)),
            (Certificate[]) null);
       } catch (MalformedURLException ignored) { }
     }
@@ -642,4 +642,10 @@ public class Classes {
   private static native void releaseClassLock();
 
   public static native String makeString(byte[] array, int offset, int length);
+
+  // mutf8 is a Modified UTF-8 payload with no trailing NUL. A payload of
+  // at most 65535 bytes is copied into unmanaged memory behind a u2 length
+  // and the string keeps that address. A longer payload, or a failed
+  // allocation, is an ordinary managed string.
+  public static native String makeUnsafeString(byte[] mutf8);
 }

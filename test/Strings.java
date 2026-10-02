@@ -259,5 +259,57 @@ public class Strings {
         (new java.io.ByteArrayInputStream(s.getBytes())).read(buffer);
       expect(s.equals(new String(buffer.array())));
     }
+
+    expect("abc".hashCode() == 96354);
+    expect("".isEmpty() && "".hashCode() == 0 && "".equals(new String()));
+    expect("abc".equals(new String("abc".toCharArray())));
+    expect(! "abc".equals("abd"));
+
+    String nul = "a\u0000b";
+    expect(nul.length() == 3 && nul.charAt(1) == 0);
+    expect(arraysEqual(nul.getBytes("UTF-8"), new byte[] { 'a', 0, 'b' }));
+    expect(new String(nul.getBytes("UTF-8"), "UTF-8").equals(nul));
+    expect("\u0000".compareTo("a") < 0);
+
+    String accent = "é";
+    expect(accent.length() == 1 && accent.charAt(0) == '\u00e9');
+    expect("éé".substring(1).equals(accent));
+
+    String pair = "\uD800\uDC00";
+    expect(pair.length() == 2);
+    expect(arraysEqual(pair.getBytes("UTF-8"),
+                       new byte[] { (byte) 0xF0, (byte) 0x90,
+                                    (byte) 0x80, (byte) 0x80 }));
+    expect(new String(pair.getBytes("UTF-8"), "UTF-8").equals(pair));
+
+    boolean threw = false;
+    try {
+      "abc".charAt(3);
+    } catch (StringIndexOutOfBoundsException e) {
+      threw = true;
+    }
+    expect(threw);
+    threw = false;
+    try {
+      "abc".charAt(-1);
+    } catch (StringIndexOutOfBoundsException e) {
+      threw = true;
+    }
+    expect(threw);
+
+    String unsafe = avian.Classes.makeUnsafeString(new byte[] { 'a', 'b', 'c' });
+    expect("abc".equals(unsafe) && unsafe.hashCode() == 96354);
+    expect(unsafe.charAt(1) == 'b');
+    java.lang.reflect.Field field
+      = String.class.getDeclaredField("unsafe_data");
+    field.setAccessible(true);
+    expect(field.getLong(unsafe) != 0);
+    expect(field.getLong("abc") == 0);
+
+    String unsafeNul = avian.Classes.makeUnsafeString
+      (new byte[] { (byte) 0xC0, (byte) 0x80 });
+    expect(unsafeNul.length() == 1 && unsafeNul.charAt(0) == 0);
+    expect(unsafeNul.equals("\u0000"));
+    expect(field.getLong(unsafeNul) != 0);
   }
 }
