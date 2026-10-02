@@ -21,6 +21,9 @@
 #include <avian/util/runtime-array.h>
 #include <avian/util/math.h>
 
+#include <cstdio>
+#include <cstring>
+
 #if defined(PLATFORM_WINDOWS)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -274,6 +277,33 @@ unsigned edenUsedBytes(Machine* m)
   return static_cast<unsigned>(m->edenTop - m->edenStart) * BytesPerWord;
 }
 
+// Eighths of eden already reported. Reset when the bump rewinds.
+unsigned edenReportedEighths = 0;
+unsigned gcMinorCount = 0;
+unsigned gcMajorCount = 0;
+uint64_t gcStallMillis = 0;
+uint64_t gcYoungBytes = 0;
+
+void noteEdenFill(Machine* m)
+{
+  unsigned cap = m->edenCapacity;
+  if (cap == 0) {
+    return;
+  }
+  unsigned used = edenUsedBytes(m);
+  unsigned eighths = static_cast<unsigned>((static_cast<uint64_t>(used) * 8) / cap);
+  if (eighths <= edenReportedEighths or eighths > 8) {
+    return;
+  }
+  edenReportedEighths = eighths;
+  fprintf(stderr,
+          "[avian] eden %u/8 used=%u cap=%u limit=%llu\n",
+          eighths,
+          used,
+          cap,
+          static_cast<unsigned long long>(m->heap->limit()));
+}
+
 unsigned tlabAvailableWords(Machine* m)
 {
   if (m->edenStart == 0 or m->edenEnd < m->edenTop) {
@@ -295,6 +325,7 @@ bool tlabTakeSlice(Machine* m, unsigned chunkWords, uintptr_t** payload)
   uintptr_t* start = m->edenTop;
   m->edenTop = start + chunkWords;
   *payload = start;
+  noteEdenFill(m);
   return true;
 }
 
@@ -440,6 +471,7 @@ unsigned finishTlabs(Thread* t, unsigned edenUsed)
 void resetEden(Machine* m)
 {
   m->edenTop = m->edenStart;
+  edenReportedEighths = 0;
 }
 
 void freeEden(Machine* m)
@@ -474,6 +506,12 @@ void configureTlabs(Machine* m)
   m->edenEnd = m->edenStart + (bytes / BytesPerWord);
 
   m->allocatingThreads.sample(1.f);
+
+  fprintf(stderr,
+          "[avian] heap limit=%llu eden_cap=%u tlab_max=%u\n",
+          static_cast<unsigned long long>(m->heap->limit()),
+          m->edenCapacity,
+          m->tlabMaxWords * BytesPerWord);
 }
 
 unsigned footprint(Thread* t)
@@ -4978,8 +5016,41 @@ object allocate3(Thread* t,
   }
 }
 
+void logGc(Thread* t,
+           Heap::CollectionType type,
+           unsigned edenUsed,
+           int64_t started)
+{
+  int64_t stall = t->m->system->now() - started;
+  if (stall < 0) {
+    stall = 0;
+  }
+  gcStallMillis += static_cast<uint64_t>(stall);
+  gcYoungBytes += edenUsed;
+  unsigned* count = &gcMinorCount;
+  const char* kind = "minor";
+  if (type == Heap::MajorCollection) {
+    count = &gcMajorCount;
+    kind = "major";
+  }
+  ++(*count);
+  fprintf(stderr,
+          "[avian] gc %s stall_ms=%lld eden_used=%u fixed=%u "
+          "minor=%u major=%u young_total=%llu\n",
+          kind,
+          static_cast<long long>(stall),
+          edenUsed,
+          t->m->fixedFootprint,
+          gcMinorCount,
+          gcMajorCount,
+          static_cast<unsigned long long>(gcYoungBytes));
+}
+
 void collect(Thread* t, Heap::CollectionType type, int pendingAllocation)
 {
+  unsigned edenUsed = edenUsedBytes(t->m);
+  int64_t started = t->m->system->now();
+
   ENTER(t, Thread::ExclusiveState);
 
   if (t->m->heap->limitExceeded(pendingAllocation)) {
@@ -4987,11 +5058,14 @@ void collect(Thread* t, Heap::CollectionType type, int pendingAllocation)
   }
 
   doCollect(t, type, pendingAllocation);
+  logGc(t, type, edenUsed, started);
 
   if (t->m->heap->limitExceeded(pendingAllocation)) {
     // try once more, giving the heap a chance to squeeze everything
     // into the smallest possible space:
+    int64_t again = t->m->system->now();
     doCollect(t, Heap::MajorCollection, pendingAllocation);
+    logGc(t, Heap::MajorCollection, 0, again);
   }
 }
 
@@ -5802,6 +5876,94 @@ bool classNeedsInit(Thread* t, GcClass* c)
   }
 }
 
+// Classes whose <clinit> another thread was already running. Updated
+// only while classLock is held. Dumped on powers of two so a killed
+// traverse still leaves the hot names in stderr.
+const unsigned ClinitSlots = 1024;
+const unsigned ClinitName = 96;
+
+struct ClinitSlot {
+  char name[ClinitName];
+  unsigned count;
+};
+
+ClinitSlot clinitSlots[ClinitSlots];
+unsigned clinitWaits = 0;
+
+void dumpClinitWaits()
+{
+  unsigned top[12];
+  unsigned ntop = 0;
+  for (unsigned i = 0; i < ClinitSlots; ++i) {
+    if (clinitSlots[i].count == 0) {
+      continue;
+    }
+    unsigned place = ntop;
+    if (place > 12) {
+      place = 12;
+    }
+    while (place > 0
+           and clinitSlots[top[place - 1]].count < clinitSlots[i].count) {
+      if (place < 12) {
+        top[place] = top[place - 1];
+      }
+      --place;
+    }
+    if (place < 12) {
+      top[place] = i;
+      if (ntop < 12) {
+        ++ntop;
+      }
+    }
+  }
+
+  fprintf(stderr, "[avian] clinit-wait total=%u\n", clinitWaits);
+  for (unsigned i = 0; i < ntop; ++i) {
+    ClinitSlot* slot = &clinitSlots[top[i]];
+    fprintf(stderr, "[avian] clinit-wait %u %s\n", slot->count, slot->name);
+  }
+}
+
+void noteClinitWait(GcClass* c)
+{
+  const char* name = reinterpret_cast<const char*>(c->name()->body().begin());
+  unsigned hash = 2166136261u;
+  for (const char* p = name; *p; ++p) {
+    hash = (hash ^ static_cast<unsigned char>(*p)) * 16777619u;
+  }
+
+  ClinitSlot* slot = 0;
+  for (unsigned n = 0; n < ClinitSlots; ++n) {
+    ClinitSlot* candidate = &clinitSlots[(hash + n) & (ClinitSlots - 1)];
+    if (candidate->name[0] == 0) {
+      unsigned i = 0;
+      for (; i + 1 < ClinitName and name[i]; ++i) {
+        candidate->name[i] = name[i];
+      }
+      candidate->name[i] = 0;
+      candidate->count = 1;
+      slot = candidate;
+      break;
+    }
+    const char* have = candidate->name;
+    const char* want = name;
+    while (*have and *have == *want) {
+      ++have;
+      ++want;
+    }
+    if (*have == *want) {
+      ++candidate->count;
+      slot = candidate;
+      break;
+    }
+  }
+  ++clinitWaits;
+  if (clinitWaits >= 32 and (clinitWaits & (clinitWaits - 1)) == 0) {
+    dumpClinitWaits();
+  }
+  (void)slot;
+}
+
 bool preInitClass(Thread* t, GcClass* c)
 {
   int flags = c->vmFlags();
@@ -5822,6 +5984,7 @@ bool preInitClass(Thread* t, GcClass* c)
         }
 
         // some other thread is on the job - wait for it to finish.
+        noteClinitWait(c);
         while (c->vmFlags() & InitFlag) {
           ENTER(t, Thread::IdleState);
           t->m->classLock->wait(t->systemThread, 0);
