@@ -39,4 +39,7 @@ public class VMClass {
   public Singleton staticTable;
   public ClassLoader loader;
   public byte[] source;
+  // Stub addresses. Primitives, so the garbage collector does not trace them.
+  public long serializeThunk;
+  public long deserializeThunk;
 }

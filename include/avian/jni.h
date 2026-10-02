@@ -12,6 +12,7 @@
 #define AVIAN_JNI_H_
 
 #include <jni.h>
+#include <stdint.h>
 
 #ifndef __cplusplus
 #error AvianJniEnv extends the C++ JNIEnv
@@ -35,6 +36,27 @@ struct AvianJniEnv : JNIEnv {
     const unsigned slot = 234;
     const Fn* table = reinterpret_cast<const Fn*>(functions);
     return table[slot](this, header);
+  }
+
+  /* Versioned ByteFun state bytes. A null object is a 2-byte array, not a
+     null return. The bytes are produced in native memory; one Java array is
+     allocated only as this call returns. */
+  jbyteArray SerializeGraph(jobject obj)
+  {
+    typedef jbyteArray(JNICALL* Fn)(JNIEnv*, jobject);
+    const unsigned slot = 235;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, obj);
+  }
+
+  /* data is native and is not moved by the garbage collector. It includes
+     the version byte. */
+  jobject DeserializeGraph(const uint8_t* data, jint length)
+  {
+    typedef jobject(JNICALL* Fn)(JNIEnv*, const uint8_t*, jint);
+    const unsigned slot = 236;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, data, length);
   }
 };
 

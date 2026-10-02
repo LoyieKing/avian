@@ -3424,6 +3424,15 @@ static_assert(offsetof(JNIEnvVTable, NewStringFromUnmanagedMutf8)
                       / sizeof(void*)
                   == AvianJniNewStringFromUnmanagedMutf8,
               "include/avian/jni.h slot");
+static_assert(offsetof(JNIEnvVTable, SerializeGraph) / sizeof(void*)
+                  == AvianJniSerializeGraph,
+              "include/avian/jni.h serialize slot");
+static_assert(offsetof(JNIEnvVTable, DeserializeGraph) / sizeof(void*)
+                  == AvianJniDeserializeGraph,
+              "include/avian/jni.h deserialize slot");
+
+jbyteArray JNICALL SerializeGraph(Thread* t, jobject object);
+jobject JNICALL DeserializeGraph(Thread* t, const uint8_t* data, jint length);
 
 void populateJNITables(JavaVMVTable* vmTable, JNIEnvVTable* envTable)
 {
@@ -3452,6 +3461,8 @@ void populateJNITables(JavaVMVTable* vmTable, JNIEnvVTable* envTable)
   envTable->NewString = local::NewString;
   envTable->NewStringUTF = local::NewStringUTF;
   envTable->NewStringFromUnmanagedMutf8 = local::NewStringFromUnmanagedMutf8;
+  envTable->SerializeGraph = SerializeGraph;
+  envTable->DeserializeGraph = DeserializeGraph;
   envTable->DefineClass = local::DefineClass;
   envTable->FindClass = local::FindClass;
   envTable->ThrowNew = local::ThrowNew;

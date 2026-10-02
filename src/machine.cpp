@@ -5423,7 +5423,9 @@ GcClass* parseClass(Thread* t,
       0,  // addendum
       0,  // static table
       loader,
-      0,   // source
+      0,  // source
+      0,  // serializeThunk
+      0,  // deserializeThunk
       0);  // vtable length
   PROTECT(t, class_);
 

@@ -942,10 +942,19 @@ struct JNIEnvVTable {
   // header is unmanaged and immovable: a big-endian u2 byte length,
   // then that many Modified UTF-8 bytes. The string stores the address.
   jstring(JNICALL* NewStringFromUnmanagedMutf8)(JNIEnv*, const void*);
+
+  // ByteFun state graph. Serialize returns a versioned byte[].
+  // Deserialize reads those bytes; they must not point into the Java heap.
+  jbyteArray(JNICALL* SerializeGraph)(JNIEnv*, jobject);
+  jobject(JNICALL* DeserializeGraph)(JNIEnv*, const uint8_t*, jint);
 };
 
-// Slot of NewStringFromUnmanagedMutf8. include/avian/jni.h uses the same index.
-enum { AvianJniNewStringFromUnmanagedMutf8 = 234 };
+// Slots past GetModule. include/avian/jni.h uses the same indexes.
+enum {
+  AvianJniNewStringFromUnmanagedMutf8 = 234,
+  AvianJniSerializeGraph = 235,
+  AvianJniDeserializeGraph = 236
+};
 
 inline void atomicOr(uint32_t* p, int v)
 {

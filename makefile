@@ -1291,6 +1291,7 @@ vm-sources = \
 	$(src)/classpath-$(classpath).cpp \
 	$(src)/builtin.cpp \
 	$(src)/jnienv.cpp \
+	$(src)/codec.cpp \
 	$(src)/process.cpp \
 	$(src)/heapdump.cpp
 

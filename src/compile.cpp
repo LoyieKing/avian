@@ -10017,6 +10017,8 @@ class MyProcessor : public Processor {
                          staticTable,
                          loader,
                          0,
+                         0,
+                         0,
                          vtableLength);
   }
 
