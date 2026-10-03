@@ -2040,7 +2040,10 @@ $(build)/%.o: $(lzma)/C/%.c
 	@mkdir -p $(dir $(@))
 	$(cc) $(lzma-cflags) -c $(<) $(call output,$(@))
 
-$(vm-asm-objects): $(build)/%-asm.o: $(src)/%.$(asm-format)
+# The .S files include avian/target-fields.h. A thread-layout edit that
+# only touches the header used to leave these objects at the old offsets.
+$(vm-asm-objects): $(build)/%-asm.o: $(src)/%.$(asm-format) \
+		$(src)/avian/types.h $(src)/avian/target-fields.h
 	$(compile-asm-object)
 
 $(bootimage-generator-objects): $(build)/%.o: $(src)/%.cpp $(vm-depends)
@@ -2155,13 +2158,18 @@ else
 	$(ranlib) $(@)
 endif
 
-$(bootimage-object) $(codeimage-object): $(bootimage-generator) \
+# One generator writes both images. Listing both outputs on one rule
+# makes make -j launch two writers of the same files.
+$(bootimage-object): $(bootimage-generator) \
 		$(classpath-jar-dep) $(test-dep)
 	@echo "generating bootimage and codeimage binaries from $(classpath-build) using $(<)"
 	$(<) -cp $(bootimage-classpath) -bootimage $(bootimage-object) -codeimage $(codeimage-object) \
 		-bootimage-symbols $(bootimage-symbols) \
 		-codeimage-symbols $(codeimage-symbols) \
 		-hostvm $(host-vm)
+
+$(codeimage-object): $(bootimage-object)
+	@test -f $(codeimage-object)
 
 executable-objects = $(vm-objects) $(classpath-objects) $(driver-object) \
 	$(vm-heapwalk-objects) $(boot-object) $(vm-classpath-objects) \
