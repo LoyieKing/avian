@@ -35,12 +35,91 @@ uintptr_t regionBase = 0;
 uintptr_t regionBump = 0;
 uintptr_t regionEnd = 0;
 pthread_once_t once = PTHREAD_ONCE_INIT;
+#if !defined(__x86_64__)
 pthread_mutex_t bumpLock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+#if defined(__x86_64__)
+// The bootimage generator links this file and then dlopens a second
+// libjvm that links it again. Both copies reserve the same granule.
+// The header lives in the first page so the two bumps cannot overlap.
+struct SharedRegion {
+  pthread_mutex_t lock;
+  uintptr_t bump;
+  uintptr_t end;
+  uint32_t ready;
+};
+
+const uintptr_t SharedHeaderBytes = 4096;
+SharedRegion* sharedRegion = 0;
+
+void reserveFailed()
+{
+  const char* msg = "[avian] unmanaged heap reserve failed\n";
+  size_t n = 0;
+  while (msg[n] != 0) {
+    ++n;
+  }
+  ssize_t wrote = ::write(2, msg, n);
+  (void)wrote;
+  ::abort();
+}
+
+void attachFixedRegion()
+{
+  void* reserved = mmap(reinterpret_cast<void*>(RegionBase),
+                        RegionSpan,
+                        PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+                            | MAP_FIXED_NOREPLACE,
+                        -1,
+                        0);
+  if (reserved == MAP_FAILED and errno != EEXIST) {
+    reserveFailed();
+  }
+  if (mprotect(reinterpret_cast<void*>(RegionBase),
+               SharedHeaderBytes,
+               PROT_READ | PROT_WRITE)
+      != 0) {
+    reserveFailed();
+  }
+  SharedRegion* shared = reinterpret_cast<SharedRegion*>(RegionBase);
+  if (__sync_bool_compare_and_swap(&shared->ready, 0, 1)) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&shared->lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+    shared->bump = RegionBase + SharedHeaderBytes;
+    shared->end = RegionBase + RegionSpan;
+    __sync_synchronize();
+    __atomic_store_n(&shared->ready, 2, __ATOMIC_RELEASE);
+  } else {
+    while (__atomic_load_n(&shared->ready, __ATOMIC_ACQUIRE) != 2) {
+    }
+  }
+  sharedRegion = shared;
+  regionBase = RegionBase;
+  regionBump = shared->bump;
+  regionEnd = shared->end;
+}
+#endif
 
 #if !defined(__linux__) || !defined(__x86_64__)
 void* bumpAllocate(size_t bytes)
 {
   const uintptr_t align = 16;
+#if defined(__x86_64__)
+  pthread_mutex_lock(&sharedRegion->lock);
+  uintptr_t p = (sharedRegion->bump + align - 1) & ~(align - 1);
+  uintptr_t end = (p + bytes + 4095) & ~uintptr_t(4095);
+  if (end > sharedRegion->end) {
+    pthread_mutex_unlock(&sharedRegion->lock);
+    return 0;
+  }
+  sharedRegion->bump = end;
+  pthread_mutex_unlock(&sharedRegion->lock);
+#else
   pthread_mutex_lock(&bumpLock);
   uintptr_t p = (regionBump + align - 1) & ~(align - 1);
   uintptr_t end = (p + bytes + 4095) & ~uintptr_t(4095);
@@ -50,6 +129,7 @@ void* bumpAllocate(size_t bytes)
   }
   regionBump = end;
   pthread_mutex_unlock(&bumpLock);
+#endif
   if (mprotect(reinterpret_cast<void*>(p), end - p, PROT_READ | PROT_WRITE)
       != 0) {
     return 0;
@@ -131,33 +211,31 @@ void* extentAlloc(ExtentHooks*,
                   bool* commit,
                   unsigned)
 {
-  pthread_mutex_lock(&bumpLock);
+  pthread_mutex_lock(&sharedRegion->lock);
   uintptr_t p;
   if (newAddr != 0) {
     p = reinterpret_cast<uintptr_t>(newAddr);
-    if (p < regionBase or p + size > regionEnd) {
-      pthread_mutex_unlock(&bumpLock);
+    if (p < sharedRegion->bump or p + size > sharedRegion->end) {
+      pthread_mutex_unlock(&sharedRegion->lock);
       return 0;
     }
-    if (p + size > regionBump) {
-      regionBump = p + size;
-    }
+    sharedRegion->bump = p + size;
   } else {
     uintptr_t align = alignment == 0 ? 4096 : alignment;
-    p = (regionBump + align - 1) & ~(align - 1);
-    if (p + size > regionEnd) {
-      pthread_mutex_unlock(&bumpLock);
+    p = (sharedRegion->bump + align - 1) & ~(align - 1);
+    if (p + size > sharedRegion->end) {
+      pthread_mutex_unlock(&sharedRegion->lock);
       return 0;
     }
-    regionBump = p + size;
+    sharedRegion->bump = p + size;
   }
-  pthread_mutex_unlock(&bumpLock);
+  pthread_mutex_unlock(&sharedRegion->lock);
 
   if ((p & 4095) != 0 or p + size < p) {
     return 0;
   }
   size_t protect = (size + 4095) & ~size_t(4095);
-  if (p + protect > regionEnd) {
+  if (p + protect > sharedRegion->end) {
     return 0;
   }
   if (mprotect(reinterpret_cast<void*>(p), protect, PROT_READ | PROT_WRITE)
@@ -207,19 +285,7 @@ ExtentHooks hooks = {extentAlloc,
 
 void initOnce()
 {
-  void* reserved = mmap(reinterpret_cast<void*>(RegionBase),
-                        RegionSpan,
-                        PROT_NONE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-                            | MAP_FIXED_NOREPLACE,
-                        -1,
-                        0);
-  if (reserved == MAP_FAILED) {
-    die("[avian] unmanaged heap reserve failed\n");
-  }
-  regionBase = RegionBase;
-  regionBump = RegionBase;
-  regionEnd = RegionBase + RegionSpan;
+  attachFixedRegion();
 
   ExtentHooks* hp = &hooks;
   size_t sz = sizeof(arenaIndex);
@@ -281,20 +347,7 @@ void* arenaAllocate(size_t bytes)
 
 void initOnce()
 {
-  void* reserved = mmap(reinterpret_cast<void*>(RegionBase),
-                        RegionSpan,
-                        PROT_NONE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-                            | MAP_FIXED_NOREPLACE,
-                        -1,
-                        0);
-  if (reserved == MAP_FAILED) {
-    fprintf(stderr, "[avian] unmanaged heap reserve failed\n");
-    ::abort();
-  }
-  regionBase = RegionBase;
-  regionBump = RegionBase;
-  regionEnd = RegionBase + RegionSpan;
+  attachFixedRegion();
   fprintf(stderr,
           "[avian] unmanaged heap base=0x%llx span=%llu tag_bit=45 "
           "(1 = unmanaged)\n",
@@ -342,11 +395,30 @@ void* arenaAllocate(size_t bytes)
 #endif
 
 struct Tracked {
-  Tracked* next;
+  Tracked* dirtyNext;
   void* object;
+  uint32_t onDirty;
 };
 
-Tracked* trackedHead = 0;
+Tracked* dirtyHead = 0;
+
+void dirtyPush(Tracked* node)
+{
+  // onDirty is 1 exactly while the node is linked. A second store while
+  // it is already linked must not push again, or the list cycles.
+  if (__atomic_exchange_n(&node->onDirty, 1u, __ATOMIC_ACQ_REL) != 0) {
+    return;
+  }
+  Tracked* old = __atomic_load_n(&dirtyHead, __ATOMIC_ACQUIRE);
+  do {
+    node->dirtyNext = old;
+  } while (not __atomic_compare_exchange_n(&dirtyHead,
+                                           &old,
+                                           node,
+                                           true,
+                                           __ATOMIC_RELEASE,
+                                           __ATOMIC_ACQUIRE));
+}
 
 }  // namespace
 
@@ -472,23 +544,61 @@ void unmanagedTrack(void* object)
     ::abort();
   }
   node->object = object;
-  Tracked* old = __atomic_load_n(&trackedHead, __ATOMIC_ACQUIRE);
-  do {
-    node->next = old;
-  } while (not __atomic_compare_exchange_n(&trackedHead,
-                                           &old,
-                                           node,
-                                           true,
-                                           __ATOMIC_RELEASE,
-                                           __ATOMIC_ACQUIRE));
+  node->dirtyNext = 0;
+  node->onDirty = 0;
+  *reinterpret_cast<Tracked**>(unmanagedNodeWord(object)) = node;
+  dirtyPush(node);
+}
+
+void unmanagedMarkScanDirty(void* object)
+{
+  uintptr_t* word = unmanagedScanWord(object);
+  uintptr_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
+  if (seen == 0) {
+    return;
+  }
+  if (not __atomic_compare_exchange_n(word,
+                                      &seen,
+                                      static_cast<uintptr_t>(0),
+                                      true,
+                                      __ATOMIC_RELAXED,
+                                      __ATOMIC_RELAXED)) {
+    return;
+  }
+  Tracked* node = *reinterpret_cast<Tracked**>(unmanagedNodeWord(object));
+  if (node == 0) {
+    return;
+  }
+  dirtyPush(node);
 }
 
 void unmanagedForEach(void (*fn)(void* object, void* arg), void* arg)
 {
-  for (Tracked* node = __atomic_load_n(&trackedHead, __ATOMIC_ACQUIRE);
-       node != 0;
-       node = node->next) {
+  // Mutators are stopped. Unlink a node the callback just marked clean
+  // so the next collection does not chase it. The node stays allocated
+  // and the object still points at it.
+  Tracked* prev = 0;
+  Tracked* node = dirtyHead;
+  unsigned guard = 0;
+  while (node != 0) {
+    Tracked* next = node->dirtyNext;
     fn(node->object, arg);
+    if (unmanagedScanClean(node->object)) {
+      if (prev != 0) {
+        prev->dirtyNext = next;
+      } else {
+        dirtyHead = next;
+      }
+      node->dirtyNext = 0;
+      __atomic_store_n(&node->onDirty, 0u, __ATOMIC_RELEASE);
+    } else {
+      prev = node;
+    }
+    node = next;
+    if (++guard == 100000000u) {
+      fprintf(stderr, "[avian] gc dirty list cycle\n");
+      ::abort();
+    }
   }
 }
 

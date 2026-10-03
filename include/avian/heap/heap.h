@@ -64,6 +64,12 @@ class Heap : public avian::util::Allocator {
     virtual unsigned copiedSizeInWords(void*) = 0;
     virtual void copy(void*, void*) = 0;
     virtual void walk(void*, Walker*) = 0;
+    // A managed slot the walk deliberately did not trace. The object
+    // must stay on the dirty list so a later pass can update it.
+    virtual bool retainsManagedSlot(void*)
+    {
+      return false;
+    }
   };
 
   virtual void setClient(Client* client) = 0;

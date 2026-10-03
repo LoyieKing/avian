@@ -20,10 +20,16 @@
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 using namespace vm;
 using namespace avian::util;
+
+namespace vm {
+extern unsigned gcTracePhase;
+extern bool gcCopyShallow;
+}
 
 namespace {
 
@@ -38,6 +44,49 @@ const bool Verbose = false;
 const bool Verbose2 = false;
 const bool Debug = false;
 const bool DebugFixies = false;
+
+// One collection's phase times. The coordinator is the only writer of
+// the *_us fields; copy and scan counters are atomic because a worker
+// pool would otherwise race. Reset at the start of collect().
+struct GcSplit {
+  uint64_t prep_us;
+  uint64_t gen2_us;
+  uint64_t fixie_us;
+  uint64_t roots_us;
+  uint64_t um_us;
+  uint64_t drain_us;
+  uint64_t weak_us;
+  uint64_t drain2_us;
+  uint64_t sweep_us;
+  uint64_t objs;
+  uint64_t eden_w;
+  uint64_t surv_w;
+  uint64_t promo_w;
+  uint64_t old_w;
+  uint64_t um_n;
+  uint64_t um_dirty;
+  uint64_t slots;
+  // Index is gcTracePhase: 0 other, 1 roots, 2 unmanaged, 3 drain, 4 weak, 5 drain2.
+  uint64_t phaseObjs[6];
+  uint64_t phaseWords[6];
+  uint64_t phasePush[6];
+};
+
+GcSplit gcSplit;
+
+uint64_t monoNs()
+{
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull
+         + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+uint64_t usSince(uint64_t start)
+{
+  uint64_t now = monoNs();
+  return now >= start ? (now - start) / 1000ull : 0;
+}
 
 #ifdef NDEBUG
 const bool DebugAllocation = false;
@@ -1160,20 +1209,31 @@ bool immortalHeapContains(Context* c, void* p)
 void* copy2(Context* c, void* o)
 {
   unsigned size = c->client->copiedSizeInWords(o);
+  __atomic_fetch_add(&gcSplit.objs, 1, __ATOMIC_RELAXED);
+  {
+    unsigned phase = vm::gcTracePhase;
+    if (phase < 6) {
+      __atomic_fetch_add(&gcSplit.phaseObjs[phase], 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&gcSplit.phaseWords[phase], size, __ATOMIC_RELAXED);
+    }
+  }
 
   if (c->gen2.contains(o)) {
     assertT(c, c->mode == Heap::MajorCollection);
+    __atomic_fetch_add(&gcSplit.old_w, size, __ATOMIC_RELAXED);
 
     return copyTo(c, &(c->nextGen2), o, size);
   } else if (c->gen1.contains(o)) {
     unsigned age = c->ageMap.get(o);
     if (age == TenureThreshold) {
+      __atomic_fetch_add(&gcSplit.promo_w, size, __ATOMIC_RELAXED);
       if (c->mode == Heap::MinorCollection) {
         return copyTo(c, &(c->gen2), o, size);
       } else {
         return copyTo(c, &(c->nextGen2), o, size);
       }
     } else {
+      __atomic_fetch_add(&gcSplit.surv_w, size, __ATOMIC_RELAXED);
       o = copyTo(c, &(c->nextGen1), o, size);
 
       c->nextAgeMap.setOnly(o, age + 1);
@@ -1187,6 +1247,7 @@ void* copy2(Context* c, void* o)
     assertT(c, not c->nextGen1.contains(o));
     assertT(c, not c->nextGen2.contains(o));
     assertT(c, not immortalHeapContains(c, o));
+    __atomic_fetch_add(&gcSplit.eden_w, size, __ATOMIC_RELAXED);
 
     o = copyTo(c, &(c->nextGen1), o, size);
 
@@ -1543,6 +1604,12 @@ void gcPush(void* p)
     }
     q->data[q->n] = p;
     ++q->n;
+    {
+      unsigned phase = vm::gcTracePhase;
+      if (phase < 6) {
+        __atomic_fetch_add(&gcSplit.phasePush[phase], 1, __ATOMIC_RELAXED);
+      }
+    }
     return;
   }
   pthread_mutex_lock(&q->mu);
@@ -1609,10 +1676,14 @@ void scanSlice(GcWorker* w)
 
 void collect(Context* c, void** p, void* target, unsigned offset)
 {
+  // Consume the flag before update. visitMarkedFixies runs after this
+  // returns and must trace normally.
+  bool shallow = vm::gcCopyShallow;
+  vm::gcCopyShallow = false;
   bool needsVisit = false;
   void* result = update(c, p, target, offset, &needsVisit);
   local::set(p, result);
-  if (needsVisit and result != 0) {
+  if (needsVisit and result != 0 and not shallow) {
     gcPush(result);
   }
 }
@@ -1984,6 +2055,7 @@ void collect(Context* c,
       }
     } else {
       assertT(c, map->scale == 1);
+      __atomic_fetch_add(&gcSplit.slots, 1, __ATOMIC_RELAXED);
       void** p = reinterpret_cast<void**>(map->segment->get(it.next()));
 
       map->clearOnly(p);
@@ -2062,12 +2134,14 @@ void drainTrace()
 void scanUnmanagedObject(void* object, void* arg)
 {
   Context* c = static_cast<Context*>(arg);
+  __atomic_fetch_add(&gcSplit.um_n, 1, __ATOMIC_RELAXED);
   // A previous scan found no managed slot, and no store since then
   // has written one. The object does not move, so there is nothing
   // to update.
   if (unmanagedScanClean(object)) {
     return;
   }
+  __atomic_fetch_add(&gcSplit.um_dirty, 1, __ATOMIC_RELAXED);
   if (maskAlignedPointer(*static_cast<void**>(object)) == 0) {
     return;
   }
@@ -2095,7 +2169,9 @@ void scanUnmanagedObject(void* object, void* arg)
   } walker(c, object);
 
   c->client->walk(object, &walker);
-  if (not walker.managed) {
+  // A class loader slot is not traced, but it is still a managed
+  // pointer that the next collection has to forward or clear.
+  if (not walker.managed and not c->client->retainsManagedSlot(object)) {
     unmanagedMarkScanClean(object);
   }
 }
@@ -2121,6 +2197,7 @@ void collect2(Context* c)
 
   beginTrace(c);
 
+  uint64_t mark = monoNs();
   if (c->mode == Heap::MinorCollection and c->gen2.position()) {
     if (pool.n > 1) {
       assignSlices(c);
@@ -2132,10 +2209,13 @@ void collect2(Context* c)
       collect(c, &(c->heapMap), 0, c->gen2.position(), &dirty, false);
     }
   }
+  gcSplit.gen2_us = usSince(mark);
 
+  mark = monoNs();
   if (c->mode == Heap::MinorCollection) {
     visitDirtyFixies(c, &(c->dirtyTenuredFixies));
   }
+  gcSplit.fixie_us = usSince(mark);
 
   class Visitor : public Heap::Visitor {
    public:
@@ -2152,18 +2232,34 @@ void collect2(Context* c)
     Context* c;
   } v(c);
 
+  vm::gcTracePhase = 1;
+  mark = monoNs();
   c->client->visitRoots(&v);
+  gcSplit.roots_us = usSince(mark);
   // Metadata and other unmanaged objects are not in a segment, so the
   // card table never records them. Slots that point at managed objects
   // are updated in place. An object whose last scan saw none of those,
   // and which has not stored one since, is left alone.
+  vm::gcTracePhase = 2;
+  mark = monoNs();
   unmanagedForEach(scanUnmanagedObject, c);
+  gcSplit.um_us = usSince(mark);
   // Roots only push. Drain before weak refs: status() reports
   // Unreachable for a from-space object that has not been forwarded,
   // and that clears WeakHashMap keys which are still strongly held.
+  vm::gcTracePhase = 3;
+  mark = monoNs();
   drainTrace();
+  gcSplit.drain_us = usSince(mark);
+  vm::gcTracePhase = 4;
+  mark = monoNs();
   c->client->traceWeakRoots(&v);
+  gcSplit.weak_us = usSince(mark);
+  vm::gcTracePhase = 5;
+  mark = monoNs();
   drainTrace();
+  gcSplit.drain2_us = usSince(mark);
+  vm::gcTracePhase = 0;
   endTrace();
 }
 
@@ -2225,20 +2321,73 @@ void collect(Context* c)
     then = c->system->now();
   }
 
+  gcSplit = GcSplit();
+  uint64_t mark = monoNs();
   initNextGen1(c);
 
   if (c->mode == Heap::MajorCollection) {
     initNextGen2(c);
   }
+  gcSplit.prep_us = usSince(mark);
 
   collect2(c);
 
+  mark = monoNs();
   c->gen1.replaceWith(&(c->nextGen1));
   if (c->mode == Heap::MajorCollection) {
     c->gen2.replaceWith(&(c->nextGen2));
   }
 
   sweepFixies(c);
+  gcSplit.sweep_us = usSince(mark);
+
+  fprintf(stderr,
+          "[avian] gc split prep_us=%llu gen2_us=%llu fixie_us=%llu "
+          "roots_us=%llu um_us=%llu drain_us=%llu weak_us=%llu "
+          "drain2_us=%llu sweep_us=%llu objs=%llu eden_w=%llu "
+          "surv_w=%llu promo_w=%llu old_w=%llu um_n=%llu um_dirty=%llu "
+          "slots=%llu young_w=%u gen2_w=%u\n",
+          static_cast<unsigned long long>(gcSplit.prep_us),
+          static_cast<unsigned long long>(gcSplit.gen2_us),
+          static_cast<unsigned long long>(gcSplit.fixie_us),
+          static_cast<unsigned long long>(gcSplit.roots_us),
+          static_cast<unsigned long long>(gcSplit.um_us),
+          static_cast<unsigned long long>(gcSplit.drain_us),
+          static_cast<unsigned long long>(gcSplit.weak_us),
+          static_cast<unsigned long long>(gcSplit.drain2_us),
+          static_cast<unsigned long long>(gcSplit.sweep_us),
+          static_cast<unsigned long long>(gcSplit.objs),
+          static_cast<unsigned long long>(gcSplit.eden_w),
+          static_cast<unsigned long long>(gcSplit.surv_w),
+          static_cast<unsigned long long>(gcSplit.promo_w),
+          static_cast<unsigned long long>(gcSplit.old_w),
+          static_cast<unsigned long long>(gcSplit.um_n),
+          static_cast<unsigned long long>(gcSplit.um_dirty),
+          static_cast<unsigned long long>(gcSplit.slots),
+          c->gen1.position(),
+          c->gen2.position());
+  fprintf(stderr,
+          "[avian] gc copy objs=%llu,%llu,%llu,%llu,%llu,%llu "
+          "words=%llu,%llu,%llu,%llu,%llu,%llu "
+          "push=%llu,%llu,%llu,%llu,%llu,%llu\n",
+          static_cast<unsigned long long>(gcSplit.phaseObjs[0]),
+          static_cast<unsigned long long>(gcSplit.phaseObjs[1]),
+          static_cast<unsigned long long>(gcSplit.phaseObjs[2]),
+          static_cast<unsigned long long>(gcSplit.phaseObjs[3]),
+          static_cast<unsigned long long>(gcSplit.phaseObjs[4]),
+          static_cast<unsigned long long>(gcSplit.phaseObjs[5]),
+          static_cast<unsigned long long>(gcSplit.phaseWords[0]),
+          static_cast<unsigned long long>(gcSplit.phaseWords[1]),
+          static_cast<unsigned long long>(gcSplit.phaseWords[2]),
+          static_cast<unsigned long long>(gcSplit.phaseWords[3]),
+          static_cast<unsigned long long>(gcSplit.phaseWords[4]),
+          static_cast<unsigned long long>(gcSplit.phaseWords[5]),
+          static_cast<unsigned long long>(gcSplit.phasePush[0]),
+          static_cast<unsigned long long>(gcSplit.phasePush[1]),
+          static_cast<unsigned long long>(gcSplit.phasePush[2]),
+          static_cast<unsigned long long>(gcSplit.phasePush[3]),
+          static_cast<unsigned long long>(gcSplit.phasePush[4]),
+          static_cast<unsigned long long>(gcSplit.phasePush[5]));
 
   if (Verbose) {
     int64_t now = c->system->now();
@@ -2640,5 +2789,10 @@ unsigned gcTraceWorkers()
 {
   return local::traceWorkerCount();
 }
+
+// Which collect2 stage is copying. 0 other, 1 roots, 2 unmanaged,
+// 3 first drain, 4 weak roots, 5 second drain.
+unsigned gcTracePhase = 0;
+bool gcCopyShallow = false;
 
 }  // namespace vm

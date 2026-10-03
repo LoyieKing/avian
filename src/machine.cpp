@@ -32,7 +32,12 @@
 using namespace vm;
 using namespace avian::util;
 
-
+namespace vm {
+extern unsigned gcTracePhase;
+// Set around one Visitor::visit. The collector copies that referent
+// and does not push it, so its fields stay untraced.
+extern bool gcCopyShallow;
+}
 
 namespace {
 
@@ -619,15 +624,22 @@ object findInInterfaces(
   return result;
 }
 
+void removeMonitor(Thread* t, object o);
+
 void finalizerTargetUnreachable(Thread* t, Heap::Visitor* v, GcFinalizer** p)
 {
-  v->visit(&(*p)->target());
-
   GcFinalizer* finalizer = *p;
-  *p = cast<GcFinalizer>(t, finalizer->next());
-
   void (*function)(Thread*, object);
   memcpy(&function, &finalizer->finalize(), BytesPerWord);
+  // removeMonitor hashes the object and drops the weak monitor entry.
+  // It does not read fields. Tracing them copies the StringBuilder
+  // cell chain of every synchronized buffer this collection is dropping.
+  if (function == removeMonitor) {
+    gcCopyShallow = true;
+  }
+  v->visit(&finalizer->target());
+
+  *p = cast<GcFinalizer>(t, finalizer->next());
 
   if (function) {
     // TODO: use set() here?
@@ -681,20 +693,18 @@ void referenceTargetUnreachable(Thread* t, Heap::Visitor* v, GcJreference** p)
   }
 }
 
-void referenceUnreachable(Thread* t, Heap::Visitor* v, GcJreference** p)
+void referenceUnreachable(Thread* t, Heap::Visitor* v UNUSED, GcJreference** p)
 {
-  GcJreference* r = t->m->heap->follow(*p);
-
+  // The reference object itself is garbage. A reachable queue must not
+  // keep it, or enqueueing it traces value and next and copies the
+  // whole dead WeakHashMap. java.lang.ref only enqueues a reference
+  // that is still reachable.
   if (DebugReferences) {
+    GcJreference* r = t->m->heap->follow(*p);
     fprintf(stderr, "reference %p unreachable (target %p)\n", *p, r->target());
   }
 
-  if (r->queue() and t->m->heap->status(r->queue()) != Heap::Unreachable) {
-    // queue is reachable - add the reference
-    referenceTargetUnreachable(t, v, p);
-  } else {
-    *p = cast<GcJreference>(t, (*p)->vmNext());
-  }
+  *p = cast<GcJreference>(t, (*p)->vmNext());
 }
 
 void referenceTargetReachable(Thread* t, Heap::Visitor* v, GcJreference** p)
@@ -732,6 +742,13 @@ void postVisit(Thread* t, Heap::Visitor* v)
 {
   Machine* m = t->m;
   bool major = m->heap->collectionType() == Heap::MajorCollection;
+  unsigned finalizerCount = 0;
+  unsigned resurrected = 0;
+  unsigned weakCount = 0;
+  unsigned refDeadQueueDead = 0;
+  unsigned refDeadQueueLive = 0;
+  unsigned refLiveTargetDead = 0;
+  unsigned refLiveTargetLive = 0;
 
   assertT(t, m->finalizeQueue == 0);
 
@@ -760,9 +777,11 @@ void postVisit(Thread* t, Heap::Visitor* v)
   {
     object unreachable = 0;
     for (GcFinalizer** p = &(m->finalizers); *p;) {
+      ++finalizerCount;
       v->visit(p);
 
       if (m->heap->status((*p)->target()) == Heap::Unreachable) {
+        ++resurrected;
         GcFinalizer* finalizer = *p;
         *p = cast<GcFinalizer>(t, finalizer->next());
 
@@ -804,15 +823,22 @@ void postVisit(Thread* t, Heap::Visitor* v)
   GcJreference* lastNewTenuredWeakReference = 0;
 
   for (GcJreference** p = &(m->weakReferences); *p;) {
+    ++weakCount;
     if (m->heap->status(*p) == Heap::Unreachable) {
-      // reference is unreachable
+      GcJreference* r = m->heap->follow(*p);
+      if (r->queue()
+          and m->heap->status(r->queue()) != Heap::Unreachable) {
+        ++refDeadQueueLive;
+      } else {
+        ++refDeadQueueDead;
+      }
       referenceUnreachable(t, v, p);
     } else if (m->heap->status(m->heap->follow(*p)->target())
                == Heap::Unreachable) {
-      // target is unreachable
+      ++refLiveTargetDead;
       referenceTargetUnreachable(t, v, p);
     } else {
-      // both reference and target are reachable
+      ++refLiveTargetLive;
       referenceTargetReachable(t, v, p);
 
       if (m->heap->status(*p) == Heap::Tenured) {
@@ -892,6 +918,16 @@ void postVisit(Thread* t, Heap::Visitor* v)
   if (m->weakGlobalHandles) {
     m->weakGlobalHandles->postVisit(t, v);
   }
+  fprintf(stderr,
+          "[avian] gc refs finalizers=%u resurrected=%u weaks=%u "
+          "dead_q=%u dead_liveq=%u live_deadkey=%u live=%u\n",
+          finalizerCount,
+          resurrected,
+          weakCount,
+          refDeadQueueDead,
+          refDeadQueueLive,
+          refLiveTargetDead,
+          refLiveTargetLive);
 }
 
 void postCollect(Thread* t)
@@ -3625,6 +3661,104 @@ void fixUnmanagedLoaders(Thread* t)
   unmanagedForEach(fixUnmanagedLoader, t);
 }
 
+struct CopiedClass {
+  uintptr_t key;
+  uint64_t n;
+  uint64_t words;
+  char name[96];
+};
+
+CopiedClass copiedWeak[256];
+CopiedClass copiedDrain2[256];
+uint64_t copiedWeakOverflow = 0;
+uint64_t copiedDrain2Overflow = 0;
+
+void resetCopiedClass()
+{
+  memset(copiedWeak, 0, sizeof(copiedWeak));
+  memset(copiedDrain2, 0, sizeof(copiedDrain2));
+  copiedWeakOverflow = 0;
+  copiedDrain2Overflow = 0;
+}
+
+void noteRow(CopiedClass* table, uint64_t* overflow, GcClass* class_, unsigned words)
+{
+  uintptr_t key = reinterpret_cast<uintptr_t>(class_);
+  unsigned slot = static_cast<unsigned>((key >> 4) & 255);
+  for (unsigned probe = 0; probe < 8; ++probe) {
+    CopiedClass* row = &table[(slot + probe) & 255];
+    if (row->key == key) {
+      ++row->n;
+      row->words += words;
+      return;
+    }
+    if (row->key == 0) {
+      row->key = key;
+      row->n = 1;
+      row->words = words;
+      row->name[0] = 0;
+      if (class_->name() != 0) {
+        const int8_t* bytes = class_->name()->body().begin();
+        unsigned i = 0;
+        for (; i < 95 and bytes[i] != 0; ++i) {
+          row->name[i] = static_cast<char>(bytes[i]);
+        }
+        row->name[i] = 0;
+      }
+      return;
+    }
+  }
+  ++(*overflow);
+}
+
+void noteCopiedClass(GcClass* class_, unsigned words)
+{
+  if (class_ == 0) {
+    return;
+  }
+  if (gcTracePhase == 4) {
+    noteRow(copiedWeak, &copiedWeakOverflow, class_, words);
+  } else if (gcTracePhase == 5) {
+    noteRow(copiedDrain2, &copiedDrain2Overflow, class_, words);
+  }
+}
+
+void printTable(const char* tag, CopiedClass* table, uint64_t overflow)
+{
+  for (unsigned rank = 0; rank < 8; ++rank) {
+    unsigned best = 256;
+    uint64_t bestN = 0;
+    for (unsigned i = 0; i < 256; ++i) {
+      if (table[i].n > bestN) {
+        bestN = table[i].n;
+        best = i;
+      }
+    }
+    if (best == 256) {
+      break;
+    }
+    fprintf(stderr,
+            "[avian] gc live %s class=%s n=%llu words=%llu\n",
+            tag,
+            table[best].name,
+            static_cast<unsigned long long>(table[best].n),
+            static_cast<unsigned long long>(table[best].words));
+    table[best].n = 0;
+  }
+  if (overflow != 0) {
+    fprintf(stderr,
+            "[avian] gc live %s overflow=%llu\n",
+            tag,
+            static_cast<unsigned long long>(overflow));
+  }
+}
+
+void printCopiedClass()
+{
+  printTable("weak", copiedWeak, copiedWeakOverflow);
+  printTable("drain2", copiedDrain2, copiedDrain2Overflow);
+}
+
 class HeapClient : public Heap::Client {
  public:
   HeapClient(Machine* m) : m(m)
@@ -3698,6 +3832,7 @@ class HeapClient : public Heap::Client {
 
     unsigned base = baseSize(t, src, class_);
     unsigned n = extendedSize(t, src, base);
+    noteCopiedClass(class_, n);
 
     object dst = static_cast<object>(dstp);
 
@@ -3708,6 +3843,21 @@ class HeapClient : public Heap::Client {
       alias(dst, 0) |= ExtendedMark;
       extendedWord(t, dst, base) = takeHash(t, src);
     }
+  }
+
+  virtual bool retainsManagedSlot(void* p)
+  {
+    Thread* t = m->rootThread;
+    object o = static_cast<object>(maskAlignedPointer(p));
+    if (not pointerIsUnmanaged(o)
+        or maskAlignedPointer(fieldAtOffset<object>(o, 0)) == 0) {
+      return false;
+    }
+    if (objectClass(t, o) != type(t, GcClass::Type)) {
+      return false;
+    }
+    void* loader = maskAlignedPointer(static_cast<GcClass*>(o)->loader());
+    return loader != 0 and not pointerIsUnmanaged(loader);
   }
 
   virtual void walk(void* p, Heap::Walker* w)
@@ -3766,9 +3916,11 @@ void doCollect(Thread* t, Heap::CollectionType type, int pendingAllocation)
 
   Machine* m = t->m;
 
+  resetCopiedClass();
   m->unsafe = true;
   m->heap->collect(type, footprint(m->rootThread), pendingAllocation);
   m->unsafe = false;
+  printCopiedClass();
 
   postCollect(m->rootThread);
 
@@ -4892,8 +5044,9 @@ object allocateUnmanaged(Thread* t, unsigned sizeInBytes, bool objectMask)
 {
   unsigned bytes = pad(sizeInBytes);
   expect(t, bytes > 0);
-  // The word before the object is the scan flag. Zero means dirty.
-  unsigned total = bytes + BytesPerWord;
+  // Two words before the object: the tracker node, then the scan flag.
+  // Zero means dirty. The node word is filled in by unmanagedTrack.
+  unsigned total = bytes + 2 * BytesPerWord;
   if (total < bytes) {
     throw_(t, roots(t)->outOfMemoryError());
   }
@@ -4901,7 +5054,7 @@ object allocateUnmanaged(Thread* t, unsigned sizeInBytes, bool objectMask)
   if (raw == 0) {
     throw_(t, roots(t)->outOfMemoryError());
   }
-  void* p = static_cast<uint8_t*>(raw) + BytesPerWord;
+  void* p = static_cast<uint8_t*>(raw) + 2 * BytesPerWord;
   if (objectMask) {
     unmanagedTrack(p);
   }

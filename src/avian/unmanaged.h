@@ -45,10 +45,18 @@ void copyingHeapFree(const void* p);
 // slots in place; the object itself does not move.
 void unmanagedTrack(void* object);
 
-// allocateUnmanaged places one word immediately before the Java object.
-// Zero, the allocator's fill, means the next collection must scan it.
-// A scan that sees only null and unmanaged slots stores 1. A later
-// store of a managed referent stores 0. The word is not a Java field.
+// allocateUnmanaged places two words immediately before the Java object.
+// The first is the tracker node. The second is the scan flag. Zero, the
+// allocator's fill, means the object is on the dirty list and the next
+// collection must scan it. A scan that sees only null and unmanaged
+// slots stores 1 and unlinks the node. The node is never freed. A later
+// store of a managed referent stores 0 and links that same node again.
+// Neither word is a Java field.
+inline void** unmanagedNodeWord(void* object)
+{
+  return reinterpret_cast<void**>(object) - 2;
+}
+
 inline uintptr_t* unmanagedScanWord(void* object)
 {
   return reinterpret_cast<uintptr_t*>(object) - 1;
@@ -64,10 +72,9 @@ inline void unmanagedMarkScanClean(void* object)
   __atomic_store_n(unmanagedScanWord(object), static_cast<uintptr_t>(1), __ATOMIC_RELAXED);
 }
 
-inline void unmanagedMarkScanDirty(void* object)
-{
-  __atomic_store_n(unmanagedScanWord(object), static_cast<uintptr_t>(0), __ATOMIC_RELAXED);
-}
+// Already-dirty is one relaxed load. A clean object is linked again
+// under the stop-the-world collection that walks the list.
+void unmanagedMarkScanDirty(void* object);
 
 void unmanagedForEach(void (*fn)(void* object, void* arg), void* arg);
 
