@@ -120,10 +120,17 @@ void* bumpAllocate(size_t bytes)
   sharedRegion->bump = end;
   pthread_mutex_unlock(&sharedRegion->lock);
 #else
+  // Apple Silicon pages are 16KB. A 4KB mprotect is rejected.
+  long page = sysconf(_SC_PAGESIZE);
+  uintptr_t pageSize = page > 0 ? static_cast<uintptr_t>(page) : 4096;
+  uintptr_t pageMask = pageSize - 1;
   pthread_mutex_lock(&bumpLock);
   uintptr_t p = (regionBump + align - 1) & ~(align - 1);
-  uintptr_t end = (p + bytes + 4095) & ~uintptr_t(4095);
-  if (end > regionEnd) {
+  if (p & pageMask) {
+    p = (p + pageMask) & ~pageMask;
+  }
+  uintptr_t end = (p + bytes + pageMask) & ~pageMask;
+  if (end > regionEnd or end < p) {
     pthread_mutex_unlock(&bumpLock);
     return 0;
   }
