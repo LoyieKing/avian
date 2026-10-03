@@ -5071,6 +5071,16 @@ void shutdown(Thread* t)
   }
   disposed = true;
   resumeAll();
+#ifndef _WIN32
+  // The server thread is blocked in read. Shut the socket down so it
+  // can leave, then wait for it. Destroying the heap first faults on
+  // macOS, where the interpreter reaches teardown sooner.
+  int fd = clientSocket;
+  if (fd >= 0)
+    ::shutdown(fd, SHUT_RDWR);
+  if (serverSystemThread != 0)
+    serverSystemThread->join();
+#endif
   (void)t;
 }
 
