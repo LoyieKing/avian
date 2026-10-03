@@ -287,7 +287,8 @@ def bad_redefine_bytes():
     src = os.path.join(tmp, "JdwpDebug.java")
     with open(src, "w") as f:
         f.write("public class JdwpDebug { public static void main(String[] a) {} }\n")
-    subprocess.check_call([javac, "-g", "-d", tmp, src])
+    subprocess.check_call(
+        [javac, "-g", "-source", "1.8", "-target", "1.8", "-d", tmp, src])
     with open(os.path.join(tmp, "JdwpDebug.class"), "rb") as f:
         return f.read()
 
@@ -299,7 +300,8 @@ def redefine_bytes():
     if not os.path.exists(javac):
         javac = "javac"
     tmp = tempfile.mkdtemp(prefix="jdwp-redef-")
-    subprocess.check_call([javac, "-g", "-d", tmp, src])
+    subprocess.check_call(
+        [javac, "-g", "-source", "1.8", "-target", "1.8", "-d", tmp, src])
     with open(os.path.join(tmp, "JdwpDebug.class"), "rb") as f:
         return f.read()
 
