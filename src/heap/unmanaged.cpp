@@ -721,4 +721,73 @@ AVIAN_ALLOC_EXPORT void operator delete[](void* p,
   vm::heapFree(p);
 }
 
+#else
+
+// The VM links with the C driver, so libc++ is not on the link line.
+// Only linux x86-64 replaces process malloc. Other platforms still need
+// these symbols for `new`, and they go to the system allocator.
+
+void* operator new(size_t bytes)
+{
+  if (bytes == 0) {
+    bytes = 1;
+  }
+  void* p = malloc(bytes);
+  if (p == 0) {
+    ::abort();
+  }
+  return p;
+}
+
+void* operator new[](size_t bytes)
+{
+  return operator new(bytes);
+}
+
+void* operator new(size_t bytes, const std::nothrow_t&) noexcept
+{
+  if (bytes == 0) {
+    bytes = 1;
+  }
+  return malloc(bytes);
+}
+
+void* operator new[](size_t bytes, const std::nothrow_t&) noexcept
+{
+  if (bytes == 0) {
+    bytes = 1;
+  }
+  return malloc(bytes);
+}
+
+void operator delete(void* p) noexcept
+{
+  free(p);
+}
+
+void operator delete[](void* p) noexcept
+{
+  free(p);
+}
+
+void operator delete(void* p, size_t) noexcept
+{
+  free(p);
+}
+
+void operator delete[](void* p, size_t) noexcept
+{
+  free(p);
+}
+
+void operator delete(void* p, const std::nothrow_t&) noexcept
+{
+  free(p);
+}
+
+void operator delete[](void* p, const std::nothrow_t&) noexcept
+{
+  free(p);
+}
+
 #endif

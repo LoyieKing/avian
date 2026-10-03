@@ -8,7 +8,7 @@ namespace vm {
 
 // x86-64 user space is 48-bit. The unmanaged heap reserves one 4TB
 // granule at bit 45 (address >> 42 == 8). That bit is the tag: set
-// means unmanaged. Process malloc and ordinary C++ new land there.
+// means unmanaged. On linux x86-64, process malloc and C++ new land there.
 // Copying-heap segments stay on jemalloc's normal arena, outside this
 // granule, so a managed object does not carry the tag. The two areas
 // are different physical pages, not a ZGC multi-map. Null is granule

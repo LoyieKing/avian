@@ -365,6 +365,7 @@ extern "C" JNIEXPORT jboolean JNICALL
 extern "C" JNIEXPORT jboolean JNICALL
     Java_JNI_mallocIsUnmanaged(JNIEnv*, jclass)
 {
+#if defined(__linux__) && defined(__x86_64__)
   void* block = malloc(32);
   void* object = ::operator new(32);
   bool tagged = block != 0 && object != 0
@@ -373,6 +374,10 @@ extern "C" JNIEXPORT jboolean JNICALL
   free(block);
   ::operator delete(object);
   return tagged;
+#else
+  // Process malloc is intercepted only on linux x86-64.
+  return true;
+#endif
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
