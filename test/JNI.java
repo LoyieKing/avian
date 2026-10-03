@@ -84,6 +84,13 @@ public class JNI {
 
   private static native String newUnmanagedStringFromUnmanaged(byte[] bytes);
 
+  private static native String newReadOnlyUnmanagedString(byte[] bytes);
+
+  private static native String newReadOnlyUnmanagedStringFromUnmanaged(
+      byte[] bytes);
+
+  private static native boolean readOnlyUtfIsNull(String s);
+
   private static native boolean mallocIsUnmanaged();
 
   private static native boolean isUnmanaged(Object o);
@@ -191,6 +198,22 @@ public class JNI {
            && data.getLong(alias) != 0);
     System.gc();
     expect(alias.equals("abc") && isUnmanaged(alias));
+
+    expect(newReadOnlyUnmanagedString(null) == null);
+    String readOnly = newReadOnlyUnmanagedString(new byte[] { 'a', 'b', 'c' });
+    expect(readOnly.equals("abc") && readOnly.hashCode() == 96354
+           && readOnly.charAt(1) == 'b' && isUnmanaged(readOnly)
+           && data.getLong(readOnly) != 0);
+    System.gc();
+    expect(readOnly.equals("abc") && isUnmanaged(readOnly));
+
+    expect(newReadOnlyUnmanagedStringFromUnmanaged(null) == null);
+    String readOnlyAlias = newReadOnlyUnmanagedStringFromUnmanaged(
+        new byte[] { 'a', 'b', 'c' });
+    expect(readOnlyAlias.equals("abc") && readOnlyAlias.hashCode() == 96354
+           && readOnlyAlias.charAt(1) == 'b' && isUnmanaged(readOnlyAlias)
+           && data.getLong(readOnlyAlias) != 0);
+    expect(readOnlyUtfIsNull(new String(new byte[] { 'z', 'z', 'z' })));
 
     expect(mallocIsUnmanaged());
 

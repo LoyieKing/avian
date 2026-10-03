@@ -292,6 +292,76 @@ extern "C" JNIEXPORT jstring JNICALL
       ->NewUnmanagedStringFromUnmanagedMutf8(header);
 }
 
+static jstring newReadOnlyAlias(JNIEnv* e, jbyteArray bytes, bool fromUnmanaged)
+{
+  AvianJniEnv* env = reinterpret_cast<AvianJniEnv*>(e);
+  if (bytes == 0) {
+    return fromUnmanaged ? env->NewReadOnlyUnmanagedStringFromUnmanagedMutf8(0)
+                         : env->NewReadOnlyUnmanagedStringFromMutf8(0);
+  }
+
+  jsize n = e->GetArrayLength(bytes);
+  if (n < 0 || n > 65535) {
+    return 0;
+  }
+  uint8_t* header = static_cast<uint8_t*>(malloc(static_cast<size_t>(n) + 2));
+  if (header == 0) {
+    return 0;
+  }
+  header[0] = static_cast<uint8_t>(static_cast<unsigned>(n) >> 8);
+  header[1] = static_cast<uint8_t>(n);
+  if (n) {
+    e->GetByteArrayRegion(bytes, 0, n, reinterpret_cast<jbyte*>(header + 2));
+  }
+  jstring result = fromUnmanaged
+                       ? env->NewReadOnlyUnmanagedStringFromUnmanagedMutf8(header)
+                       : env->NewReadOnlyUnmanagedStringFromMutf8(header);
+  if (result == 0) {
+    return 0;
+  }
+  jint byteLength = -1;
+  const char* payload = env->GetReadOnlyUnmanagedStringUtfChars(result, &byteLength);
+  const bool alias = payload == reinterpret_cast<const char*>(header + 2)
+                     && byteLength == n;
+  env->ReleaseReadOnlyUnmanagedStringUtfChars(result, payload);
+  jboolean copied = JNI_FALSE;
+  const char* utf = e->GetStringUTFChars(result, &copied);
+  const bool separate = utf != 0 && utf != reinterpret_cast<const char*>(header + 2);
+  if (utf != 0) {
+    e->ReleaseStringUTFChars(result, utf);
+  }
+  if (!alias || !separate) {
+    return 0;
+  }
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+    Java_JNI_newReadOnlyUnmanagedString(JNIEnv* e, jclass, jbyteArray bytes)
+{
+  return newReadOnlyAlias(e, bytes, false);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+    Java_JNI_newReadOnlyUnmanagedStringFromUnmanaged(JNIEnv* e,
+                                                    jclass,
+                                                    jbyteArray bytes)
+{
+  return newReadOnlyAlias(e, bytes, true);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+    Java_JNI_readOnlyUtfIsNull(JNIEnv* e, jclass, jstring s)
+{
+  jint byteLength = -1;
+  const char* payload
+      = reinterpret_cast<AvianJniEnv*>(e)->GetReadOnlyUnmanagedStringUtfChars(
+          s, &byteLength);
+  reinterpret_cast<AvianJniEnv*>(e)->ReleaseReadOnlyUnmanagedStringUtfChars(
+      s, payload);
+  return payload == 0 && byteLength == 0;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
     Java_JNI_mallocIsUnmanaged(JNIEnv*, jclass)
 {

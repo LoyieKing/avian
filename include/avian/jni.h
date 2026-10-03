@@ -120,6 +120,50 @@ struct AvianJniEnv : JNIEnv {
     const Fn* table = reinterpret_cast<const Fn*>(functions);
     table[slot](this);
   }
+
+  /* header is a big-endian u2 byte length, then that many Modified UTF-8
+     bytes. The String lives on the unmanaged heap and stores that address.
+     The bytes are not copied. The caller keeps the memory alive and does
+     not write it. A null header returns null. */
+  jstring NewReadOnlyUnmanagedStringFromMutf8(const void* header)
+  {
+    typedef jstring(JNICALL* Fn)(JNIEnv*, const void*);
+    const unsigned slot = 243;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, header);
+  }
+
+  /* Same contract as NewReadOnlyUnmanagedStringFromMutf8. The header is
+     already unmanaged. The bytes are not copied. */
+  jstring NewReadOnlyUnmanagedStringFromUnmanagedMutf8(const void* header)
+  {
+    typedef jstring(JNICALL* Fn)(JNIEnv*, const void*);
+    const unsigned slot = 244;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, header);
+  }
+
+  /* Payload of a read-only unmanaged string: the Modified UTF-8 bytes
+     already stored for it, not a copy. byteLength receives the byte count.
+     Returns null when the payload could move, and does not copy in that
+     case. A null string returns null and writes zero when byteLength is
+     set. */
+  const char* GetReadOnlyUnmanagedStringUtfChars(jstring s, jint* byteLength)
+  {
+    typedef const char*(JNICALL* Fn)(JNIEnv*, jstring, jint*);
+    const unsigned slot = 245;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, s, byteLength);
+  }
+
+  /* No buffer was allocated. This does not free chars. */
+  void ReleaseReadOnlyUnmanagedStringUtfChars(jstring s, const char* chars)
+  {
+    typedef void(JNICALL* Fn)(JNIEnv*, jstring, const char*);
+    const unsigned slot = 246;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    table[slot](this, s, chars);
+  }
 };
 
 #endif /* AVIAN_JNI_H_ */

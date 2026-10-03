@@ -418,6 +418,61 @@ jstring JNICALL NewUnmanagedStringFromUnmanagedMutf8(Thread* t,
       run(t, newUnmanagedStringFromUnmanagedMutf8, arguments));
 }
 
+jstring JNICALL NewReadOnlyUnmanagedStringFromMutf8(Thread* t,
+                                                   const void* header)
+{
+  return NewUnmanagedStringFromUnmanagedMutf8(t, header);
+}
+
+jstring JNICALL NewReadOnlyUnmanagedStringFromUnmanagedMutf8(Thread* t,
+                                                            const void* header)
+{
+  return NewUnmanagedStringFromUnmanagedMutf8(t, header);
+}
+
+uint64_t getReadOnlyUnmanagedStringUtfChars(Thread* t, uintptr_t* arguments)
+{
+  jobject s = reinterpret_cast<jobject>(arguments[0]);
+  jint* byteLength = reinterpret_cast<jint*>(arguments[1]);
+  if (s == 0 or *s == 0) {
+    if (byteLength != 0) {
+      *byteLength = 0;
+    }
+    return 0;
+  }
+
+  GcString* string = cast<GcString>(t, *s);
+  object data = string->data();
+  const bool external = string->unsafe_data() != 0;
+  const bool frozen = data != 0 and pointerIsUnmanaged(data);
+  if (not external and not frozen) {
+    if (byteLength != 0) {
+      *byteLength = 0;
+    }
+    return 0;
+  }
+
+  Mutf8View view = mutf8View(t, string);
+  if (byteLength != 0) {
+    *byteLength = static_cast<jint>(view.length);
+  }
+  return reinterpret_cast<uint64_t>(view.bytes);
+}
+
+const char* JNICALL GetReadOnlyUnmanagedStringUtfChars(Thread* t,
+                                                      jstring s,
+                                                      jint* byteLength)
+{
+  uintptr_t arguments[]
+      = {reinterpret_cast<uintptr_t>(s), reinterpret_cast<uintptr_t>(byteLength)};
+  return reinterpret_cast<const char*>(
+      run(t, getReadOnlyUnmanagedStringUtfChars, arguments));
+}
+
+void JNICALL ReleaseReadOnlyUnmanagedStringUtfChars(Thread*, jstring, const char*)
+{
+}
+
 uint64_t isUnmanaged(Thread* t UNUSED, uintptr_t* arguments)
 {
   jobject o = reinterpret_cast<jobject>(arguments[0]);
@@ -3637,6 +3692,23 @@ static_assert(offsetof(JNIEnvVTable, PushUnmanagedAlloc) / sizeof(void*)
 static_assert(offsetof(JNIEnvVTable, PopUnmanagedAlloc) / sizeof(void*)
                   == AvianJniPopUnmanagedAlloc,
               "include/avian/jni.h unmanaged pop slot");
+static_assert(offsetof(JNIEnvVTable, NewReadOnlyUnmanagedStringFromMutf8)
+                      / sizeof(void*)
+                  == AvianJniNewReadOnlyUnmanagedStringFromMutf8,
+              "include/avian/jni.h readonly unmanaged string slot");
+static_assert(
+    offsetof(JNIEnvVTable, NewReadOnlyUnmanagedStringFromUnmanagedMutf8)
+            / sizeof(void*)
+        == AvianJniNewReadOnlyUnmanagedStringFromUnmanagedMutf8,
+    "include/avian/jni.h readonly unmanaged string alias slot");
+static_assert(offsetof(JNIEnvVTable, GetReadOnlyUnmanagedStringUtfChars)
+                      / sizeof(void*)
+                  == AvianJniGetReadOnlyUnmanagedStringUtfChars,
+              "include/avian/jni.h readonly utf chars slot");
+static_assert(offsetof(JNIEnvVTable, ReleaseReadOnlyUnmanagedStringUtfChars)
+                      / sizeof(void*)
+                  == AvianJniReleaseReadOnlyUnmanagedStringUtfChars,
+              "include/avian/jni.h readonly utf release slot");
 
 jbyteArray JNICALL SerializeGraph(Thread* t, jobject object);
 jobject JNICALL DeserializeGraph(Thread* t, const uint8_t* data, jint length);
@@ -3677,6 +3749,14 @@ void populateJNITables(JavaVMVTable* vmTable, JNIEnvVTable* envTable)
       = local::NewUnmanagedStringFromUnmanagedMutf8;
   envTable->PushUnmanagedAlloc = local::PushUnmanagedAlloc;
   envTable->PopUnmanagedAlloc = local::PopUnmanagedAlloc;
+  envTable->NewReadOnlyUnmanagedStringFromMutf8
+      = local::NewReadOnlyUnmanagedStringFromMutf8;
+  envTable->NewReadOnlyUnmanagedStringFromUnmanagedMutf8
+      = local::NewReadOnlyUnmanagedStringFromUnmanagedMutf8;
+  envTable->GetReadOnlyUnmanagedStringUtfChars
+      = local::GetReadOnlyUnmanagedStringUtfChars;
+  envTable->ReleaseReadOnlyUnmanagedStringUtfChars
+      = local::ReleaseReadOnlyUnmanagedStringUtfChars;
   envTable->DefineClass = local::DefineClass;
   envTable->FindClass = local::FindClass;
   envTable->ThrowNew = local::ThrowNew;

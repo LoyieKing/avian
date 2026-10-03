@@ -966,6 +966,19 @@ struct JNIEnvVTable {
   // until the matching pop. An unwind past the push restores the depth.
   void(JNICALL* PushUnmanagedAlloc)(JNIEnv*);
   void(JNICALL* PopUnmanagedAlloc)(JNIEnv*);
+
+  // Unmanaged String. unsafe_data is the caller's u2-prefixed Modified
+  // UTF-8 header. The bytes are not copied. Does not intern.
+  jstring(JNICALL* NewReadOnlyUnmanagedStringFromMutf8)(JNIEnv*, const void*);
+  jstring(JNICALL* NewReadOnlyUnmanagedStringFromUnmanagedMutf8)(JNIEnv*,
+                                                                const void*);
+  // Existing Modified UTF-8 payload. Null when those bytes could move.
+  const char*(JNICALL* GetReadOnlyUnmanagedStringUtfChars)(JNIEnv*,
+                                                          jstring,
+                                                          jint*);
+  void(JNICALL* ReleaseReadOnlyUnmanagedStringUtfChars)(JNIEnv*,
+                                                       jstring,
+                                                       const char*);
 };
 
 // Slots past GetModule. include/avian/jni.h uses the same indexes.
@@ -978,7 +991,11 @@ enum {
   AvianJniIsUnmanaged = 239,
   AvianJniNewUnmanagedStringFromUnmanagedMutf8 = 240,
   AvianJniPushUnmanagedAlloc = 241,
-  AvianJniPopUnmanagedAlloc = 242
+  AvianJniPopUnmanagedAlloc = 242,
+  AvianJniNewReadOnlyUnmanagedStringFromMutf8 = 243,
+  AvianJniNewReadOnlyUnmanagedStringFromUnmanagedMutf8 = 244,
+  AvianJniGetReadOnlyUnmanagedStringUtfChars = 245,
+  AvianJniReleaseReadOnlyUnmanagedStringUtfChars = 246
 };
 
 inline void atomicOr(uint32_t* p, int v)

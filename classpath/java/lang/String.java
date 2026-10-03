@@ -135,16 +135,20 @@ public final class String
   public int hashCode() {
     int h = hashCode;
     if (h == 0 && length != 0) {
-      byte[] b = bytes();
-      int n = payload(b);
-      if (n == length) {
-        for (int i = 0; i < n; ++i) {
-          h = (h * 31) + (b[i] & 0xff);
-        }
+      if (data == null) {
+        h = unsafeHash(this);
       } else {
-        Seq seq = new Seq(b);
-        for (int i = 0; i < length; ++i) {
-          h = (h * 31) + seq.next();
+        byte[] b = data;
+        int n = payload(b);
+        if (n == length) {
+          for (int i = 0; i < n; ++i) {
+            h = (h * 31) + (b[i] & 0xff);
+          }
+        } else {
+          Seq seq = new Seq(b);
+          for (int i = 0; i < length; ++i) {
+            h = (h * 31) + seq.next();
+          }
         }
       }
       hashCode = h;
@@ -161,18 +165,21 @@ public final class String
       if (s.length != length) {
         return false;
       }
-      byte[] a = bytes();
-      byte[] b = s.bytes();
-      int n = payload(a);
-      if (n != payload(b)) {
-        return false;
-      }
-      for (int i = 0; i < n; ++i) {
-        if (a[i] != b[i]) {
+      if (data != null && s.data != null) {
+        byte[] a = data;
+        byte[] b = s.data;
+        int n = payload(a);
+        if (n != payload(b)) {
           return false;
         }
+        for (int i = 0; i < n; ++i) {
+          if (a[i] != b[i]) {
+            return false;
+          }
+        }
+        return true;
       }
-      return true;
+      return unsafeEquals(this, s);
     } else {
       return false;
     }
@@ -510,6 +517,13 @@ public final class String
     throws java.io.UnsupportedEncodingException
   {
     String fmt = format.trim().toUpperCase();
+    // One byte per char is already UTF-8 and Latin-1. Copy it once.
+    if (data == null && unsafeByteLength(unsafe_data) == length
+        && (fmt.equals(DEFAULT_ENCODING) || fmt.equals(ISO_8859_1_ENCODING)
+            || fmt.equals(LATIN_1_ENCODING) || fmt.equals("US-ASCII")
+            || fmt.equals("ASCII"))) {
+      return unsafeBytes(unsafe_data);
+    }
     byte[] b = bytes();
     int n = payload(b);
     if (DEFAULT_ENCODING.equals(fmt)) {
@@ -574,6 +588,10 @@ public final class String
       throw new StringIndexOutOfBoundsException(srcEnd);
 
     int srcLength = srcEnd - srcOffset;
+    if (data == null) {
+      copyChars(srcOffset, srcLength, dst, dstOffset);
+      return;
+    }
     byte[] b = bytes();
     if (payload(b) == length) {
       for (int i = 0; i < srcLength; ++i) {
@@ -802,12 +820,17 @@ public final class String
 
   private static native int unsafeByteLength(long pointer);
 
+  private static native byte[] unsafeBytes(long pointer);
+
+  private static native boolean unsafeEquals(String a, String b);
+
+  private static native int unsafeHash(String s);
+
+  private native void copyChars(int srcOffset, int count, char[] dst, int dstOffset);
+
   private byte[] bytes() {
     if (data != null) return data;
-    int n = unsafeByteLength(unsafe_data);
-    byte[] b = new byte[n];
-    for (int i = 0; i < n; ++i) b[i] = unsafeByte(unsafe_data, i);
-    return b;
+    return unsafeBytes(unsafe_data);
   }
 
   // Symbol arrays count a trailing 0. A string may share that array.

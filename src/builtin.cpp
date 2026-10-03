@@ -243,6 +243,81 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
 }
 
 extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeBytes(Thread* t, object, uintptr_t* arguments)
+{
+  uint64_t address;
+  memcpy(&address, arguments, 8);
+  const uint8_t* header
+      = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(address));
+  unsigned n = (static_cast<unsigned>(header[0]) << 8) | header[1];
+  GcByteArray* array = makeByteArray(t, n);
+  if (n) {
+    memcpy(array->body().begin(), header + 2, n);
+  }
+  return reinterpret_cast<int64_t>(array);
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeEquals(Thread* t, object, uintptr_t* arguments)
+{
+  object a = reinterpret_cast<object>(arguments[0]);
+  object b = reinterpret_cast<object>(arguments[1]);
+  if (UNLIKELY(a == 0)) {
+    throwNew(t, GcNullPointerException::Type);
+  }
+  if (b == 0 or objectClass(t, b) != type(t, GcString::Type)) {
+    return 0;
+  }
+  return stringEqual(t, a, b) ? 1 : 0;
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeHash(Thread* t, object, uintptr_t* arguments)
+{
+  object s = reinterpret_cast<object>(arguments[0]);
+  if (UNLIKELY(s == 0)) {
+    throwNew(t, GcNullPointerException::Type);
+  }
+  return stringHash(t, s);
+}
+
+extern "C" AVIAN_EXPORT void JNICALL
+    Avian_java_lang_String_copyChars(Thread* t, object, uintptr_t* arguments)
+{
+  GcString* string = cast<GcString>(t, reinterpret_cast<object>(arguments[0]));
+  int32_t src = static_cast<int32_t>(arguments[1]);
+  int32_t count = static_cast<int32_t>(arguments[2]);
+  GcCharArray* dst = cast<GcCharArray>(t, reinterpret_cast<object>(arguments[3]));
+  int32_t dstOff = static_cast<int32_t>(arguments[4]);
+  if (UNLIKELY(string == 0 or dst == 0)) {
+    throwNew(t, GcNullPointerException::Type);
+  }
+  if (UNLIKELY(src < 0 or count < 0 or dstOff < 0
+               or static_cast<uint32_t>(src) + static_cast<uint32_t>(count)
+                      > string->length(t)
+               or static_cast<uint32_t>(dstOff) + static_cast<uint32_t>(count)
+                      > dst->length())) {
+    throwNew(t, GcStringIndexOutOfBoundsException::Type);
+  }
+  if (count == 0) {
+    return;
+  }
+  Mutf8View view = mutf8View(t, string);
+  uint16_t* out = &dst->body()[dstOff];
+  if (view.length == string->length(t)) {
+    const uint8_t* bytes = view.bytes + src;
+    for (int32_t i = 0; i < count; ++i) {
+      out[i] = bytes[i];
+    }
+    return;
+  }
+  const uint8_t* p = mutf8Skip(view.bytes, static_cast<unsigned>(src));
+  for (int32_t i = 0; i < count; ++i) {
+    out[i] = mutf8Next(p);
+  }
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
     Avian_avian_SystemClassLoader_appLoader(Thread* t, object, uintptr_t*)
 {
   return reinterpret_cast<int64_t>(roots(t)->appLoader());
