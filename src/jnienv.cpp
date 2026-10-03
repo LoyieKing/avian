@@ -11,6 +11,8 @@
 #include "avian/jnienv.h"
 
 #include <stddef.h>
+#include <cstdio>
+#include <cstdlib>
 #include "avian/machine.h"
 #include "avian/debug.h"
 #include "avian/util.h"
@@ -332,6 +334,191 @@ jstring JNICALL NewStringFromUnmanagedMutf8(Thread* t, const void* header)
 
   uintptr_t arguments[] = {reinterpret_cast<uintptr_t>(header)};
   return reinterpret_cast<jstring>(run(t, newStringFromUnmanagedMutf8, arguments));
+}
+
+uint64_t newUnmanagedObject(Thread* t, uintptr_t* arguments)
+{
+  jclass c = reinterpret_cast<jclass>(arguments[0]);
+  if (c == 0 or *c == 0) {
+    return 0;
+  }
+
+  GcClass* class_ = (*c)->vmClass();
+  PROTECT(t, class_);
+  object instance;
+  {
+    UnmanagedAllocScope zone(t);
+    instance = make(t, class_);
+  }
+  return reinterpret_cast<uint64_t>(makeLocalReference(t, instance));
+}
+
+jobject JNICALL NewUnmanagedObject(Thread* t, jclass c)
+{
+  if (c == 0) {
+    return 0;
+  }
+
+  uintptr_t arguments[] = {reinterpret_cast<uintptr_t>(c)};
+  return reinterpret_cast<jobject>(run(t, newUnmanagedObject, arguments));
+}
+
+uint64_t newUnmanagedStringFromMutf8(Thread* t, uintptr_t* arguments)
+{
+  const uint8_t* header = reinterpret_cast<const uint8_t*>(arguments[0]);
+  unsigned n = (static_cast<unsigned>(header[0]) << 8) | header[1];
+  GcByteArray* bytes;
+  GcString* s;
+  {
+    UnmanagedAllocScope zone(t);
+    bytes = makeByteArray(t, n);
+    if (n) {
+      memcpy(bytes->body().begin(), header + 2, n);
+    }
+    s = makeString(t,
+                   static_cast<object>(bytes),
+                   static_cast<int32_t>(0),
+                   static_cast<int32_t>(n),
+                   static_cast<int32_t>(0));
+  }
+  return reinterpret_cast<uint64_t>(makeLocalReference(t, s));
+}
+
+jstring JNICALL NewUnmanagedStringFromMutf8(Thread* t, const void* header)
+{
+  if (header == 0) {
+    return 0;
+  }
+
+  uintptr_t arguments[] = {reinterpret_cast<uintptr_t>(header)};
+  return reinterpret_cast<jstring>(
+      run(t, newUnmanagedStringFromMutf8, arguments));
+}
+
+uint64_t newUnmanagedStringFromUnmanagedMutf8(Thread* t, uintptr_t* arguments)
+{
+  const uint8_t* header = reinterpret_cast<const uint8_t*>(arguments[0]);
+  GcString* s;
+  {
+    UnmanagedAllocScope zone(t);
+    s = makeStringFromMutf8Header(t, header);
+  }
+  return reinterpret_cast<uint64_t>(makeLocalReference(t, s));
+}
+
+jstring JNICALL NewUnmanagedStringFromUnmanagedMutf8(Thread* t,
+                                                    const void* header)
+{
+  if (header == 0) {
+    return 0;
+  }
+
+  uintptr_t arguments[] = {reinterpret_cast<uintptr_t>(header)};
+  return reinterpret_cast<jstring>(
+      run(t, newUnmanagedStringFromUnmanagedMutf8, arguments));
+}
+
+uint64_t isUnmanaged(Thread* t UNUSED, uintptr_t* arguments)
+{
+  jobject o = reinterpret_cast<jobject>(arguments[0]);
+  if (o == 0 or *o == 0) {
+    return 0;
+  }
+  return pointerIsUnmanaged(*o);
+}
+
+jboolean JNICALL IsUnmanaged(Thread* t, jobject o)
+{
+  uintptr_t arguments[] = {reinterpret_cast<uintptr_t>(o)};
+  return run(t, isUnmanaged, arguments);
+}
+
+// Outlives this function's checkpoint. The following Java call installs
+// a newer checkpoint, so a throw there does not drop the zone; Pop does.
+// An unwind to an older checkpoint releases it and restores the depth.
+class UnmanagedZone : public Thread::Resource {
+ public:
+  UnmanagedZone(Thread* t)
+      : Thread::Resource(t, t->resource),
+        prevZone(zoneHead),
+        prevDepth(t->unmanagedAllocDepth),
+        armed(true)
+  {
+    t->unmanagedAllocDepth = prevDepth + 1;
+    zoneHead = this;
+  }
+
+  virtual void release()
+  {
+    if (zoneHead == this) {
+      zoneHead = prevZone;
+    }
+    disarm();
+    delete this;
+  }
+
+  void pop(Thread::Resource* above)
+  {
+    if (t->resource == this) {
+      t->resource = next;
+    } else if (above != 0 and above->next == this) {
+      above->next = next;
+    } else {
+      fprintf(stderr, "[avian] unmanaged alloc pop is not the resource head\n");
+      fflush(stderr);
+      ::abort();
+    }
+    if (zoneHead == this) {
+      zoneHead = prevZone;
+    }
+    disarm();
+    delete this;
+  }
+
+  // `above` is the resource pushed after this zone, or null when this
+  // zone is the head. Its next pointer must skip the zone afterwards.
+  static void popHead(Thread::Resource* above)
+  {
+    if (zoneHead == 0) {
+      return;
+    }
+    zoneHead->pop(above);
+  }
+
+ private:
+  void disarm()
+  {
+    if (not armed) {
+      return;
+    }
+    armed = false;
+    t->unmanagedAllocDepth = prevDepth;
+  }
+
+  UnmanagedZone* prevZone;
+  unsigned prevDepth;
+  bool armed;
+
+  static __thread UnmanagedZone* zoneHead;
+};
+
+__thread UnmanagedZone* UnmanagedZone::zoneHead = 0;
+
+void JNICALL PushUnmanagedAlloc(Thread* t)
+{
+  // Stay Active so a collection cannot walk the resource list mid-update.
+  // The state resource dies with this call; the zone stays at the head
+  // and does not point back at it.
+  StateResource state(t, Thread::ActiveState);
+  UnmanagedZone* zone = new UnmanagedZone(t);
+  zone->next = state.next;
+  state.next = zone;
+}
+
+void JNICALL PopUnmanagedAlloc(Thread* t)
+{
+  StateResource state(t, Thread::ActiveState);
+  UnmanagedZone::popHead(&state);
 }
 
 void replace(int a, int b, const char* in, int8_t* out)
@@ -3430,6 +3617,26 @@ static_assert(offsetof(JNIEnvVTable, SerializeGraph) / sizeof(void*)
 static_assert(offsetof(JNIEnvVTable, DeserializeGraph) / sizeof(void*)
                   == AvianJniDeserializeGraph,
               "include/avian/jni.h deserialize slot");
+static_assert(offsetof(JNIEnvVTable, NewUnmanagedObject) / sizeof(void*)
+                  == AvianJniNewUnmanagedObject,
+              "include/avian/jni.h unmanaged object slot");
+static_assert(offsetof(JNIEnvVTable, NewUnmanagedStringFromMutf8)
+                      / sizeof(void*)
+                  == AvianJniNewUnmanagedStringFromMutf8,
+              "include/avian/jni.h unmanaged string slot");
+static_assert(offsetof(JNIEnvVTable, IsUnmanaged) / sizeof(void*)
+                  == AvianJniIsUnmanaged,
+              "include/avian/jni.h unmanaged predicate slot");
+static_assert(offsetof(JNIEnvVTable, NewUnmanagedStringFromUnmanagedMutf8)
+                      / sizeof(void*)
+                  == AvianJniNewUnmanagedStringFromUnmanagedMutf8,
+              "include/avian/jni.h unmanaged string alias slot");
+static_assert(offsetof(JNIEnvVTable, PushUnmanagedAlloc) / sizeof(void*)
+                  == AvianJniPushUnmanagedAlloc,
+              "include/avian/jni.h unmanaged push slot");
+static_assert(offsetof(JNIEnvVTable, PopUnmanagedAlloc) / sizeof(void*)
+                  == AvianJniPopUnmanagedAlloc,
+              "include/avian/jni.h unmanaged pop slot");
 
 jbyteArray JNICALL SerializeGraph(Thread* t, jobject object);
 jobject JNICALL DeserializeGraph(Thread* t, const uint8_t* data, jint length);
@@ -3463,6 +3670,13 @@ void populateJNITables(JavaVMVTable* vmTable, JNIEnvVTable* envTable)
   envTable->NewStringFromUnmanagedMutf8 = local::NewStringFromUnmanagedMutf8;
   envTable->SerializeGraph = SerializeGraph;
   envTable->DeserializeGraph = DeserializeGraph;
+  envTable->NewUnmanagedObject = local::NewUnmanagedObject;
+  envTable->NewUnmanagedStringFromMutf8 = local::NewUnmanagedStringFromMutf8;
+  envTable->IsUnmanaged = local::IsUnmanaged;
+  envTable->NewUnmanagedStringFromUnmanagedMutf8
+      = local::NewUnmanagedStringFromUnmanagedMutf8;
+  envTable->PushUnmanagedAlloc = local::PushUnmanagedAlloc;
+  envTable->PopUnmanagedAlloc = local::PopUnmanagedAlloc;
   envTable->DefineClass = local::DefineClass;
   envTable->FindClass = local::FindClass;
   envTable->ThrowNew = local::ThrowNew;

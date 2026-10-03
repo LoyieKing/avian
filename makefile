@@ -521,6 +521,18 @@ build-lflags = -lz -lpthread -ldl
 
 lflags = $(common-lflags) -lpthread -ldl
 
+# jemalloc's initial-exec TLS cannot be satisfied by a late dlopen.
+# Link the soname into the VM so the dynamic linker maps it at startup.
+# -Bsymbolic-functions keeps libjvm's malloc/new on the tagged arena
+# when a host already bound those symbols to glibc before dlopen.
+jvm-symbolic =
+ifeq ($(platform),linux)
+ifeq ($(arch),x86_64)
+	lflags += -l:libjemalloc.so.2
+	jvm-symbolic = -Wl,-Bsymbolic-functions
+endif
+endif
+
 build-system = posix
 
 system = posix
@@ -1287,6 +1299,7 @@ vm-sources = \
 	$(src)/debug.cpp \
 	$(src)/util.cpp \
 	$(src)/heap/heap.cpp \
+	$(src)/heap/unmanaged.cpp \
 	$(src)/$(process).cpp \
 	$(src)/classpath-$(classpath).cpp \
 	$(src)/builtin.cpp \
@@ -2263,7 +2276,7 @@ ifdef mt
 endif
 else
 	$(ld) $(^) $(version-script-flag) $(soname-flag) \
-		$(shared) $(lflags) $(classpath-lflags) $(bootimage-lflags) \
+		$(shared) $(jvm-symbolic) $(lflags) $(classpath-lflags) $(bootimage-lflags) \
 		-o $(@)
 endif
 	$(strip) $(strip-all) $(@)

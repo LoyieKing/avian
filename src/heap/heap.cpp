@@ -11,9 +11,16 @@
 #include <avian/heap/heap.h>
 #include <avian/system/system.h>
 #include "avian/common.h"
+#include "avian/unmanaged.h"
 #include "avian/arch.h"
 
 #include <avian/util/math.h>
+
+#include <pthread.h>
+#include <sched.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 using namespace vm;
 using namespace avian::util;
@@ -97,6 +104,53 @@ inline void set(void** o, void* value)
 inline void set(void* o, unsigned offsetInWords, void* value)
 {
   set(getp(o, offsetInWords), value);
+}
+
+// Low bits of an object header. Must match vm::FixedMark.
+const uintptr_t HeapFixedMark = 3;
+
+inline bool fixedHeader(void* o)
+{
+  return (reinterpret_cast<uintptr_t*>(o)[0] & ~PointerMask) == HeapFixedMark;
+}
+
+inline uintptr_t headerLoad(void* o)
+{
+  return __atomic_load_n(reinterpret_cast<uintptr_t*>(o), __ATOMIC_ACQUIRE);
+}
+
+inline void headerStoreForward(void* o, void* dst)
+{
+  __atomic_store_n(reinterpret_cast<uintptr_t*>(o),
+                   reinterpret_cast<uintptr_t>(dst),
+                   __ATOMIC_RELEASE);
+}
+
+inline void* headerPointer(void* o)
+{
+  return maskAlignedPointer(reinterpret_cast<void*>(headerLoad(o)));
+}
+
+inline void atomicSetRecord(uintptr_t* map,
+                            unsigned bitsPerRecord,
+                            unsigned index,
+                            unsigned v)
+{
+  for (int i = static_cast<int>(index + bitsPerRecord) - 1;
+       i >= static_cast<int>(index);
+       --i) {
+    uintptr_t bit = static_cast<uintptr_t>(1) << bitOf(static_cast<unsigned>(i));
+    uintptr_t* word = map + wordOf(static_cast<unsigned>(i));
+    uintptr_t old = __atomic_load_n(word, __ATOMIC_RELAXED);
+    for (;;) {
+      uintptr_t next = (v & 1) ? (old | bit) : (old & ~bit);
+      if (__atomic_compare_exchange_n(
+              word, &old, next, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        break;
+      }
+    }
+    v >>= 1;
+  }
 }
 
 class Segment {
@@ -300,7 +354,7 @@ class Segment {
 
     void clearOnlyIndex(unsigned index)
     {
-      clearBits(data, bitsPerRecord, index);
+      atomicSetRecord(data, bitsPerRecord, index, 0);
     }
 
     void clearOnly(unsigned segmentIndex)
@@ -322,7 +376,7 @@ class Segment {
 
     void setOnlyIndex(unsigned index, unsigned v = 1)
     {
-      setBits(data, bitsPerRecord, index, v);
+      atomicSetRecord(data, bitsPerRecord, index, v);
     }
 
     void setOnly(unsigned segmentIndex, unsigned v = 1)
@@ -467,7 +521,12 @@ class Segment {
 
   unsigned position()
   {
-    return position_;
+    return __atomic_load_n(&position_, __ATOMIC_ACQUIRE);
+  }
+
+  void setPosition(unsigned p)
+  {
+    __atomic_store_n(&position_, p, __ATOMIC_RELEASE);
   }
 
   unsigned remaining()
@@ -483,8 +542,8 @@ class Segment {
     data = s->data;
     s->data = 0;
 
-    position_ = s->position_;
-    s->position_ = 0;
+    setPosition(s->position());
+    s->setPosition(0);
 
     capacity_ = s->capacity_;
     s->capacity_ = 0;
@@ -526,11 +585,30 @@ class Segment {
   void* allocate(unsigned size)
   {
     assertT(context, size);
-    assertT(context, position() + size <= capacity());
+    unsigned old = position();
+    assertT(context, old + size <= capacity());
 
-    void* p = data + position();
-    position_ += size;
-    return p;
+    setPosition(old + size);
+    return data + old;
+  }
+
+  void* claim(unsigned size)
+  {
+    unsigned cap = capacity_;
+    unsigned old = __atomic_load_n(&position_, __ATOMIC_RELAXED);
+    for (;;) {
+      if (old + size < old or old + size > cap) {
+        return 0;
+      }
+      if (__atomic_compare_exchange_n(&position_,
+                                      &old,
+                                      old + size,
+                                      true,
+                                      __ATOMIC_ACQ_REL,
+                                      __ATOMIC_RELAXED)) {
+        return data + old;
+      }
+    }
   }
 
   void dispose()
@@ -932,25 +1010,18 @@ inline bool fresh(Context* c, void* o)
 
 inline bool wasCollected(Context* c, void* o)
 {
-  return o and (not fresh(c, o)) and fresh(c, get(o, 0));
+  // An unmanaged class word is not a forwarding pointer. fresh() would
+  // see a moved managed class and treat the instance as already copied.
+  if (o == 0 or pointerIsUnmanaged(o)) {
+    return false;
+  }
+  return (not fresh(c, o)) and fresh(c, headerPointer(o));
 }
 
 inline void* follow(Context* c UNUSED, void* o)
 {
   assertT(c, wasCollected(c, o));
-  return fieldAtOffset<void*>(o, 0);
-}
-
-inline void*& parent(Context* c UNUSED, void* o)
-{
-  assertT(c, wasCollected(c, o));
-  return fieldAtOffset<void*>(o, BytesPerWord);
-}
-
-inline uintptr_t* bitset(Context* c UNUSED, void* o)
-{
-  assertT(c, wasCollected(c, o));
-  return &fieldAtOffset<uintptr_t>(o, BytesPerWord * 2);
+  return reinterpret_cast<void*>(headerLoad(o));
 }
 
 void free(Context* c, Fixie** fixies, bool resetImmortal)
@@ -1058,8 +1129,15 @@ void sweepFixies(Context* c)
 
 inline void* copyTo(Context* c, Segment* s, void* o, unsigned size)
 {
-  assertT(c, s->remaining() >= size);
-  void* dst = s->allocate(size);
+  void* dst = s->claim(size);
+  if (dst == 0) {
+    fprintf(stderr,
+            "[avian] gc to-space exhausted need=%u position=%u cap=%u\n",
+            size,
+            s->position(),
+            s->capacity());
+    c->system->abort();
+  }
   c->client->copy(o, dst);
   return dst;
 }
@@ -1081,12 +1159,6 @@ void* copy2(Context* c, void* o)
     unsigned age = c->ageMap.get(o);
     if (age == TenureThreshold) {
       if (c->mode == Heap::MinorCollection) {
-        assertT(c, c->gen2.remaining() >= size);
-
-        if (c->gen2Base == Top) {
-          c->gen2Base = c->gen2.position();
-        }
-
         return copyTo(c, &(c->gen2), o, size);
       } else {
         return copyTo(c, &(c->nextGen2), o, size);
@@ -1096,7 +1168,7 @@ void* copy2(Context* c, void* o)
 
       c->nextAgeMap.setOnly(o, age + 1);
       if (age + 1 == TenureThreshold) {
-        c->tenureFootprint += size;
+        __sync_fetch_and_add(&c->tenureFootprint, size);
       }
 
       return o;
@@ -1114,8 +1186,40 @@ void* copy2(Context* c, void* o)
   }
 }
 
-void* copy(Context* c, void* o)
+pthread_mutex_t copyStripe[256];
+pthread_once_t stripeOnce = PTHREAD_ONCE_INIT;
+
+void initStripes()
 {
+  for (unsigned i = 0; i < 256; ++i) {
+    pthread_mutex_init(&copyStripe[i], 0);
+  }
+}
+
+void* copy(Context* c, void* o, bool* won)
+{
+  if (pointerIsUnmanaged(o)) {
+    *won = false;
+    return o;
+  }
+
+  pthread_once(&stripeOnce, initStripes);
+
+  if (wasCollected(c, o)) {
+    *won = false;
+    return follow(c, o);
+  }
+
+  unsigned stripe
+      = static_cast<unsigned>(reinterpret_cast<uintptr_t>(o) >> 4) & 255;
+  pthread_mutex_lock(&copyStripe[stripe]);
+
+  if (wasCollected(c, o)) {
+    pthread_mutex_unlock(&copyStripe[stripe]);
+    *won = false;
+    return follow(c, o);
+  }
+
   void* r = copy2(c, o);
 
   if (Debug) {
@@ -1127,24 +1231,40 @@ void* copy(Context* c, void* o)
             segment(c, r));
   }
 
-  // leave a pointer to the copy in the original
-  fieldAtOffset<void*>(o, 0) = r;
-
+  headerStoreForward(o, r);
+  pthread_mutex_unlock(&copyStripe[stripe]);
+  *won = true;
   return r;
 }
 
 void* update3(Context* c, void* o, bool* needsVisit)
 {
-  if (c->client->isFixed(o)) {
+  if (pointerIsUnmanaged(o)) {
+    *needsVisit = false;
+    return o;
+  }
+
+  // A slot visited again after the strong scan already holds the
+  // to-space pointer. Copying it would overwrite its class word
+  // with a forwarding pointer.
+  if (fresh(c, o)) {
+    *needsVisit = false;
+    return o;
+  }
+  if (fixedHeader(o)) {
     Fixie* f = fixie(o);
     if ((not f->marked()) and (c->mode == Heap::MajorCollection
                                or f->age < FixieTenureThreshold)) {
-      if (DebugFixies) {
-        fprintf(stderr, "mark fixie %p\n", f);
+      ACQUIRE(c->lock);
+      if ((not f->marked()) and (c->mode == Heap::MajorCollection
+                                 or f->age < FixieTenureThreshold)) {
+        if (DebugFixies) {
+          fprintf(stderr, "mark fixie %p\n", f);
+        }
+        f->marked(true);
+        f->dead(false);
+        f->move(c, &(c->markedFixies));
       }
-      f->marked(true);
-      f->dead(false);
-      f->move(c, &(c->markedFixies));
     }
     *needsVisit = false;
     return o;
@@ -1155,8 +1275,10 @@ void* update3(Context* c, void* o, bool* needsVisit)
     *needsVisit = false;
     return follow(c, o);
   } else {
-    *needsVisit = true;
-    return copy(c, o);
+    bool won = false;
+    void* r = copy(c, o, &won);
+    *needsVisit = won;
+    return r;
   }
 }
 
@@ -1214,10 +1336,10 @@ void updateHeapMap(Context* c,
   }
 
   if (not(immortalHeapContains(c, result)
-          or (c->client->isFixed(result)
+          or (fixedHeader(result)
               and fixie(result)->age >= FixieTenureThreshold)
           or seg->contains(result))) {
-    if (target and c->client->isFixed(target)) {
+    if (target and fixedHeader(target)) {
       Fixie* f = fixie(target);
       assertT(c, offset == 0 or f->hasMask());
 
@@ -1255,12 +1377,13 @@ void* update(Context* c,
              unsigned offset,
              bool* needsVisit)
 {
-  if (maskAlignedPointer(*p) == 0) {
+  void* masked = maskAlignedPointer(*p);
+  if (masked == 0 or pointerIsUnmanaged(masked)) {
     *needsVisit = false;
-    return 0;
+    return masked;
   }
 
-  void* result = update2(c, maskAlignedPointer(*p), needsVisit);
+  void* result = update2(c, masked, needsVisit);
 
   if (result) {
     updateHeapMap(c, p, target, offset, result);
@@ -1269,310 +1392,426 @@ void* update(Context* c,
   return result;
 }
 
-const uintptr_t BitsetExtensionBit
-    = (static_cast<uintptr_t>(1) << (BitsPerWord - 1));
+static const unsigned GcWorkerMax = 32;
 
-void bitsetInit(uintptr_t* p)
+struct GcDeque {
+  pthread_mutex_t mu;
+  void** data;
+  unsigned n;
+  unsigned cap;
+};
+
+struct GcWorker {
+  unsigned id;
+  GcDeque deque;
+  unsigned sliceBegin;
+  unsigned sliceEnd;
+};
+
+struct GcPool {
+  pthread_mutex_t mu;
+  pthread_cond_t cv;
+  pthread_cond_t doneCv;
+  bool ready;
+  unsigned n;
+  unsigned epoch;
+  unsigned phase;
+  unsigned arrived;
+  unsigned queued;
+  unsigned inFlight;
+  Context* context;
+  GcWorker workers[GcWorkerMax];
+  pthread_t threads[GcWorkerMax];
+};
+
+GcPool pool;
+__thread GcWorker* tlsWorker = 0;
+
+unsigned traceWorkerCount()
 {
-  memset(p, 0, BytesPerWord);
+  static unsigned n = 0;
+  if (n != 0) {
+    return n;
+  }
+
+  const char* env = getenv("AVIAN_GC_THREADS");
+  long count = 1;
+  if (env != 0 and env[0] != 0) {
+    count = strtol(env, 0, 10);
+  }
+  // Copies share one to-space bump and a per-object stripe lock.
+  // On a 2.7GiB young collection, 18 workers took about 1.6–2.0s
+  // and one worker took about 0.8–1.2s. Raise AVIAN_GC_THREADS to
+  // use the extra workers anyway.
+  if (count < 1) {
+    count = 1;
+  }
+  if (count > static_cast<long>(GcWorkerMax)) {
+    count = GcWorkerMax;
+  }
+  n = static_cast<unsigned>(count);
+  return n;
 }
 
-void bitsetClear(uintptr_t* p, unsigned start, unsigned end)
+void dequeInit(GcDeque* q)
 {
-  if (end < BitsPerWord - 1) {
-    // do nothing
-  } else if (start < BitsPerWord - 1) {
-    memset(p + 1, 0, (wordOf(end + (BitsPerWord * 2) + 1)) * BytesPerWord);
-  } else {
-    unsigned startWord = wordOf(start + (BitsPerWord * 2) + 1);
-    unsigned endWord = wordOf(end + (BitsPerWord * 2) + 1);
-    if (endWord > startWord) {
-      memset(p + startWord + 1, 0, (endWord - startWord) * BytesPerWord);
-    }
-  }
+  pthread_mutex_init(&q->mu, 0);
+  q->data = 0;
+  q->n = 0;
+  q->cap = 0;
 }
 
-void bitsetSet(uintptr_t* p, unsigned i, bool v)
+void dequeReset(GcDeque* q)
 {
-  if (i >= BitsPerWord - 1) {
-    i += (BitsPerWord * 2) + 1;
-    if (v) {
-      p[0] |= BitsetExtensionBit;
-      if (p[2] <= wordOf(i) - 3)
-        p[2] = wordOf(i) - 2;
-    }
-  }
-
-  if (v) {
-    markBit(p, i);
-  } else {
-    clearBit(p, i);
-  }
+  pthread_mutex_lock(&q->mu);
+  q->n = 0;
+  pthread_mutex_unlock(&q->mu);
 }
 
-bool bitsetHasMore(uintptr_t* p)
+void dequeGrow(GcDeque* q)
 {
-  switch (*p) {
-  case 0:
-    return false;
-
-  case BitsetExtensionBit: {
-    uintptr_t length = p[2];
-    uintptr_t word = wordOf(p[1]);
-    for (; word < length; ++word) {
-      if (p[word + 3]) {
-        p[1] = indexOf(word, 0);
-        return true;
-      }
-    }
-    p[1] = indexOf(word, 0);
-    return false;
+  unsigned cap = q->cap == 0 ? 1024 : q->cap * 2;
+  if (cap < q->cap) {
+    fprintf(stderr, "[avian] gc work queue\n");
+    abort();
   }
-
-  default:
-    return true;
+  void** data = static_cast<void**>(malloc(sizeof(void*) * cap));
+  if (data == 0) {
+    fprintf(stderr, "[avian] gc work queue\n");
+    abort();
   }
+  if (q->n != 0) {
+    memcpy(data, q->data, sizeof(void*) * q->n);
+  }
+  ::free(q->data);
+  q->data = data;
+  q->cap = cap;
 }
 
-unsigned bitsetNext(Context* c, uintptr_t* p)
+void gcPush(void* p)
 {
-  bool more UNUSED = bitsetHasMore(p);
-  assertT(c, more);
+  if (p == 0) {
+    return;
+  }
+  GcWorker* w = tlsWorker;
+  if (w == 0) {
+    fprintf(stderr, "[avian] gc push outside trace\n");
+    abort();
+  }
+  GcDeque* q = &w->deque;
+  pthread_mutex_lock(&q->mu);
+  if (q->n == q->cap) {
+    dequeGrow(q);
+  }
+  q->data[q->n] = p;
+  ++q->n;
+  __atomic_fetch_add(&pool.queued, 1u, __ATOMIC_ACQ_REL);
+  pthread_mutex_unlock(&q->mu);
+}
 
-  switch (*p) {
-  case 0:
-    abort(c);
+void* gcPop(GcWorker* w)
+{
+  GcDeque* q = &w->deque;
+  pthread_mutex_lock(&q->mu);
+  if (q->n == 0) {
+    pthread_mutex_unlock(&q->mu);
+    return 0;
+  }
+  --q->n;
+  void* p = q->data[q->n];
+  __atomic_fetch_add(&pool.inFlight, 1u, __ATOMIC_ACQ_REL);
+  __atomic_fetch_sub(&pool.queued, 1u, __ATOMIC_ACQ_REL);
+  pthread_mutex_unlock(&q->mu);
+  return p;
+}
 
-  case BitsetExtensionBit: {
-    uintptr_t i = p[1];
-    uintptr_t word = wordOf(i);
-    assertT(c, word < p[2]);
-    for (uintptr_t bit = bitOf(i); bit < BitsPerWord; ++bit) {
-      if (p[word + 3] & (static_cast<uintptr_t>(1) << bit)) {
-        p[1] = indexOf(word, bit) + 1;
-        bitsetSet(p, p[1] + BitsPerWord - 2, false);
-        return p[1] + BitsPerWord - 2;
-      }
+void* gcSteal(GcWorker* self)
+{
+  for (unsigned step = 0; step < pool.n; ++step) {
+    unsigned i = (self->id + 1 + step) % pool.n;
+    if (i == self->id) {
+      continue;
     }
-    abort(c);
-  }
-
-  default: {
-    for (unsigned i = 0; i < BitsPerWord - 1; ++i) {
-      if (*p & (static_cast<uintptr_t>(1) << i)) {
-        bitsetSet(p, i, false);
-        return i;
-      }
+    void* p = gcPop(&pool.workers[i]);
+    if (p != 0) {
+      return p;
     }
-    abort(c);
   }
+  return 0;
+}
+
+void collect(Context* c, Segment::Map* map, unsigned start, unsigned end,
+             bool* dirty, bool expectDirty);
+void collect(Context* c, void* target, unsigned offset);
+
+void scanSlice(GcWorker* w)
+{
+  Context* c = pool.context;
+  if (w->sliceBegin >= w->sliceEnd) {
+    return;
   }
+  bool dirty = false;
+  collect(c, &(c->heapMap), w->sliceBegin, w->sliceEnd, &dirty, false);
 }
 
 void collect(Context* c, void** p, void* target, unsigned offset)
 {
-  void* original = maskAlignedPointer(*p);
-  void* parent_ = 0;
-
-  if (Debug) {
-    fprintf(stderr,
-            "update %p (%s) at %p (%s)\n",
-            maskAlignedPointer(*p),
-            segment(c, *p),
-            p,
-            segment(c, p));
+  bool needsVisit = false;
+  void* result = update(c, p, target, offset, &needsVisit);
+  local::set(p, result);
+  if (needsVisit and result != 0) {
+    gcPush(result);
   }
+}
 
-  bool needsVisit;
-  local::set(p, update(c, maskAlignedPointer(p), target, offset, &needsVisit));
-
-  if (Debug) {
-    fprintf(stderr,
-            "  result: %p (%s) (visit? %d)\n",
-            maskAlignedPointer(*p),
-            segment(c, *p),
-            needsVisit);
-  }
-
-  if (not needsVisit)
-    return;
-
-visit : {
-  void* copy = follow(c, original);
-
+void scanObject(Context* c, void* copy)
+{
   class Walker : public Heap::Walker {
    public:
-    Walker(Context* c, void* copy, uintptr_t* bitset)
-        : c(c),
-          copy(copy),
-          bitset(bitset),
-          first(0),
-          second(0),
-          last(0),
-          visits(0),
-          total(0)
+    Walker(Context* c, void* copy) : c(c), copy(copy)
     {
     }
 
     virtual bool visit(unsigned offset)
     {
-      if (Debug) {
-        fprintf(stderr,
-                "  update %p (%s) at %p - offset %d from %p (%s)\n",
-                get(copy, offset),
-                segment(c, get(copy, offset)),
-                getp(copy, offset),
-                offset,
-                copy,
-                segment(c, copy));
-      }
-
-      bool needsVisit;
-      void* childCopy
-          = update(c, getp(copy, offset), copy, offset, &needsVisit);
-
-      if (Debug) {
-        fprintf(stderr,
-                "    result: %p (%s) (visit? %d)\n",
-                childCopy,
-                segment(c, childCopy),
-                needsVisit);
-      }
-
-      ++total;
-
-      if (total == 3) {
-        bitsetInit(bitset);
-      }
-
-      if (needsVisit) {
-        ++visits;
-
-        if (visits == 1) {
-          first = offset;
-        } else if (visits == 2) {
-          second = offset;
-        }
-      } else {
-        local::set(copy, offset, childCopy);
-      }
-
-      if (visits > 1 and total > 2 and (second or needsVisit)) {
-        bitsetClear(bitset, last, offset);
-        last = offset;
-
-        if (second) {
-          bitsetSet(bitset, second, true);
-          second = 0;
-        }
-
-        if (needsVisit) {
-          bitsetSet(bitset, offset, true);
-        }
-      }
-
+      collect(c, getp(copy, offset), copy, offset);
       return true;
     }
 
     Context* c;
     void* copy;
-    uintptr_t* bitset;
-    unsigned first;
-    unsigned second;
-    unsigned last;
-    unsigned visits;
-    unsigned total;
-  } walker(c, copy, bitset(c, original));
-
-  if (Debug) {
-    fprintf(stderr, "walk %p (%s)\n", copy, segment(c, copy));
-  }
+  } walker(c, copy);
 
   c->client->walk(copy, &walker);
+}
 
-  if (walker.visits) {
-    // descend
-    if (walker.visits > 1) {
-      parent(c, original) = parent_;
-      parent_ = original;
+bool traceFixie(Context* c)
+{
+  Fixie* f;
+  {
+    ACQUIRE(c->lock);
+    f = c->markedFixies;
+    if (f == 0) {
+      return false;
+    }
+    // Count the fixie before it leaves the list. Otherwise another
+    // worker can observe an empty list and zero counters and stop
+    // while this one has not started the walk.
+    __atomic_fetch_add(&pool.inFlight, 1u, __ATOMIC_ACQ_REL);
+    f->remove(c);
+  }
+
+  class Walker : public Heap::Walker {
+   public:
+    Walker(Context* c, void** p) : c(c), p(p)
+    {
     }
 
-    original = get(copy, walker.first);
-    local::set(copy, walker.first, follow(c, original));
-    goto visit;
-  } else {
-    // ascend
-    original = parent_;
+    virtual bool visit(unsigned offset)
+    {
+      collect(c, p, offset);
+      return true;
+    }
+
+    Context* c;
+    void** p;
+  } walker(c, f->body());
+
+  c->client->walk(f->body(), &walker);
+
+  {
+    ACQUIRE(c->lock);
+    f->move(c, &(c->visitedFixies));
+  }
+
+  __atomic_fetch_sub(&pool.inFlight, 1u, __ATOMIC_ACQ_REL);
+  return true;
+}
+
+bool traceQuiescent(Context* c)
+{
+  if (__atomic_load_n(&pool.queued, __ATOMIC_ACQUIRE) != 0) {
+    return false;
+  }
+  if (__atomic_load_n(&pool.inFlight, __ATOMIC_ACQUIRE) != 0) {
+    return false;
+  }
+  ACQUIRE(c->lock);
+  if (c->markedFixies != 0) {
+    return false;
+  }
+  if (__atomic_load_n(&pool.queued, __ATOMIC_ACQUIRE) != 0) {
+    return false;
+  }
+  if (__atomic_load_n(&pool.inFlight, __ATOMIC_ACQUIRE) != 0) {
+    return false;
+  }
+  return true;
+}
+
+void drain(GcWorker* w);
+
+void* gcWorkerMain(void* arg)
+{
+  GcWorker* self = static_cast<GcWorker*>(arg);
+  unsigned seen = 0;
+  for (;;) {
+    pthread_mutex_lock(&pool.mu);
+    while (pool.epoch == seen and pool.phase != 3) {
+      pthread_cond_wait(&pool.cv, &pool.mu);
+    }
+    if (pool.phase == 3) {
+      pthread_mutex_unlock(&pool.mu);
+      return 0;
+    }
+    unsigned phase = pool.phase;
+    unsigned epoch = pool.epoch;
+    pthread_mutex_unlock(&pool.mu);
+
+    tlsWorker = self;
+    if (phase == 1) {
+      scanSlice(self);
+    } else if (phase == 2) {
+      drain(self);
+    }
+    tlsWorker = 0;
+
+    pthread_mutex_lock(&pool.mu);
+    ++pool.arrived;
+    if (pool.arrived + 1 == pool.n) {
+      pthread_cond_signal(&pool.doneCv);
+    }
+    seen = epoch;
+    pthread_mutex_unlock(&pool.mu);
   }
 }
 
-  if (original) {
-    void* copy = follow(c, original);
-
-    class Walker : public Heap::Walker {
-     public:
-      Walker(Context* c, uintptr_t* bitset)
-          : c(c), bitset(bitset), next(0), total(0)
-      {
-      }
-
-      virtual bool visit(unsigned offset)
-      {
-        switch (++total) {
-        case 1:
-          return true;
-
-        case 2:
-          next = offset;
-          return true;
-
-        case 3:
-          next = bitsetNext(c, bitset);
-          return false;
-
-        default:
-          abort(c);
-        }
-      }
-
-      Context* c;
-      uintptr_t* bitset;
-      unsigned next;
-      unsigned total;
-    } walker(c, bitset(c, original));
-
-    if (Debug) {
-      fprintf(stderr, "scan %p\n", copy);
-    }
-
-    c->client->walk(copy, &walker);
-
-    assertT(c, walker.total > 1);
-
-    if (walker.total == 3 and bitsetHasMore(bitset(c, original))) {
-      parent_ = original;
-    } else {
-      parent_ = parent(c, original);
-    }
-
-    if (Debug) {
-      fprintf(stderr,
-              "  next is %p (%s) at %p - offset %d from %p (%s)\n",
-              get(copy, walker.next),
-              segment(c, get(copy, walker.next)),
-              getp(copy, walker.next),
-              walker.next,
-              copy,
-              segment(c, copy));
-    }
-
-    original = get(copy, walker.next);
-    local::set(copy, walker.next, follow(c, original));
-    goto visit;
-  } else {
+void ensurePool(unsigned n)
+{
+  pthread_once(&stripeOnce, initStripes);
+  if (pool.ready) {
     return;
   }
+
+  pool.n = n;
+  pthread_mutex_init(&pool.mu, 0);
+  pthread_cond_init(&pool.cv, 0);
+  pthread_cond_init(&pool.doneCv, 0);
+  pool.epoch = 0;
+  pool.phase = 0;
+  pool.arrived = 0;
+  pool.queued = 0;
+  pool.inFlight = 0;
+  pool.context = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    pool.workers[i].id = i;
+    pool.workers[i].sliceBegin = 0;
+    pool.workers[i].sliceEnd = 0;
+    dequeInit(&pool.workers[i].deque);
+  }
+  pool.ready = true;
+  for (unsigned i = 1; i < n; ++i) {
+    if (pthread_create(
+            &pool.threads[i], 0, gcWorkerMain, &pool.workers[i])
+        != 0) {
+      fprintf(stderr, "[avian] gc worker\n");
+      abort();
+    }
+  }
+  fprintf(stderr, "[avian] gc workers=%u\n", n);
 }
+
+void beginTrace(Context* c)
+{
+  ensurePool(traceWorkerCount());
+  pool.context = c;
+  __atomic_store_n(&pool.queued, 0u, __ATOMIC_RELAXED);
+  __atomic_store_n(&pool.inFlight, 0u, __ATOMIC_RELAXED);
+  for (unsigned i = 0; i < pool.n; ++i) {
+    dequeReset(&pool.workers[i].deque);
+  }
+  tlsWorker = &pool.workers[0];
+}
+
+void endTrace()
+{
+  tlsWorker = 0;
+  pool.context = 0;
+}
+
+void assignSlices(Context* c)
+{
+  unsigned end = c->gen2.position();
+  unsigned scale = c->heapMap.scale;
+  if (scale == 0) {
+    scale = 1;
+  }
+  unsigned chunks = end == 0 ? 0 : (end + scale - 1) / scale;
+  for (unsigned i = 0; i < pool.n; ++i) {
+    uint64_t c0 = chunks == 0
+                      ? 0
+                      : (static_cast<uint64_t>(chunks) * i) / pool.n;
+    uint64_t c1 = chunks == 0
+                      ? 0
+                      : (static_cast<uint64_t>(chunks) * (i + 1)) / pool.n;
+    uint64_t begin = c0 * scale;
+    uint64_t limit = c1 * scale;
+    if (begin > end) {
+      begin = end;
+    }
+    if (limit > end) {
+      limit = end;
+    }
+    pool.workers[i].sliceBegin = static_cast<unsigned>(begin);
+    pool.workers[i].sliceEnd = static_cast<unsigned>(limit);
+  }
+}
+
+void startPhase(unsigned phase)
+{
+  pthread_mutex_lock(&pool.mu);
+  pool.phase = phase;
+  pool.arrived = 0;
+  ++pool.epoch;
+  pthread_cond_broadcast(&pool.cv);
+  pthread_mutex_unlock(&pool.mu);
+}
+
+void waitWorkers()
+{
+  if (pool.n < 2) {
+    return;
+  }
+  pthread_mutex_lock(&pool.mu);
+  while (pool.arrived + 1 < pool.n) {
+    pthread_cond_wait(&pool.doneCv, &pool.mu);
+  }
+  pthread_mutex_unlock(&pool.mu);
+}
+
+void drain(GcWorker* w)
+{
+  Context* c = pool.context;
+  while (true) {
+    void* p = gcPop(w);
+    if (p == 0) {
+      p = gcSteal(w);
+    }
+    if (p != 0) {
+      scanObject(c, p);
+      __atomic_fetch_sub(&pool.inFlight, 1u, __ATOMIC_ACQ_REL);
+      continue;
+    }
+    if (traceFixie(c)) {
+      continue;
+    }
+    if (traceQuiescent(c)) {
+      return;
+    }
+    sched_yield();
+  }
+}
+
 
 void collect(Context* c, void** p)
 {
@@ -1648,33 +1887,7 @@ void visitDirtyFixies(Context* c, Fixie** p)
 
 void visitMarkedFixies(Context* c)
 {
-  while (c->markedFixies) {
-    Fixie* f = c->markedFixies;
-    f->remove(c);
-
-    if (DebugFixies) {
-      fprintf(stderr, "visit fixie %p\n", f);
-    }
-
-    class Walker : public Heap::Walker {
-     public:
-      Walker(Context* c, void** p) : c(c), p(p)
-      {
-      }
-
-      virtual bool visit(unsigned offset)
-      {
-        local::collect(c, p, offset);
-        return true;
-      }
-
-      Context* c;
-      void** p;
-    } w(c, f->body());
-
-    c->client->walk(f->body(), &w);
-
-    f->move(c, &(c->visitedFixies));
+  while (traceFixie(c)) {
   }
 }
 
@@ -1722,6 +1935,87 @@ void collect(Context* c,
   assertT(c, wasDirty or not expectDirty);
 }
 
+void dequeAppend(GcDeque* q, void* p)
+{
+  if (q->n == q->cap) {
+    dequeGrow(q);
+  }
+  q->data[q->n] = p;
+  ++q->n;
+}
+
+// The coordinator pushes every root, so the gray stack starts on
+// worker 0. Stealing that one deque serializes the drain. Hand each
+// worker a slice while the others are still idle. queued is unchanged.
+void spreadQueue()
+{
+  if (pool.n < 2) {
+    return;
+  }
+  unsigned total = 0;
+  for (unsigned i = 0; i < pool.n; ++i) {
+    total += pool.workers[i].deque.n;
+  }
+  if (total < pool.n) {
+    return;
+  }
+  void** all = static_cast<void**>(malloc(sizeof(void*) * total));
+  if (all == 0) {
+    return;
+  }
+  unsigned n = 0;
+  for (unsigned i = 0; i < pool.n; ++i) {
+    GcDeque* q = &pool.workers[i].deque;
+    if (q->n != 0) {
+      memcpy(all + n, q->data, sizeof(void*) * q->n);
+      n += q->n;
+      q->n = 0;
+    }
+  }
+  for (unsigned i = 0; i < n; ++i) {
+    dequeAppend(&pool.workers[i % pool.n].deque, all[i]);
+  }
+  ::free(all);
+}
+
+void drainTrace()
+{
+  spreadQueue();
+  if (pool.n > 1) {
+    startPhase(2);
+    drain(&pool.workers[0]);
+    waitWorkers();
+  } else {
+    drain(&pool.workers[0]);
+  }
+}
+
+void scanUnmanagedObject(void* object, void* arg)
+{
+  Context* c = static_cast<Context*>(arg);
+  if (maskAlignedPointer(*static_cast<void**>(object)) == 0) {
+    return;
+  }
+
+  class Walker : public Heap::Walker {
+   public:
+    Walker(Context* c, void* copy) : c(c), copy(copy)
+    {
+    }
+
+    virtual bool visit(unsigned offset)
+    {
+      collect(c, getp(copy, offset), copy, offset);
+      return true;
+    }
+
+    Context* c;
+    void* copy;
+  } walker(c, object);
+
+  c->client->walk(object, &walker);
+}
+
 void collect2(Context* c)
 {
   c->gen2Base = Top;
@@ -1734,11 +2028,25 @@ void collect2(Context* c)
     c->gen2Padding = 0;
   }
 
+  // Preset before any worker copies. Tenure publishes into gen2 at
+  // this position, and wasCollected treats index >= gen2Base as
+  // to-space. A lazy store from the copier races with the readers.
+  if (c->mode == Heap::MinorCollection) {
+    c->gen2Base = c->gen2.position();
+  }
+
+  beginTrace(c);
+
   if (c->mode == Heap::MinorCollection and c->gen2.position()) {
-    unsigned start = 0;
-    unsigned end = start + c->gen2.position();
-    bool dirty;
-    collect(c, &(c->heapMap), start, end, &dirty, false);
+    if (pool.n > 1) {
+      assignSlices(c);
+      startPhase(1);
+      scanSlice(&pool.workers[0]);
+      waitWorkers();
+    } else {
+      bool dirty;
+      collect(c, &(c->heapMap), 0, c->gen2.position(), &dirty, false);
+    }
   }
 
   if (c->mode == Heap::MinorCollection) {
@@ -1761,6 +2069,17 @@ void collect2(Context* c)
   } v(c);
 
   c->client->visitRoots(&v);
+  // Metadata and other unmanaged objects are not in a segment, so the
+  // card table never records them. Scan every one. Slots that point at
+  // managed objects are updated in place; the unmanaged object stays.
+  unmanagedForEach(scanUnmanagedObject, c);
+  // Roots only push. Drain before weak refs: status() reports
+  // Unreachable for a from-space object that has not been forwarded,
+  // and that clears WeakHashMap keys which are still strongly held.
+  drainTrace();
+  c->client->traceWeakRoots(&v);
+  drainTrace();
+  endTrace();
 }
 
 bool limitExceeded(Context* c, int pendingAllocation)
@@ -1883,7 +2202,7 @@ void* allocate(Context* c, size_t size, bool limit)
   }
 
   if ((not limit) or size + c->count < c->limit) {
-    void* p = c->system->tryAllocate(size);
+    void* p = copyingHeapAllocate(size);
     if (p) {
       c->count += size;
 
@@ -1932,7 +2251,7 @@ void free(Context* c, const void* p, size_t size)
 
   expect(c->system, c->count >= size);
 
-  c->system->free(p);
+  copyingHeapFree(p);
   c->count -= size;
 }
 
@@ -2021,9 +2340,13 @@ class MyHeap : public Heap {
 
   bool needsMark(void* p)
   {
-    assertT(&c, c.client->isFixed(p) or (not immortalHeapContains(&c, p)));
+    if (pointerIsUnmanaged(p)) {
+      return false;
+    }
 
-    if (c.client->isFixed(p)) {
+    assertT(&c, fixedHeader(p) or (not immortalHeapContains(&c, p)));
+
+    if (fixedHeader(p)) {
       return fixie(p)->age >= FixieTenureThreshold;
     } else {
       return c.gen2.contains(p) or c.nextGen2.contains(p);
@@ -2032,10 +2355,13 @@ class MyHeap : public Heap {
 
   bool targetNeedsMark(void* target)
   {
-    return target and not c.gen2.contains(target)
+    if (target == 0 or pointerIsUnmanaged(target)) {
+      return false;
+    }
+    return not c.gen2.contains(target)
            and not c.nextGen2.contains(target)
            and not immortalHeapContains(&c, target)
-           and not(c.client->isFixed(target)
+           and not(fixedHeader(target)
                    and fixie(target)->age >= FixieTenureThreshold);
   }
 
@@ -2046,7 +2372,7 @@ class MyHeap : public Heap {
       ACQUIRE(c.lock);
 #endif
 
-      if (c.client->isFixed(p)) {
+      if (fixedHeader(p)) {
         Fixie* f = fixie(p);
         assertT(&c, offset == 0 or f->hasMask());
 
@@ -2100,6 +2426,12 @@ class MyHeap : public Heap {
 
   virtual void pad(void* p)
   {
+    // Identity hash of an unmanaged object is its address. The mark bit
+    // is only an accounting flag, and this object is not in a generation.
+    if (pointerIsUnmanaged(p)) {
+      return;
+    }
+
     // hashCode no longer holds heapLock, so several mutators can account
     // for different objects at once. GC resets these only at a safepoint.
     unsigned* counter;
@@ -2123,7 +2455,7 @@ class MyHeap : public Heap {
 
   virtual void* follow(void* p)
   {
-    if (p == 0 or c.client->isFixed(p)) {
+    if (p == 0 or pointerIsUnmanaged(p) or fixedHeader(p)) {
       return p;
     } else if (wasCollected(&c, p)) {
       if (Debug) {
@@ -2152,7 +2484,10 @@ class MyHeap : public Heap {
 
     if (p == 0) {
       return Null;
-    } else if (c.client->isFixed(p)) {
+    } else if (pointerIsUnmanaged(p)) {
+      // Alive, immovable. Unreachable would drop finalizers and weak keys.
+      return Tenured;
+    } else if (fixedHeader(p)) {
       Fixie* f = fixie(p);
       return f->dead() ? Unreachable : (static_cast<unsigned>(f->age + 1)
                                             < FixieTenureThreshold
@@ -2202,6 +2537,11 @@ Heap* makeHeap(System* system, uint64_t limit)
 {
   return new (system->tryAllocate(sizeof(local::MyHeap)))
       local::MyHeap(system, limit);
+}
+
+unsigned gcTraceWorkers()
+{
+  return local::traceWorkerCount();
 }
 
 }  // namespace vm

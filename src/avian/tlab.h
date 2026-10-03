@@ -87,9 +87,10 @@ struct TlabSize {
     return refills;
   }
 
-  // Machine::edenCapacity is a 32-bit byte count. Heaps above 12GB
-  // saturate the young budget instead of truncating the heap limit.
-  static unsigned edenCapacity(uint64_t heapLimit)
+  // TLAB and segment sizes are 32-bit word counts. 16GiB-8 keeps
+  // edenWords inside that range; a 30g heap asks for 10GiB and is
+  // unaffected. Heaps above 48GiB saturate the nursery here.
+  static uint64_t edenCapacity(uint64_t heapLimit)
   {
     uint64_t third = heapLimit / TlabEdenDivisor;
     uint64_t half = heapLimit / 2;
@@ -101,46 +102,46 @@ struct TlabSize {
     if (third > result) {
       result = third;
     }
-    const uint64_t maxEden = 0xffffffffu;
+    const uint64_t maxEden = static_cast<uint64_t>(0x7fffffffu) * 8u;
     if (result > maxEden) {
       result = maxEden;
     }
-    return static_cast<unsigned>(result);
+    return result;
   }
 
-  static unsigned minWords(unsigned edenBytes)
+  static unsigned minWords(uint64_t edenBytes)
   {
     unsigned bytes = TlabMinBytes;
-    if (bytes > edenBytes) {
-      bytes = edenBytes;
+    if (static_cast<uint64_t>(bytes) > edenBytes) {
+      bytes = static_cast<unsigned>(edenBytes);
     }
     unsigned words = bytes / BytesPerWord;
-    unsigned edenWords = edenBytes / BytesPerWord;
+    uint64_t edenWords = edenBytes / BytesPerWord;
     if (words < 1) {
       words = 1;
     }
-    if (edenWords > 0 and words > edenWords) {
-      words = edenWords;
+    if (edenWords > 0 and static_cast<uint64_t>(words) > edenWords) {
+      words = static_cast<unsigned>(edenWords);
     }
     return words;
   }
 
-  static unsigned maxWords(unsigned edenBytes, unsigned minimum)
+  static unsigned maxWords(uint64_t edenBytes, unsigned minimum)
   {
-    unsigned maxBytes = edenBytes / 2;
+    uint64_t maxBytes = edenBytes / 2;
     if (maxBytes > TlabMaxBytes) {
       maxBytes = TlabMaxBytes;
     }
     if (maxBytes < TlabHistoricalBytes and edenBytes >= TlabHistoricalBytes) {
       maxBytes = TlabHistoricalBytes;
     }
-    unsigned words = maxBytes / BytesPerWord;
-    unsigned edenWords = edenBytes / BytesPerWord;
+    unsigned words = static_cast<unsigned>(maxBytes / BytesPerWord);
+    uint64_t edenWords = edenBytes / BytesPerWord;
     if (words < minimum) {
       words = minimum;
     }
-    if (edenWords > 0 and words > edenWords) {
-      words = edenWords;
+    if (edenWords > 0 and static_cast<uint64_t>(words) > edenWords) {
+      words = static_cast<unsigned>(edenWords);
     }
     if (words < 1) {
       words = 1;

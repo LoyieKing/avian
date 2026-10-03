@@ -38,6 +38,7 @@ namespace {
 
 const bool DebugClassReader = false;
 
+
 void join(Thread* t, Thread* o)
 {
   if (t != o) {
@@ -267,12 +268,12 @@ void killZombies(Thread* t, Thread* o)
   }
 }
 
-unsigned edenUsedBytes(Machine* m)
+uint64_t edenUsedBytes(Machine* m)
 {
   if (m->edenStart == 0 or m->edenTop < m->edenStart) {
     return 0;
   }
-  return static_cast<unsigned>(m->edenTop - m->edenStart) * BytesPerWord;
+  return static_cast<uint64_t>(m->edenTop - m->edenStart) * BytesPerWord;
 }
 
 // Eighths of eden already reported. Reset when the bump rewinds.
@@ -284,21 +285,21 @@ uint64_t gcYoungBytes = 0;
 
 void noteEdenFill(Machine* m)
 {
-  unsigned cap = m->edenCapacity;
+  uint64_t cap = m->edenCapacity;
   if (cap == 0) {
     return;
   }
-  unsigned used = edenUsedBytes(m);
-  unsigned eighths = static_cast<unsigned>((static_cast<uint64_t>(used) * 8) / cap);
+  uint64_t used = edenUsedBytes(m);
+  unsigned eighths = static_cast<unsigned>((used * 8) / cap);
   if (eighths <= edenReportedEighths or eighths > 8) {
     return;
   }
   edenReportedEighths = eighths;
   fprintf(stderr,
-          "[avian] eden %u/8 used=%u cap=%u limit=%llu\n",
+          "[avian] eden %u/8 used=%llu cap=%llu limit=%llu\n",
           eighths,
-          used,
-          cap,
+          static_cast<unsigned long long>(used),
+          static_cast<unsigned long long>(cap),
           static_cast<unsigned long long>(m->heap->limit()));
 }
 
@@ -330,7 +331,7 @@ bool tlabTakeSlice(Machine* m, unsigned chunkWords, uintptr_t** payload)
 void tlabSeed(Thread* t)
 {
   Machine* m = t->m;
-  unsigned edenWords = m->edenCapacity / BytesPerWord;
+  unsigned edenWords = static_cast<unsigned>(m->edenCapacity / BytesPerWord);
   t->desiredWords = TlabSize::initialWords(
       edenWords, m->allocatingThreads.average, m->tlabMinWords, m->tlabMaxWords);
   t->refillWasteLimit = TlabSize::wasteLimit(t->desiredWords);
@@ -410,9 +411,9 @@ bool tlabSatisfyMiss(Thread* t, unsigned words, object* result)
   return tlabAllocateOutside(t, words, result);
 }
 
-void tlabAccumulate(Thread* t, unsigned edenUsed)
+void tlabAccumulate(Thread* t, uint64_t edenUsed)
 {
-  unsigned edenCap = t->m->edenCapacity;
+  uint64_t edenCap = t->m->edenCapacity;
   if (t->numberOfRefills > 0 and edenUsed > 0 and edenUsed > edenCap / 2) {
     unsigned threadWords
         = t->heapOffset + tlabCurrentWords(t) + t->slowWords;
@@ -432,7 +433,7 @@ void tlabAccumulate(Thread* t, unsigned edenUsed)
 
 void tlabResize(Thread* t)
 {
-  unsigned edenWords = t->m->edenCapacity / BytesPerWord;
+  unsigned edenWords = static_cast<unsigned>(t->m->edenCapacity / BytesPerWord);
   t->desiredWords = TlabSize::resizedWords(t->allocationFraction.average,
                                            edenWords,
                                            t->m->tlabMinWords,
@@ -440,7 +441,7 @@ void tlabResize(Thread* t)
   t->refillWasteLimit = TlabSize::wasteLimit(t->desiredWords);
 }
 
-unsigned finishTlabs(Thread* t, unsigned edenUsed)
+unsigned finishTlabs(Thread* t, uint64_t edenUsed)
 {
   unsigned allocating = 0;
   if (t->numberOfRefills > 0 or t->slowWords > 0) {
@@ -485,8 +486,8 @@ void freeEden(Machine* m)
 
 void configureTlabs(Machine* m)
 {
-  unsigned bytes = TlabSize::edenCapacity(m->heap->limit());
-  unsigned extra = bytes % BytesPerWord;
+  uint64_t bytes = TlabSize::edenCapacity(m->heap->limit());
+  uint64_t extra = bytes % BytesPerWord;
   if (extra) {
     bytes -= extra;
   }
@@ -498,7 +499,7 @@ void configureTlabs(Machine* m)
   m->tlabMinWords = TlabSize::minWords(bytes);
   m->tlabMaxWords = TlabSize::maxWords(bytes, m->tlabMinWords);
 
-  void* mem = m->heap->allocate(bytes);
+  void* mem = m->heap->allocate(static_cast<size_t>(bytes));
   m->edenStart = static_cast<uintptr_t*>(mem);
   m->edenTop = m->edenStart;
   m->edenEnd = m->edenStart + (bytes / BytesPerWord);
@@ -506,9 +507,9 @@ void configureTlabs(Machine* m)
   m->allocatingThreads.sample(1.f);
 
   fprintf(stderr,
-          "[avian] heap limit=%llu eden_cap=%u tlab_max=%u\n",
+          "[avian] heap limit=%llu eden_cap=%llu tlab_max=%u\n",
           static_cast<unsigned long long>(m->heap->limit()),
-          m->edenCapacity,
+          static_cast<unsigned long long>(m->edenCapacity),
           m->tlabMaxWords * BytesPerWord);
 }
 
@@ -897,7 +898,7 @@ void postCollect(Thread* t)
 {
   // Survivors have been copied out. Sample each thread's share of the
   // bytes handed out, resize, then rewind the bump. The buffer stays.
-  unsigned edenUsed = edenUsedBytes(t->m);
+  uint64_t edenUsed = edenUsedBytes(t->m);
   unsigned allocating = finishTlabs(t, edenUsed);
   if (edenUsed > 0) {
     t->m->allocatingThreads.sample(static_cast<float>(allocating));
@@ -966,7 +967,9 @@ GcByteArray* internByteArray(Thread* t, GcByteArray* array)
     return cast<GcByteArray>(t, cast<GcJreference>(t, n->first())->target());
   } else {
     hashMapInsert(t, roots(t)->byteArrayMap(), array, 0, byteArrayHash);
-    addFinalizer(t, array, removeByteArray);
+    if (not pointerIsUnmanaged(array)) {
+      addFinalizer(t, array, removeByteArray);
+    }
     return array;
   }
 }
@@ -3105,6 +3108,8 @@ GcClass* makeArrayClass(Thread* t,
                         GcByteArray* spec,
                         GcClass* elementClass)
 {
+  UnmanagedAllocScope unmanaged(t);
+
   if (type(t, GcJobject::Type)->vmFlags() & BootstrapFlag) {
     PROTECT(t, loader);
     PROTECT(t, spec);
@@ -3176,6 +3181,8 @@ GcClass* makeArrayClass(Thread* t,
                         bool throw_,
                         Gc::Type throwType)
 {
+  UnmanagedAllocScope unmanaged(t);
+
   PROTECT(t, loader);
   PROTECT(t, spec);
 
@@ -3312,6 +3319,8 @@ void bootClass(Thread* t,
                unsigned arrayElementSize,
                unsigned vtableLength)
 {
+  UnmanagedAllocScope unmanaged(t);
+
   GcClass* super
       = (superType >= 0 ? vm::type(t, static_cast<Gc::Type>(superType)) : 0);
 
@@ -3391,6 +3400,8 @@ void bootJavaClass(Thread* t,
                    int vtableLength,
                    object bootMethod)
 {
+  UnmanagedAllocScope unmanaged(t);
+
   PROTECT(t, bootMethod);
 
   GcByteArray* n = makeByteArray(t, name);
@@ -3421,6 +3432,8 @@ void bootJavaClass(Thread* t,
 
 void nameClass(Thread* t, Gc::Type type, const char* name)
 {
+  UnmanagedAllocScope unmanaged(t);
+
   GcByteArray* n = makeByteArray(t, name);
   cast<GcClass>(t, t->m->types->body()[type])->setName(t, n);
 }
@@ -3563,6 +3576,8 @@ void boot(Thread* t)
   m->processor->boot(t, 0, 0);
 
   {
+    UnmanagedAllocScope unmanaged(t);
+
     GcCode* bootCode = makeCode(t, 0, 0, 0, 0, 0, 0, 0, 0, 1);
     bootCode->body()[0] = impdep1;
     object bootMethod
@@ -3576,6 +3591,40 @@ void boot(Thread* t)
 
 }
 
+void fixUnmanagedLoader(void* p, void* arg)
+{
+  Thread* t = static_cast<Thread*>(arg);
+  if (maskAlignedPointer(p) == 0
+      or maskAlignedPointer(fieldAtOffset<object>(p, 0)) == 0) {
+    return;
+  }
+
+  object o = static_cast<object>(p);
+  if (objectClass(t, o) != type(t, GcClass::Type)) {
+    return;
+  }
+
+  GcClass* c = static_cast<GcClass*>(o);
+  GcClassLoader* loader
+      = static_cast<GcClassLoader*>(maskAlignedPointer(c->loader()));
+  if (loader == 0) {
+    return;
+  }
+
+  if (t->m->heap->status(loader) == Heap::Unreachable) {
+    *c->loaderPtr() = 0;
+    return;
+  }
+
+  *c->loaderPtr()
+      = static_cast<GcClassLoader*>(t->m->heap->follow(loader));
+}
+
+void fixUnmanagedLoaders(Thread* t)
+{
+  unmanagedForEach(fixUnmanagedLoader, t);
+}
+
 class HeapClient : public Heap::Client {
  public:
   HeapClient(Machine* m) : m(m)
@@ -3585,7 +3634,15 @@ class HeapClient : public Heap::Client {
   virtual void visitRoots(Heap::Visitor* v)
   {
     ::visitRoots(m, v);
+  }
 
+  virtual void traceWeakRoots(Heap::Visitor* v)
+  {
+    // The strong scan skipped each unmanaged class's loader slot. Roots
+    // are forwarded now, so a loader the application still holds can be
+    // updated in place. One that is unreachable stays unreachable: this
+    // slot must not copy it back to life, or class unloading never runs.
+    fixUnmanagedLoaders(m->rootThread);
     postVisit(m->rootThread, v);
   }
 
@@ -3655,8 +3712,34 @@ class HeapClient : public Heap::Client {
 
   virtual void walk(void* p, Heap::Walker* w)
   {
+    Thread* t = m->rootThread;
     object o = static_cast<object>(m->heap->follow(maskAlignedPointer(p)));
-    ::walk(m->rootThread, w, o, 0);
+    // The class is never freed, so this walk runs every collection. The
+    // loader slot is not a strong root: tracing it would pin every custom
+    // loader. fixUnmanagedLoaders updates a live loader after the strong
+    // trace and clears one that nothing else kept alive.
+    if (pointerIsUnmanaged(o)
+        and objectClass(t, o) == type(t, GcClass::Type)) {
+      class SkipLoader : public Heap::Walker {
+       public:
+        explicit SkipLoader(Heap::Walker* inner) : inner(inner)
+        {
+        }
+
+        virtual bool visit(unsigned offset)
+        {
+          if (offset == ClassLoader / BytesPerWord) {
+            return true;
+          }
+          return inner->visit(offset);
+        }
+
+        Heap::Walker* inner;
+      } skip(w);
+      ::walk(t, &skip, o, 0);
+      return;
+    }
+    ::walk(t, w, o, 0);
   }
 
   void dispose()
@@ -4386,6 +4469,7 @@ Thread::Thread(Machine* m, GcThread* javaThread, Thread* parent)
       debugSuppressCookie(0),
       debugDepth(0),
       debugSnap(0),
+      unmanagedAllocDepth(0),
       flags(ActiveFlag)
 {
   tlabSeed(this);
@@ -4804,6 +4888,20 @@ void enter(Thread* t, Thread::State s)
 #undef ACQUIRE_LOCK
 #undef STORE_LOAD_MEMORY_BARRIER
 
+object allocateUnmanaged(Thread* t, unsigned sizeInBytes, bool objectMask)
+{
+  unsigned bytes = pad(sizeInBytes);
+  expect(t, bytes > 0);
+  void* p = unmanagedAllocate(bytes);
+  if (p == 0) {
+    throw_(t, roots(t)->outOfMemoryError());
+  }
+  if (objectMask) {
+    unmanagedTrack(p);
+  }
+  return static_cast<object>(p);
+}
+
 object allocate2(Thread* t, unsigned sizeInBytes, bool objectMask)
 {
   unsigned words = ceilingDivide(sizeInBytes, BytesPerWord);
@@ -4915,7 +5013,7 @@ object allocate3(Thread* t,
 
 void logGc(Thread* t,
            Heap::CollectionType type,
-           unsigned edenUsed,
+           uint64_t edenUsed,
            int64_t started)
 {
   int64_t stall = t->m->system->now() - started;
@@ -4926,26 +5024,30 @@ void logGc(Thread* t,
   gcYoungBytes += edenUsed;
   unsigned* count = &gcMinorCount;
   const char* kind = "minor";
-  if (type == Heap::MajorCollection) {
+  // The heap promotes a minor to a major when the old generation
+  // cannot absorb another full eden. Count that as a major.
+  if (type == Heap::MajorCollection
+      or t->m->heap->collectionType() == Heap::MajorCollection) {
     count = &gcMajorCount;
     kind = "major";
   }
   ++(*count);
   fprintf(stderr,
-          "[avian] gc %s stall_ms=%lld eden_used=%u fixed=%u "
-          "minor=%u major=%u young_total=%llu\n",
+          "[avian] gc %s stall_ms=%lld eden_used=%llu fixed=%u "
+          "minor=%u major=%u young_total=%llu workers=%u\n",
           kind,
           static_cast<long long>(stall),
-          edenUsed,
+          static_cast<unsigned long long>(edenUsed),
           t->m->fixedFootprint,
           gcMinorCount,
           gcMajorCount,
-          static_cast<unsigned long long>(gcYoungBytes));
+          static_cast<unsigned long long>(gcYoungBytes),
+          gcTraceWorkers());
 }
 
 void collect(Thread* t, Heap::CollectionType type, int pendingAllocation)
 {
-  unsigned edenUsed = edenUsedBytes(t->m);
+  uint64_t edenUsed = edenUsedBytes(t->m);
   int64_t started = t->m->system->now();
 
   ENTER(t, Thread::ExclusiveState);
@@ -5367,6 +5469,8 @@ GcClass* parseClass(Thread* t,
                     unsigned size,
                     Gc::Type throwType)
 {
+  UnmanagedAllocScope unmanaged(t);
+
   PROTECT(t, loader);
 
   class Client : public Stream::Client {
@@ -6225,7 +6329,9 @@ object intern(Thread* t, object s)
     return cast<GcJreference>(t, n->first())->target();
   } else {
     hashMapInsert(t, roots(t)->stringMap(), s, 0, stringHash);
-    addFinalizer(t, s, removeString);
+    if (not pointerIsUnmanaged(s)) {
+      addFinalizer(t, s, removeString);
+    }
     return s;
   }
 }
@@ -6274,9 +6380,11 @@ void walk(Thread* t, Heap::Walker* w, object o, unsigned start)
   if (objectMask) {
     unsigned fixedSize = class_->fixedSize();
     unsigned arrayElementSize = class_->arrayElementSize();
-    unsigned arrayLength = (arrayElementSize ? fieldAtOffset<uintptr_t>(
-                                                   o, fixedSize - BytesPerWord)
-                                             : 0);
+    unsigned arrayLength = 0;
+    if (arrayElementSize) {
+      arrayLength = static_cast<unsigned>(
+          fieldAtOffset<uintptr_t>(o, fixedSize - BytesPerWord));
+    }
 
     THREAD_RUNTIME_ARRAY(t, uint32_t, mask, objectMask->length());
     memcpy(RUNTIME_ARRAY_BODY(mask),

@@ -37,8 +37,13 @@ TEST(TlabSize)
   assertTrue(near(average.average, 0.325f));
 
   unsigned heap = 128u * 1024u * 1024u;
-  unsigned eden = TlabSize::edenCapacity(heap);
-  assertEqual(134217728u / 3u, eden);
+  uint64_t eden = TlabSize::edenCapacity(heap);
+  assertEqual(static_cast<uint64_t>(134217728u / 3u), eden);
+
+  uint64_t heap30 = 30ull << 30;
+  assertEqual(heap30 / 3ull, TlabSize::edenCapacity(heap30));
+  uint64_t edenCap = static_cast<uint64_t>(0x7fffffffu) * 8u;
+  assertEqual(edenCap, TlabSize::edenCapacity(96ull << 30));
 
   unsigned minimum = TlabSize::minWords(eden);
   assertEqual(2048u / BytesPerWord, minimum);
@@ -46,7 +51,7 @@ TEST(TlabSize)
   unsigned maximum = TlabSize::maxWords(eden, minimum);
   assertEqual((16u * 1024u * 1024u) / BytesPerWord, maximum);
 
-  unsigned edenWords = eden / BytesPerWord;
+  unsigned edenWords = static_cast<unsigned>(eden / BytesPerWord);
   unsigned initial = TlabSize::initialWords(edenWords, 1.f, minimum, maximum);
   assertEqual(edenWords / 50u, initial);
 

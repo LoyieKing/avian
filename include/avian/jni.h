@@ -58,6 +58,68 @@ struct AvianJniEnv : JNIEnv {
     const Fn* table = reinterpret_cast<const Fn*>(functions);
     return table[slot](this, data, length);
   }
+
+  /* Zeroed instance of the class. It is never moved or freed. A null
+     class returns null. The result is a local reference. */
+  jobject NewUnmanagedObject(jclass clazz)
+  {
+    typedef jobject(JNICALL* Fn)(JNIEnv*, jclass);
+    const unsigned slot = 237;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, clazz);
+  }
+
+  /* header is a big-endian u2 byte length, then that many Modified UTF-8
+     bytes. The String and a copy of the bytes live on the unmanaged heap.
+     A null header returns null. The result is a local reference. */
+  jstring NewUnmanagedStringFromMutf8(const void* header)
+  {
+    typedef jstring(JNICALL* Fn)(JNIEnv*, const void*);
+    const unsigned slot = 238;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, header);
+  }
+
+  /* header is already unmanaged and immovable: a big-endian u2 byte
+     length, then that many Modified UTF-8 bytes. The String lives on the
+     unmanaged heap and stores that address. The bytes are not copied.
+     The caller keeps the memory alive. A null header returns null. */
+  jstring NewUnmanagedStringFromUnmanagedMutf8(const void* header)
+  {
+    typedef jstring(JNICALL* Fn)(JNIEnv*, const void*);
+    const unsigned slot = 240;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, header);
+  }
+
+  /* False for null. True when the object itself is on the unmanaged heap. */
+  jboolean IsUnmanaged(jobject obj)
+  {
+    typedef jboolean(JNICALL* Fn)(JNIEnv*, jobject);
+    const unsigned slot = 239;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, obj);
+  }
+
+  /* Nestable. Until PopUnmanagedAlloc, every allocation on this thread
+     — instances, arrays, and constructors — comes from the unmanaged
+     heap and is never moved or freed. Pop the same number of times.
+     An unwind past the push restores the previous mode. */
+  void PushUnmanagedAlloc()
+  {
+    typedef void(JNICALL* Fn)(JNIEnv*);
+    const unsigned slot = 241;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    table[slot](this);
+  }
+
+  void PopUnmanagedAlloc()
+  {
+    typedef void(JNICALL* Fn)(JNIEnv*);
+    const unsigned slot = 242;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    table[slot](this);
+  }
 };
 
 #endif /* AVIAN_JNI_H_ */

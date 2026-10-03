@@ -12,6 +12,7 @@
 #define MACHINE_H
 
 #include "avian/common.h"
+#include "avian/unmanaged.h"
 #include "avian/tlab.h"
 #include "java-common.h"
 #include <avian/system/system.h>
@@ -140,6 +141,8 @@ const bool AbortOnOutOfMemoryError = false;
 const uintptr_t HashTakenMark = 1;
 const uintptr_t ExtendedMark = 2;
 const uintptr_t FixedMark = 3;
+// heap.cpp recognizes fixed objects by this tag without a virtual call.
+static_assert(FixedMark == 3, "heap fixed-header check");
 
 const unsigned ThreadBackupHeapSizeInBytes = 2 * 1024;
 const unsigned ThreadBackupHeapSizeInWords = ThreadBackupHeapSizeInBytes
@@ -947,13 +950,35 @@ struct JNIEnvVTable {
   // Deserialize reads those bytes; they must not point into the Java heap.
   jbyteArray(JNICALL* SerializeGraph)(JNIEnv*, jobject);
   jobject(JNICALL* DeserializeGraph)(JNIEnv*, const uint8_t*, jint);
+
+  // Zeroed instance on the unmanaged heap. It is never moved or freed.
+  jobject(JNICALL* NewUnmanagedObject)(JNIEnv*, jclass);
+  // Copies the u2-prefixed Modified UTF-8 bytes onto the unmanaged heap
+  // and returns a String that lives there. Does not intern.
+  jstring(JNICALL* NewUnmanagedStringFromMutf8)(JNIEnv*, const void*);
+  jboolean(JNICALL* IsUnmanaged)(JNIEnv*, jobject);
+  // String on the unmanaged heap. unsafe_data is the caller's u2-prefixed
+  // Modified UTF-8 header. The bytes are not copied. Does not intern.
+  jstring(JNICALL* NewUnmanagedStringFromUnmanagedMutf8)(JNIEnv*,
+                                                        const void*);
+
+  // Nestable. Allocations on this thread come from the unmanaged heap
+  // until the matching pop. An unwind past the push restores the depth.
+  void(JNICALL* PushUnmanagedAlloc)(JNIEnv*);
+  void(JNICALL* PopUnmanagedAlloc)(JNIEnv*);
 };
 
 // Slots past GetModule. include/avian/jni.h uses the same indexes.
 enum {
   AvianJniNewStringFromUnmanagedMutf8 = 234,
   AvianJniSerializeGraph = 235,
-  AvianJniDeserializeGraph = 236
+  AvianJniDeserializeGraph = 236,
+  AvianJniNewUnmanagedObject = 237,
+  AvianJniNewUnmanagedStringFromMutf8 = 238,
+  AvianJniIsUnmanaged = 239,
+  AvianJniNewUnmanagedStringFromUnmanagedMutf8 = 240,
+  AvianJniPushUnmanagedAlloc = 241,
+  AvianJniPopUnmanagedAlloc = 242
 };
 
 inline void atomicOr(uint32_t* p, int v)
@@ -1171,7 +1196,8 @@ class Machine {
   uintptr_t* edenStart;
   uintptr_t* edenTop;
   uintptr_t* edenEnd;
-  unsigned edenCapacity;
+  // Bytes. Was unsigned, which capped a 30g heap at a 4GiB nursery.
+  uint64_t edenCapacity;
   unsigned tlabMinWords;
   unsigned tlabMaxWords;
   TlabAverage allocatingThreads;
@@ -1487,9 +1513,35 @@ class Thread {
   uintptr_t debugSuppressCookie;
   int debugDepth;
   void* debugSnap;
+  // Nested allocation scopes. Restored on return and on unwind.
+  unsigned unmanagedAllocDepth;
 
  private:
   unsigned flags;
+};
+
+// While this is live, allocate() takes memory from the unmanaged heap.
+// popResources runs release() on a longjmp, so a failed class load does
+// not leave the thread allocating metadata forever.
+class UnmanagedAllocScope : public Thread::AutoResource {
+ public:
+  explicit UnmanagedAllocScope(Thread* t)
+      : Thread::AutoResource(t), prev(t->unmanagedAllocDepth)
+  {
+    t->unmanagedAllocDepth = prev + 1;
+  }
+
+  ~UnmanagedAllocScope()
+  {
+    t->unmanagedAllocDepth = prev;
+  }
+
+  virtual void release()
+  {
+    this->~UnmanagedAllocScope();
+  }
+
+  unsigned prev;
 };
 
 class GcJfield;
@@ -1817,8 +1869,14 @@ inline object allocateSmall(Thread* t, unsigned sizeInBytes)
   return o;
 }
 
+object allocateUnmanaged(Thread* t, unsigned sizeInBytes, bool objectMask);
+
 inline object allocate(Thread* t, unsigned sizeInBytes, bool objectMask)
 {
+  if (UNLIKELY(t->unmanagedAllocDepth != 0)) {
+    return allocateUnmanaged(t, sizeInBytes, objectMask);
+  }
+
   stress(t);
 
   if (UNLIKELY(not tlabHasRoom(t, ceilingDivide(sizeInBytes, BytesPerWord))
@@ -4081,7 +4139,11 @@ inline GcClassRuntimeData* getClassRuntimeData(Thread* t, GcClass* c)
     ACQUIRE(t, t->m->classLock);
 
     if (c->runtimeDataIndex() == 0) {
-      GcClassRuntimeData* runtimeData = makeClassRuntimeData(t, 0, 0, 0, 0);
+      GcClassRuntimeData* runtimeData;
+      {
+        UnmanagedAllocScope zone(t);
+        runtimeData = makeClassRuntimeData(t, 0, 0, 0, 0);
+      }
 
       {
         GcVector* v
@@ -4110,7 +4172,11 @@ inline GcMethodRuntimeData* getMethodRuntimeData(Thread* t, GcMethod* method)
     ACQUIRE(t, t->m->classLock);
 
     if (method->runtimeDataIndex() == 0) {
-      GcMethodRuntimeData* runtimeData = makeMethodRuntimeData(t, 0);
+      GcMethodRuntimeData* runtimeData;
+      {
+        UnmanagedAllocScope zone(t);
+        runtimeData = makeMethodRuntimeData(t, 0);
+      }
 
       {
         GcVector* v

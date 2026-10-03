@@ -53,6 +53,12 @@ class Heap : public avian::util::Allocator {
    public:
     virtual void collect(void* context, CollectionType type) = 0;
     virtual void visitRoots(Visitor*) = 0;
+    // After the strong closure has been copied. status() is wrong for
+    // an object that is still only on the gray stack, and Reference
+    // targets are nogc fields, so this pass must not run earlier.
+    virtual void traceWeakRoots(Visitor*)
+    {
+    }
     virtual bool isFixed(void*) = 0;
     virtual unsigned sizeInWords(void*) = 0;
     virtual unsigned copiedSizeInWords(void*) = 0;
@@ -89,6 +95,10 @@ class Heap : public avian::util::Allocator {
 };
 
 Heap* makeHeap(System* system, uint64_t limit);
+
+// Threads that trace during a stop-the-world collection, including the
+// mutator that requested it. 1 before the first collection.
+unsigned gcTraceWorkers();
 
 }  // namespace vm
 

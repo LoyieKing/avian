@@ -78,6 +78,18 @@ public class JNI {
 
   private static native String newUnmanaged(byte[] bytes);
 
+  private static native Object newUnmanagedObject(Class c);
+
+  private static native String newUnmanagedString(byte[] bytes);
+
+  private static native String newUnmanagedStringFromUnmanaged(byte[] bytes);
+
+  private static native boolean mallocIsUnmanaged();
+
+  private static native boolean isUnmanaged(Object o);
+
+  public static Object held;
+
   public static int method242() { return 242; }
   
   public static final int field950 = 950;
@@ -150,5 +162,40 @@ public class JNI {
     String unmanagedNul = newUnmanaged(new byte[] { (byte) 0xC0, (byte) 0x80 });
     expect(unmanagedNul.length() == 1 && unmanagedNul.equals("\u0000")
            && data.getLong(unmanagedNul) != 0);
+
+    expect(isUnmanaged(null) == false);
+    expect(isUnmanaged(new Object()) == false);
+    expect(isUnmanaged(unmanaged) == false);
+    expect(isUnmanaged("abc"));
+    String copy = new String("abc");
+    expect(isUnmanaged(copy) == false && copy.equals("abc")
+           && copy.hashCode() == 96354);
+
+    Object immortal = newUnmanagedObject(Object.class);
+    expect(immortal != null && immortal.getClass() == Object.class
+           && isUnmanaged(immortal));
+    System.gc();
+    expect(immortal.getClass() == Object.class && isUnmanaged(immortal));
+
+    String heapString = newUnmanagedString(new byte[] { 'a', 'b', 'c' });
+    expect(heapString.equals("abc") && heapString.hashCode() == 96354
+           && heapString.charAt(1) == 'b' && isUnmanaged(heapString)
+           && data.getLong(heapString) == 0);
+    System.gc();
+    expect(heapString.equals("abc") && isUnmanaged(heapString));
+
+    expect(newUnmanagedStringFromUnmanaged(null) == null);
+    String alias = newUnmanagedStringFromUnmanaged(new byte[] { 'a', 'b', 'c' });
+    expect(alias.equals("abc") && alias.hashCode() == 96354
+           && alias.charAt(1) == 'b' && isUnmanaged(alias)
+           && data.getLong(alias) != 0);
+    System.gc();
+    expect(alias.equals("abc") && isUnmanaged(alias));
+
+    expect(mallocIsUnmanaged());
+
+    held = new byte[] { 1, 2, 3 };
+    System.gc();
+    expect(((byte[]) held)[0] == 1);
   }
 }

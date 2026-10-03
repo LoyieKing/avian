@@ -291,4 +291,24 @@ SUNWprivate_1.1 {
 
                 # This is for Forte Analyzer profiling support.
                 AsyncGetCallTrace;
+
+                # Process malloc/new land in the tagged unmanaged heap
+                # when a host links this library ahead of libc.
+                malloc;
+                calloc;
+                realloc;
+                free;
+                posix_memalign;
+                aligned_alloc;
+                memalign;
+                _Znwm;
+                _Znam;
+                _ZdlPv;
+                _ZdaPv;
+                _ZdlPvm;
+                _ZdaPvm;
+                _ZnwmRKSt9nothrow_t;
+                _ZnamRKSt9nothrow_t;
+                _ZdlPvRKSt9nothrow_t;
+                _ZdaPvRKSt9nothrow_t;
 };

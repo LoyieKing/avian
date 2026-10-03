@@ -269,7 +269,8 @@ bool followingInitCoversFields(MyThread* t,
 // target is the bump; the call fills the second. The chunk end is the
 // thread's current TLAB. Class init is compiled in when the class has no
 // <clinit>, and a loop back-edge already polls exclusive GC, so the fast
-// path compares the bump against the TLAB end and nothing else. A class
+// path compares the bump against the TLAB end, and also bails to makeNew
+// when the thread is inside an unmanaged allocation scope. A class
 // that still needs initialization keeps that test on the same branch.
 bool InlineNew::tryCompile(MyThread* t,
                            Context* context,
@@ -351,10 +352,27 @@ bool InlineNew::tryCompile(MyThread* t,
                                   ir::Type::iptr(),
                                   c->constant(bytes, ir::Type::iptr()),
                                   top);
+  // PushUnmanagedAlloc sets this depth. The bump would ignore it and
+  // leave a managed object inside an unmanaged graph. The slow path is
+  // makeNew, which already redirects allocate().
+  unsigned depthOffset = static_cast<unsigned>(
+      reinterpret_cast<uint8_t*>(&(static_cast<Thread*>(t)->unmanagedAllocDepth))
+      - reinterpret_cast<uint8_t*>(static_cast<Thread*>(t)));
+  ir::Value* depth = c->load(
+      ir::ExtendMode::Unsigned,
+      c->memory(c->threadRegister(), ir::Type::i4(), depthOffset),
+      ir::Type::iptr());
+  // subR is second minus first: end - newTop. Negative when the bump
+  // passes the TLAB. A null chunk has end == top == 0, so newTop is the
+  // size. Arithmetic shift turns that negative into a non-zero mask.
+  ir::Value* endMinusNew = c->binaryOp(
+      lir::Subtract, ir::Type::iptr(), newTop, end);
+  ir::Value* noRoom = c->binaryOp(lir::ShiftRight,
+                                  ir::Type::iptr(),
+                                  c->constant(63, ir::Type::iptr()),
+                                  endMinusNew);
+  ir::Value* blocked = c->binaryOp(lir::Or, ir::Type::iptr(), depth, noRoom);
   if (checkInit) {
-    // Same single branch as before, without the exclusive load. subR is
-    // second minus first: end - newTop. Negative when the bump passes
-    // the TLAB. A null chunk has end == top == 0, so newTop is the size.
     ir::Value* flags = c->load(
         ir::ExtendMode::Unsigned,
         c->memory(classArg, ir::Type::i2(), ClassVmFlagsOffset),
@@ -363,21 +381,12 @@ bool InlineNew::tryCompile(MyThread* t,
                                       ir::Type::iptr(),
                                       c->constant(NeedInitFlag, ir::Type::iptr()),
                                       flags);
-    ir::Value* endMinusNew = c->binaryOp(
-        lir::Subtract, ir::Type::iptr(), newTop, end);
-    ir::Value* noRoom = c->binaryOp(lir::ShiftRight,
-                                    ir::Type::iptr(),
-                                    c->constant(63, ir::Type::iptr()),
-                                    endMinusNew);
-    ir::Value* blocked = c->binaryOp(lir::Or, ir::Type::iptr(), needInit, noRoom);
-    c->condJump(lir::JumpIfNotEqual,
-                c->constant(0, ir::Type::iptr()),
-                blocked,
-                slow);
-  } else {
-    // JumpIfGreater(end, newTop) is taken when newTop > end.
-    c->condJump(lir::JumpIfGreater, end, newTop, slow);
+    blocked = c->binaryOp(lir::Or, ir::Type::iptr(), needInit, blocked);
   }
+  c->condJump(lir::JumpIfNotEqual,
+              c->constant(0, ir::Type::iptr()),
+              blocked,
+              slow);
   Compiler::State* edge = c->saveState();
   c->startLogicalIp(bumpIp);
 

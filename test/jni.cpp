@@ -236,6 +236,82 @@ extern "C" JNIEXPORT jstring JNICALL
 }
 
 extern "C" JNIEXPORT jobject JNICALL
+    Java_JNI_newUnmanagedObject(JNIEnv* e, jclass, jclass c)
+{
+  return reinterpret_cast<AvianJniEnv*>(e)->NewUnmanagedObject(c);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+    Java_JNI_newUnmanagedString(JNIEnv* e, jclass, jbyteArray bytes)
+{
+  if (bytes == 0) {
+    return reinterpret_cast<AvianJniEnv*>(e)->NewUnmanagedStringFromMutf8(0);
+  }
+
+  jsize n = e->GetArrayLength(bytes);
+  if (n < 0 || n > 65535) {
+    return 0;
+  }
+  uint8_t* header = static_cast<uint8_t*>(malloc(static_cast<size_t>(n) + 2));
+  if (header == 0) {
+    return 0;
+  }
+  header[0] = static_cast<uint8_t>(static_cast<unsigned>(n) >> 8);
+  header[1] = static_cast<uint8_t>(n);
+  if (n) {
+    e->GetByteArrayRegion(bytes, 0, n, reinterpret_cast<jbyte*>(header + 2));
+  }
+  jstring result
+      = reinterpret_cast<AvianJniEnv*>(e)->NewUnmanagedStringFromMutf8(header);
+  free(header);
+  return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+    Java_JNI_newUnmanagedStringFromUnmanaged(JNIEnv* e, jclass, jbyteArray bytes)
+{
+  if (bytes == 0) {
+    return reinterpret_cast<AvianJniEnv*>(e)
+        ->NewUnmanagedStringFromUnmanagedMutf8(0);
+  }
+
+  jsize n = e->GetArrayLength(bytes);
+  if (n < 0 || n > 65535) {
+    return 0;
+  }
+  uint8_t* header = static_cast<uint8_t*>(malloc(static_cast<size_t>(n) + 2));
+  if (header == 0) {
+    return 0;
+  }
+  header[0] = static_cast<uint8_t>(static_cast<unsigned>(n) >> 8);
+  header[1] = static_cast<uint8_t>(n);
+  if (n) {
+    e->GetByteArrayRegion(bytes, 0, n, reinterpret_cast<jbyte*>(header + 2));
+  }
+  return reinterpret_cast<AvianJniEnv*>(e)
+      ->NewUnmanagedStringFromUnmanagedMutf8(header);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+    Java_JNI_mallocIsUnmanaged(JNIEnv*, jclass)
+{
+  void* block = malloc(32);
+  void* object = ::operator new(32);
+  bool tagged = block != 0 && object != 0
+                && ((reinterpret_cast<uintptr_t>(block) >> 42) == 8)
+                && ((reinterpret_cast<uintptr_t>(object) >> 42) == 8);
+  free(block);
+  ::operator delete(object);
+  return tagged;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+    Java_JNI_isUnmanaged(JNIEnv* e, jclass, jobject o)
+{
+  return reinterpret_cast<AvianJniEnv*>(e)->IsUnmanaged(o);
+}
+
+extern "C" JNIEXPORT jobject JNICALL
     Java_Buffers_allocateNative(JNIEnv* e, jclass, jint capacity)
 {
   void* p = allocate(e, capacity);

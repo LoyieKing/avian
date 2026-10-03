@@ -5155,8 +5155,12 @@ uint64_t jvmConstantPoolGetUTF8At(Thread* t, uintptr_t* arguments)
     --n;
   }
 
-  return reinterpret_cast<uint64_t>(
-      makeLocalReference(t, t->m->classpath->makeString(t, utf8, 0, n)));
+  GcString* s;
+  {
+    UnmanagedAllocScope zone(t);
+    s = t->m->classpath->makeString(t, utf8, 0, n);
+  }
+  return reinterpret_cast<uint64_t>(makeLocalReference(t, s));
 }
 
 extern "C" AVIAN_EXPORT jstring JNICALL EXPORT(
