@@ -41,7 +41,7 @@ TEST(TlabSize)
   assertEqual(static_cast<uint64_t>(134217728u / 3u), eden);
 
   uint64_t heap30 = 30ull << 30;
-  assertEqual(heap30 / 3ull, TlabSize::edenCapacity(heap30));
+  assertEqual(heap30 / static_cast<uint64_t>(3), TlabSize::edenCapacity(heap30));
   uint64_t edenCap = static_cast<uint64_t>(0x7fffffffu) * 8u;
   assertEqual(edenCap, TlabSize::edenCapacity(96ull << 30));
 
