@@ -73,7 +73,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y zlib1g-dev
+          sudo apt-get install -y zlib1g-dev libjemalloc2
 
       - name: Environment info
         run: |
