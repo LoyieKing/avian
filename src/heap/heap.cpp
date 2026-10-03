@@ -153,6 +153,8 @@ inline void atomicSetRecord(uintptr_t* map,
   }
 }
 
+bool traceIsSerial();
+
 class Segment {
  public:
   class Map {
@@ -596,10 +598,15 @@ class Segment {
   {
     unsigned cap = capacity_;
     unsigned old = __atomic_load_n(&position_, __ATOMIC_RELAXED);
+    if (old + size < old or old + size > cap) {
+      return 0;
+    }
+    // One worker owns the bump. The CAS is only for a shared pool.
+    if (traceIsSerial()) {
+      __atomic_store_n(&position_, old + size, __ATOMIC_RELAXED);
+      return data + old;
+    }
     for (;;) {
-      if (old + size < old or old + size > cap) {
-        return 0;
-      }
       if (__atomic_compare_exchange_n(&position_,
                                       &old,
                                       old + size,
@@ -607,6 +614,9 @@ class Segment {
                                       __ATOMIC_ACQ_REL,
                                       __ATOMIC_RELAXED)) {
         return data + old;
+      }
+      if (old + size < old or old + size > cap) {
+        return 0;
       }
     }
   }
@@ -1203,6 +1213,25 @@ void* copy(Context* c, void* o, bool* won)
     return o;
   }
 
+  if (traceIsSerial()) {
+    if (wasCollected(c, o)) {
+      *won = false;
+      return follow(c, o);
+    }
+    void* r = copy2(c, o);
+    if (Debug) {
+      fprintf(stderr,
+              "copy %p (%s) to %p (%s)\n",
+              o,
+              segment(c, o),
+              r,
+              segment(c, r));
+    }
+    headerStoreForward(o, r);
+    *won = true;
+    return r;
+  }
+
   pthread_once(&stripeOnce, initStripes);
 
   if (wasCollected(c, o)) {
@@ -1427,6 +1456,11 @@ struct GcPool {
 GcPool pool;
 __thread GcWorker* tlsWorker = 0;
 
+bool traceIsSerial()
+{
+  return pool.n <= 1;
+}
+
 unsigned traceWorkerCount()
 {
   static unsigned n = 0;
@@ -1463,6 +1497,10 @@ void dequeInit(GcDeque* q)
 
 void dequeReset(GcDeque* q)
 {
+  if (traceIsSerial()) {
+    q->n = 0;
+    return;
+  }
   pthread_mutex_lock(&q->mu);
   q->n = 0;
   pthread_mutex_unlock(&q->mu);
@@ -1499,6 +1537,14 @@ void gcPush(void* p)
     abort();
   }
   GcDeque* q = &w->deque;
+  if (traceIsSerial()) {
+    if (q->n == q->cap) {
+      dequeGrow(q);
+    }
+    q->data[q->n] = p;
+    ++q->n;
+    return;
+  }
   pthread_mutex_lock(&q->mu);
   if (q->n == q->cap) {
     dequeGrow(q);
@@ -1512,6 +1558,13 @@ void gcPush(void* p)
 void* gcPop(GcWorker* w)
 {
   GcDeque* q = &w->deque;
+  if (traceIsSerial()) {
+    if (q->n == 0) {
+      return 0;
+    }
+    --q->n;
+    return q->data[q->n];
+  }
   pthread_mutex_lock(&q->mu);
   if (q->n == 0) {
     pthread_mutex_unlock(&q->mu);
@@ -1688,7 +1741,9 @@ void* gcWorkerMain(void* arg)
 
 void ensurePool(unsigned n)
 {
-  pthread_once(&stripeOnce, initStripes);
+  if (n > 1) {
+    pthread_once(&stripeOnce, initStripes);
+  }
   if (pool.ready) {
     return;
   }
@@ -1792,6 +1847,20 @@ void waitWorkers()
 void drain(GcWorker* w)
 {
   Context* c = pool.context;
+  // queued and inFlight stay zero on this path. Do not touch them:
+  // a decrement would wrap and traceQuiescent would not return.
+  if (traceIsSerial()) {
+    for (;;) {
+      void* p = gcPop(w);
+      if (p == 0) {
+        if (traceFixie(c)) {
+          continue;
+        }
+        return;
+      }
+      scanObject(c, p);
+    }
+  }
   while (true) {
     void* p = gcPop(w);
     if (p == 0) {
@@ -1993,27 +2062,42 @@ void drainTrace()
 void scanUnmanagedObject(void* object, void* arg)
 {
   Context* c = static_cast<Context*>(arg);
+  // A previous scan found no managed slot, and no store since then
+  // has written one. The object does not move, so there is nothing
+  // to update.
+  if (unmanagedScanClean(object)) {
+    return;
+  }
   if (maskAlignedPointer(*static_cast<void**>(object)) == 0) {
     return;
   }
 
   class Walker : public Heap::Walker {
    public:
-    Walker(Context* c, void* copy) : c(c), copy(copy)
+    Walker(Context* c, void* copy) : c(c), copy(copy), managed(false)
     {
     }
 
     virtual bool visit(unsigned offset)
     {
-      collect(c, getp(copy, offset), copy, offset);
+      void** slot = getp(copy, offset);
+      void* masked = maskAlignedPointer(*slot);
+      if (masked != 0 and not pointerIsUnmanaged(masked)) {
+        managed = true;
+      }
+      collect(c, slot, copy, offset);
       return true;
     }
 
     Context* c;
     void* copy;
+    bool managed;
   } walker(c, object);
 
   c->client->walk(object, &walker);
+  if (not walker.managed) {
+    unmanagedMarkScanClean(object);
+  }
 }
 
 void collect2(Context* c)
@@ -2070,8 +2154,9 @@ void collect2(Context* c)
 
   c->client->visitRoots(&v);
   // Metadata and other unmanaged objects are not in a segment, so the
-  // card table never records them. Scan every one. Slots that point at
-  // managed objects are updated in place; the unmanaged object stays.
+  // card table never records them. Slots that point at managed objects
+  // are updated in place. An object whose last scan saw none of those,
+  // and which has not stored one since, is left alone.
   unmanagedForEach(scanUnmanagedObject, c);
   // Roots only push. Drain before weak refs: status() reports
   // Unreachable for a from-space object that has not been forwarded,
@@ -2367,6 +2452,18 @@ class MyHeap : public Heap {
 
   virtual void mark(void* p, unsigned offset, unsigned count)
   {
+    if (pointerIsUnmanaged(p)) {
+      void** base = static_cast<void**>(p);
+      for (unsigned i = 0; i < count; ++i) {
+        void* value = maskAlignedPointer(base[offset + i]);
+        if (value != 0 and not pointerIsUnmanaged(value)) {
+          unmanagedMarkScanDirty(p);
+          return;
+        }
+      }
+      return;
+    }
+
     if (needsMark(p)) {
 #ifndef USE_ATOMIC_OPERATIONS
       ACQUIRE(c.lock);

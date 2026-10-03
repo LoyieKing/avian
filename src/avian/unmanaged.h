@@ -45,6 +45,30 @@ void copyingHeapFree(const void* p);
 // slots in place; the object itself does not move.
 void unmanagedTrack(void* object);
 
+// allocateUnmanaged places one word immediately before the Java object.
+// Zero, the allocator's fill, means the next collection must scan it.
+// A scan that sees only null and unmanaged slots stores 1. A later
+// store of a managed referent stores 0. The word is not a Java field.
+inline uintptr_t* unmanagedScanWord(void* object)
+{
+  return reinterpret_cast<uintptr_t*>(object) - 1;
+}
+
+inline bool unmanagedScanClean(void* object)
+{
+  return __atomic_load_n(unmanagedScanWord(object), __ATOMIC_RELAXED) != 0;
+}
+
+inline void unmanagedMarkScanClean(void* object)
+{
+  __atomic_store_n(unmanagedScanWord(object), static_cast<uintptr_t>(1), __ATOMIC_RELAXED);
+}
+
+inline void unmanagedMarkScanDirty(void* object)
+{
+  __atomic_store_n(unmanagedScanWord(object), static_cast<uintptr_t>(0), __ATOMIC_RELAXED);
+}
+
 void unmanagedForEach(void (*fn)(void* object, void* arg), void* arg);
 
 }  // namespace vm

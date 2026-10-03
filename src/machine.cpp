@@ -4892,10 +4892,16 @@ object allocateUnmanaged(Thread* t, unsigned sizeInBytes, bool objectMask)
 {
   unsigned bytes = pad(sizeInBytes);
   expect(t, bytes > 0);
-  void* p = unmanagedAllocate(bytes);
-  if (p == 0) {
+  // The word before the object is the scan flag. Zero means dirty.
+  unsigned total = bytes + BytesPerWord;
+  if (total < bytes) {
     throw_(t, roots(t)->outOfMemoryError());
   }
+  void* raw = unmanagedAllocate(total);
+  if (raw == 0) {
+    throw_(t, roots(t)->outOfMemoryError());
+  }
+  void* p = static_cast<uint8_t*>(raw) + BytesPerWord;
   if (objectMask) {
     unmanagedTrack(p);
   }
