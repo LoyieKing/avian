@@ -28,7 +28,9 @@ namespace {
 const uintptr_t RegionBase = UnmanagedTagIndex << UnmanagedTagShift;
 const uintptr_t RegionSpan = uintptr_t(1) << UnmanagedTagShift;
 #else
-const uintptr_t RegionSpan = 256u * 1024u * 1024u;
+// Virtual only until a page is committed. Bootstrap allocates far more
+// than 256MB / 16KB objects once each object no longer owns a page.
+const uintptr_t RegionSpan = uintptr_t(4) << 30;
 #endif
 
 uintptr_t regionBase = 0;
@@ -106,38 +108,45 @@ void attachFixedRegion()
 #endif
 
 #if !defined(__linux__) || !defined(__x86_64__)
+uintptr_t hostPageSize()
+{
+  long page = sysconf(_SC_PAGESIZE);
+  return page > 0 ? static_cast<uintptr_t>(page) : 4096;
+}
+
+// Pack objects inside a page. Rounding the bump up to a page made every
+// allocation cost 16KB on Apple Silicon and exhausted the reservation
+// during bootstrap.
 void* bumpAllocate(size_t bytes)
 {
   const uintptr_t align = 16;
+  uintptr_t pageMask = hostPageSize() - 1;
 #if defined(__x86_64__)
   pthread_mutex_lock(&sharedRegion->lock);
   uintptr_t p = (sharedRegion->bump + align - 1) & ~(align - 1);
-  uintptr_t end = (p + bytes + 4095) & ~uintptr_t(4095);
-  if (end > sharedRegion->end) {
+  uintptr_t next = p + bytes;
+  if (next < p or next > sharedRegion->end) {
     pthread_mutex_unlock(&sharedRegion->lock);
     return 0;
   }
-  sharedRegion->bump = end;
+  sharedRegion->bump = next;
   pthread_mutex_unlock(&sharedRegion->lock);
 #else
-  // Apple Silicon pages are 16KB. A 4KB mprotect is rejected.
-  long page = sysconf(_SC_PAGESIZE);
-  uintptr_t pageSize = page > 0 ? static_cast<uintptr_t>(page) : 4096;
-  uintptr_t pageMask = pageSize - 1;
   pthread_mutex_lock(&bumpLock);
   uintptr_t p = (regionBump + align - 1) & ~(align - 1);
-  if (p & pageMask) {
-    p = (p + pageMask) & ~pageMask;
-  }
-  uintptr_t end = (p + bytes + pageMask) & ~pageMask;
-  if (end > regionEnd or end < p) {
+  uintptr_t next = p + bytes;
+  if (next < p or next > regionEnd) {
     pthread_mutex_unlock(&bumpLock);
     return 0;
   }
-  regionBump = end;
+  regionBump = next;
   pthread_mutex_unlock(&bumpLock);
 #endif
-  if (mprotect(reinterpret_cast<void*>(p), end - p, PROT_READ | PROT_WRITE)
+  uintptr_t protect = p & ~pageMask;
+  uintptr_t protectEnd = (next + pageMask) & ~pageMask;
+  if (mprotect(reinterpret_cast<void*>(protect),
+               protectEnd - protect,
+               PROT_READ | PROT_WRITE)
       != 0) {
     return 0;
   }
