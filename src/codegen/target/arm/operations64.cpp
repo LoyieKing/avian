@@ -630,8 +630,21 @@ void moveZRR(Context* c,
              lir::RegisterPair* dst)
 {
   switch (srcSize) {
+  case 1:
+    append(c, ubfm(dst->low, src->low, 0, 7, 4));
+    break;
+
   case 2:
     append(c, uxth(dst->low, src->low));
+    break;
+
+  case 4:
+    // A 32-bit move writes the W register and clears the upper half.
+    append(c, mov(dst->low, src->low, 4));
+    break;
+
+  case 8:
+    append(c, mov(dst->low, src->low, 8));
     break;
 
   default:

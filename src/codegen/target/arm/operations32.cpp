@@ -281,9 +281,20 @@ void moveZRR(Context* con,
              lir::RegisterPair* dst)
 {
   switch (srcSize) {
+  case 1:
+    emit(con, lsli(dst->low, src->low, 24));
+    emit(con, lsri(dst->low, dst->low, 24));
+    break;
+
   case 2:
     emit(con, lsli(dst->low, src->low, 16));
     emit(con, lsri(dst->low, dst->low, 16));
+    break;
+
+  case 4:
+    if (src->low != dst->low) {
+      emit(con, mov(dst->low, src->low));
+    }
     break;
 
   default:

@@ -250,19 +250,37 @@ void moveCR(Context* c,
 }
 
 void moveZCR(Context* c,
-             unsigned aSize UNUSED,
+             unsigned aSize,
              lir::Constant* a,
-             unsigned bSize UNUSED,
+             unsigned bSize,
              lir::RegisterPair* b)
 {
   assertT(c, not isFloatReg(b));
-  assertT(c, aSize == 2);
   assertT(c, bSize == vm::TargetBytesPerWord);
   assertT(c, a->value->resolved());
 
-  maybeRex(c, vm::TargetBytesPerWord, b);
+  // A 32-bit immediate move zero-extends into the full register.
+  uint32_t mask;
+  switch (aSize) {
+  case 1:
+    mask = 0xffu;
+    break;
+  case 2:
+    mask = 0xffffu;
+    break;
+  case 4:
+    mask = 0xffffffffu;
+    break;
+  case 8:
+    moveCR(c, 8, a, bSize, b);
+    return;
+  default:
+    abort(c);
+  }
+
+  maybeRex(c, 4, b);
   opcode(c, 0xb8 + regCode(b));
-  c->code.appendTargetAddress(static_cast<uint16_t>(a->value->value()));
+  c->code.append4(static_cast<uint32_t>(a->value->value()) & mask);
 }
 
 void swapRR(Context* c,
@@ -563,14 +581,36 @@ void moveCM(Context* c,
 void moveZRR(Context* c,
              unsigned aSize,
              lir::RegisterPair* a,
-             unsigned bSize UNUSED,
+             unsigned bSize,
              lir::RegisterPair* b)
 {
   switch (aSize) {
+  case 1:
+    alwaysRex(c, 1, b, a);
+    opcode(c, 0x0f, 0xb6);
+    modrm(c, 0xc0, a, b);
+    break;
+
   case 2:
     alwaysRex(c, aSize, b, a);
     opcode(c, 0x0f, 0xb7);
     modrm(c, 0xc0, a, b);
+    break;
+
+  case 4:
+    // mov r32, r32 clears the upper half on x86-64.
+    alwaysRex(c, 4, a, b);
+    opcode(c, 0x89);
+    modrm(c, 0xc0, b, a);
+    if (vm::TargetBytesPerWord == 4 and bSize == 8) {
+      lir::RegisterPair bh(b->high);
+      opcode(c, 0x31);
+      modrm(c, 0xc0, &bh, &bh);
+    }
+    break;
+
+  case 8:
+    moveRR(c, 8, a, bSize, b);
     break;
 
   default:
@@ -579,17 +619,42 @@ void moveZRR(Context* c,
 }
 
 void moveZMR(Context* c,
-             unsigned aSize UNUSED,
+             unsigned aSize,
              lir::Memory* a,
-             unsigned bSize UNUSED,
+             unsigned bSize,
              lir::RegisterPair* b)
 {
   assertT(c, bSize == vm::TargetBytesPerWord);
-  assertT(c, aSize == 2);
 
-  maybeRex(c, bSize, b, a);
-  opcode(c, 0x0f, 0xb7);
-  modrmSibImm(c, b->low, a->scale, a->index, a->base, a->offset);
+  switch (aSize) {
+  case 1:
+    maybeRex(c, bSize, b, a);
+    opcode(c, 0x0f, 0xb6);
+    modrmSibImm(c, b->low, a->scale, a->index, a->base, a->offset);
+    break;
+
+  case 2:
+    maybeRex(c, bSize, b, a);
+    opcode(c, 0x0f, 0xb7);
+    modrmSibImm(c, b->low, a->scale, a->index, a->base, a->offset);
+    break;
+
+  case 4:
+    // No REX.W: a 32-bit load zero-extends to 64 bits.
+    maybeRex(c, 4, b, a);
+    opcode(c, 0x8b);
+    modrmSibImm(c, b->low, a->scale, a->index, a->base, a->offset);
+    break;
+
+  case 8:
+    maybeRex(c, 8, b, a);
+    opcode(c, 0x8b);
+    modrmSibImm(c, b->low, a->scale, a->index, a->base, a->offset);
+    break;
+
+  default:
+    abort(c);
+  }
 }
 
 void addCarryRR(Context* c, unsigned size, lir::RegisterPair* a, lir::RegisterPair* b)
