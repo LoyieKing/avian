@@ -11,7 +11,9 @@
 package java.lang;
 
 public class StringBuilder implements CharSequence, Appendable {
-  private static final int BufferSize = 32;
+  // First char[] used by append(char). Long enough for a typical
+  // concatenated name, so that path does not grow.
+  private static final int DefaultCapacity = 96;
 
   private Cell chain;
   private int length;
@@ -22,10 +24,22 @@ public class StringBuilder implements CharSequence, Appendable {
     append(s);
   }
 
-  public StringBuilder(int capacity) { }
+  public StringBuilder(int capacity) {
+    if (capacity < 0) throw new NegativeArraySizeException();
+    if (capacity > 0) buffer = new char[capacity];
+  }
 
   public StringBuilder() {
     this(0);
+  }
+
+  private void grow(int minimum) {
+    int old = buffer == null ? 0 : buffer.length;
+    int next = old == 0 ? DefaultCapacity : old * 2 + 2;
+    if (next < minimum) next = minimum;
+    char[] grown = new char[next];
+    if (position > 0) System.arraycopy(buffer, 0, grown, 0, position);
+    buffer = grown;
   }
 
   private void flush() {
@@ -80,11 +94,8 @@ public class StringBuilder implements CharSequence, Appendable {
   }
 
   public StringBuilder append(char v) {
-    if (buffer == null) {
-      buffer = new char[BufferSize];
-    } else if (position >= buffer.length) {
-      flush();
-      buffer = new char[BufferSize];
+    if (buffer == null || position >= buffer.length) {
+      grow(position + 1);
     }
 
     buffer[position++] = v;
@@ -343,21 +354,32 @@ public class StringBuilder implements CharSequence, Appendable {
   }
 
   public String toString() {
-    if (position == 0 && length > 0 && chain != null) {
+    if (length == 0) return "";
+    flush();
+    if (chain == null) return "";
+    // One segment is already a String. Return it.
+    if (chain.next == null) return chain.value;
+
+    int at = length;
+    for (Cell c = chain; c != null; c = c.next) {
+      byte[] bytes = c.value.latin1();
+      int n = c.value.length();
+      if (bytes == null || at < n) {
+        at = -1;
+        break;
+      }
+      at -= n;
+    }
+    if (at == 0) {
       byte[] ascii = new byte[length];
-      int at = length;
-      boolean latin = true;
+      at = length;
       for (Cell c = chain; c != null; c = c.next) {
         byte[] bytes = c.value.latin1();
         int n = c.value.length();
-        if (bytes == null || at < n) {
-          latin = false;
-          break;
-        }
         at -= n;
         for (int i = 0; i < n; ++i) ascii[at + i] = bytes[i];
       }
-      if (latin && at == 0) return String.fromAscii(ascii);
+      return String.fromAscii(ascii);
     }
     char[] array = new char[length];
     getChars(0, length, array, 0);
@@ -395,8 +417,9 @@ public class StringBuilder implements CharSequence, Appendable {
     insert(index, ch);
   }
 
-  public void ensureCapacity(int capacity) {
-    // ignore
+  public void ensureCapacity(int minimum) {
+    if (minimum <= 0) return;
+    if (buffer == null || buffer.length < minimum) grow(minimum);
   }
 
   public void trimToSize() {

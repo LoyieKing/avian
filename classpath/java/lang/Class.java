@@ -63,59 +63,18 @@ public final class Class <T>
     return res + getName();
   }
 
-  private static byte[] replace(int a, int b, byte[] s, int offset,
-                                int length)
-  {
-    byte[] array = new byte[length];
-    for (int i = 0; i < length; ++i) {
-      byte c = s[i];
-      array[i] = (byte) (c == a ? b : c);
-    }
-    return array;
-  }
-
   public String getName() {
     return getName(vmClass);
   }
 
   public static String getName(VMClass c) {
-    if (c.name == null) {
-      if ((c.vmFlags & PrimitiveFlag) != 0) {
-        if (c == Classes.primitiveClass('V')) {
-          c.name = "void\0".getBytes();
-        } else if (c == Classes.primitiveClass('Z')) {
-          c.name = "boolean\0".getBytes();
-        } else if (c == Classes.primitiveClass('B')) {
-          c.name = "byte\0".getBytes();
-        } else if (c == Classes.primitiveClass('C')) {
-          c.name = "char\0".getBytes();
-        } else if (c == Classes.primitiveClass('S')) {
-          c.name = "short\0".getBytes();
-        } else if (c == Classes.primitiveClass('I')) {
-          c.name = "int\0".getBytes();
-        } else if (c == Classes.primitiveClass('F')) {
-          c.name = "float\0".getBytes();
-        } else if (c == Classes.primitiveClass('J')) {
-          c.name = "long\0".getBytes();
-        } else if (c == Classes.primitiveClass('D')) {
-          c.name = "double\0".getBytes();
-        } else {
-          throw new AssertionError();
-        }
-      } else {
-        throw new AssertionError();
-      }
-    }
-
-    byte[] name = c.name;
-    int n = name.length - 1;
-    for (int i = 0; i < n; ++i) {
-      if (name[i] == '/') {
-        return Classes.makeString(replace('/', '.', name, 0, n), 0, n);
-      }
-    }
-    return Classes.makeString(name, 0, n);
+    String name = c.binaryName;
+    if (name != null) return name;
+    return computeName(c);
   }
+
+  // First call builds the dotted name and stores it on the VMClass.
+  private static native String computeName(VMClass c);
 
   public String getCanonicalName() {
     if ((vmClass.vmFlags & PrimitiveFlag) != 0) {

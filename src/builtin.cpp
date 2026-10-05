@@ -1691,6 +1691,87 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
   return reinterpret_cast<int64_t>(primitiveClass(t, arguments[0]));
 }
 
+const char* primitiveBinaryName(Thread* t, GcClass* c)
+{
+  if (c == primitiveClass(t, 'V')) return "void";
+  if (c == primitiveClass(t, 'Z')) return "boolean";
+  if (c == primitiveClass(t, 'B')) return "byte";
+  if (c == primitiveClass(t, 'C')) return "char";
+  if (c == primitiveClass(t, 'S')) return "short";
+  if (c == primitiveClass(t, 'I')) return "int";
+  if (c == primitiveClass(t, 'F')) return "float";
+  if (c == primitiveClass(t, 'J')) return "long";
+  if (c == primitiveClass(t, 'D')) return "double";
+  return 0;
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_Class_computeName(Thread* t, object, uintptr_t* arguments)
+{
+  GcClass* c = cast<GcClass>(t, reinterpret_cast<object>(arguments[0]));
+  if (c == 0) {
+    throwNew(t, GcNullPointerException::Type);
+  }
+
+  GcString* cached = c->binaryName();
+  if (cached) {
+    return reinterpret_cast<int64_t>(cached);
+  }
+
+  PROTECT(t, c);
+
+  if (c->name() == 0) {
+    const char* pn = 0;
+    if (c->vmFlags() & PrimitiveFlag) {
+      pn = primitiveBinaryName(t, c);
+    }
+    if (pn == 0) {
+      abort(t);
+    }
+    c->setName(t, makeByteArray(t, "%s", pn));
+  }
+
+  GcByteArray* name = c->name();
+  PROTECT(t, name);
+  unsigned len = name->length();
+  if (len == 0) {
+    abort(t);
+  }
+  unsigned n = len - 1;
+  const uint8_t* src
+      = reinterpret_cast<const uint8_t*>(name->body().begin());
+  bool slash = false;
+  for (unsigned i = 0; i < n; ++i) {
+    if (src[i] == '/') {
+      slash = true;
+      break;
+    }
+  }
+
+  GcString* s;
+  if (not slash) {
+    s = t->m->classpath->makeString(t, name, 0, static_cast<int32_t>(n));
+  } else {
+    GcByteArray* dotted = makeByteArray(t, n);
+    PROTECT(t, dotted);
+    src = reinterpret_cast<const uint8_t*>(name->body().begin());
+    uint8_t* dst = reinterpret_cast<uint8_t*>(dotted->body().begin());
+    for (unsigned i = 0; i < n; ++i) {
+      uint8_t b = src[i];
+      dst[i] = static_cast<uint8_t>(b == '/' ? '.' : b);
+    }
+    s = t->m->classpath->makeString(t, dotted, 0, static_cast<int32_t>(n));
+  }
+
+  PROTECT(t, s);
+  if (c->binaryName() == 0) {
+    c->setBinaryName(t, s);
+  } else {
+    s = c->binaryName();
+  }
+  return reinterpret_cast<int64_t>(s);
+}
+
 extern "C" AVIAN_EXPORT int64_t JNICALL
     Avian_java_lang_Class_getEnclosingMethod(Thread* t,
                                              object,

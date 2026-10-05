@@ -49,4 +49,6 @@ public class VMClass {
   public volatile java.lang.reflect.Method[] cachedPublicMethods;
   public volatile java.lang.reflect.Field[] cachedDeclaredFields;
   public volatile java.lang.reflect.Field[] cachedPublicFields;
+  // Dotted binary name. Class.getName fills this once.
+  public volatile String binaryName;
 }

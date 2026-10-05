@@ -6007,6 +6007,7 @@ GcClass* parseClass(Thread* t,
       0,  // cachedPublicMethods
       0,  // cachedDeclaredFields
       0,  // cachedPublicFields
+      0,  // binaryName
       0);  // vtable length
   PROTECT(t, class_);
 

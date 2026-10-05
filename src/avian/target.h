@@ -102,7 +102,7 @@ typedef int64_t target_intptr_t;
 
 const unsigned TargetClassFixedSize = 12;
 const unsigned TargetClassArrayElementSize = 14;
-const unsigned TargetClassVtable = 184;
+const unsigned TargetClassVtable = 192;
 
 const unsigned TargetFieldOffset = 12;
 
@@ -119,7 +119,7 @@ typedef int32_t target_intptr_t;
 
 const unsigned TargetClassFixedSize = 8;
 const unsigned TargetClassArrayElementSize = 10;
-const unsigned TargetClassVtable = 72;
+const unsigned TargetClassVtable = 76;
 
 const unsigned TargetFieldOffset = 8;
 
