@@ -22,6 +22,7 @@ bool isTailCall(MyThread* t,
                 unsigned ip,
                 GcMethod* caller,
                 GcMethod* callee);
+bool inTryBlock(MyThread* t, GcCode* code, unsigned ip);
 
 #if TARGET_BYTES_PER_WORD == 8
 unsigned takeSideIp(Context* context);
@@ -177,6 +178,12 @@ bool InlineInterface::tryCompile(MyThread* t,
   if (code == 0 or nextIp >= code->length() or origin + 5 != nextIp) {
     return false;
   }
+  // The slow lookup is a side ip past the method. An exception thrown
+  // there is outside every handler, so a catch of the null receiver
+  // would miss it. Keep the ordinary invoke in a try.
+  if (inTryBlock(t, code, origin)) {
+    return false;
+  }
   // Five-byte invokeinterface. The four operand bytes are the
   // length check, the id check, the cache load, and the stack call,
   // in that order, so each fall-through is the next machine instruction.
@@ -249,14 +256,14 @@ bool InlineInterface::tryCompile(MyThread* t,
        idIp);
 
   ir::Value* current = reloadReceiver(c);
-  ir::Value* raw = c->load(ir::ExtendMode::Signed,
-                           c->memory(current, ir::Type::object(), 0),
-                           ir::Type::iptr());
+  // Same header load as invokevirtual: the memory value is an object
+  // reference, and And with the pointer mask yields the class pointer.
+  // load() rejects an object-to-iptr flavor change.
   ir::Value* classPtr = c->binaryOp(
       lir::And,
       ir::Type::iptr(),
       c->constant(TargetPointerMask, ir::Type::iptr()),
-      raw);
+      c->memory(current, ir::Type::object()));
   ir::Value* classId = c->load(
       ir::ExtendMode::Unsigned,
       c->memory(classPtr, ir::Type::i4(), kClassRuntimeDataIndex),

@@ -886,7 +886,10 @@ class Context {
         lastCollectionTime(system->now()),
         totalCollectionTime(0),
         totalTime(0),
-        limitWasExceeded(false)
+        limitWasExceeded(false),
+        immortalSlots(0),
+        immortalSlotCount(0),
+        immortalSlotCapacity(0)
   {
     if (not system->success(system->make(&lock))) {
       system->abort();
@@ -899,6 +902,10 @@ class Context {
     nextGen1.dispose();
     gen2.dispose();
     nextGen2.dispose();
+    if (immortalSlots) {
+      system->free(immortalSlots);
+      immortalSlots = 0;
+    }
     lock->dispose();
   }
 
@@ -963,6 +970,12 @@ class Context {
   int64_t totalTime;
 
   bool limitWasExceeded;
+
+  // Slots inside the boot image. That heap is not card-marked or
+  // rescanned, so a reference stored into it is forwarded from here.
+  void*** immortalSlots;
+  unsigned immortalSlotCount;
+  unsigned immortalSlotCapacity;
 };
 
 const char* segment(Context* c, void* p)
@@ -2235,6 +2248,10 @@ void collect2(Context* c)
   vm::gcTracePhase = 1;
   mark = monoNs();
   c->client->visitRoots(&v);
+  for (unsigned i = 0; i < c->immortalSlotCount; ++i) {
+    collect(c, c->immortalSlots[i]);
+  }
+  visitMarkedFixies(c);
   gcSplit.roots_us = usSince(mark);
   // Metadata and other unmanaged objects are not in a segment, so the
   // card table never records them. Slots that point at managed objects
@@ -2494,6 +2511,36 @@ void free_(Context* c, const void* p, size_t size)
   free(c, p, size);
 }
 
+// The boot image is immortal and is not walked on later collections.
+// Remember the slot itself so the stored reference is forwarded in place.
+void rememberImmortalSlot(Context* c, void** slot)
+{
+  ACQUIRE(c->lock);
+
+  for (unsigned i = 0; i < c->immortalSlotCount; ++i) {
+    if (c->immortalSlots[i] == slot) {
+      return;
+    }
+  }
+
+  if (c->immortalSlotCount == c->immortalSlotCapacity) {
+    unsigned cap = c->immortalSlotCapacity ? c->immortalSlotCapacity * 2 : 32;
+    void*** grown = static_cast<void***>(
+        c->system->tryAllocate(cap * sizeof(void**)));
+    if (grown == 0) {
+      c->system->abort();
+    }
+    if (c->immortalSlots) {
+      memcpy(grown, c->immortalSlots, c->immortalSlotCount * sizeof(void**));
+      c->system->free(c->immortalSlots);
+    }
+    c->immortalSlots = grown;
+    c->immortalSlotCapacity = cap;
+  }
+
+  c->immortalSlots[c->immortalSlotCount++] = slot;
+}
+
 class MyHeap : public Heap {
  public:
   MyHeap(System* system, uint64_t limit) : c(system, limit)
@@ -2608,6 +2655,18 @@ class MyHeap : public Heap {
         if (value != 0 and not pointerIsUnmanaged(value)) {
           unmanagedMarkScanDirty(p);
           return;
+        }
+      }
+      return;
+    }
+
+    if (not fixedHeader(p) and immortalHeapContains(&c, p)) {
+      void** base = static_cast<void**>(p);
+      for (unsigned i = 0; i < count; ++i) {
+        void* value = maskAlignedPointer(base[offset + i]);
+        if (value != 0 and not pointerIsUnmanaged(value)
+            and not immortalHeapContains(&c, value)) {
+          rememberImmortalSlot(&c, base + offset + i);
         }
       }
       return;

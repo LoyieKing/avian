@@ -1348,7 +1348,11 @@ ifeq ($(process),compile)
 	vm-sources += $(compiler-sources)
 	vm-sources += $(src)/compile/rangeCheckElimination.cpp
 	vm-sources += $(src)/compile/objectStoreFacts.cpp
-	vm-sources += $(src)/sample.cpp
+	# The sampler uses linux x86_64 timers and ucontext. Other targets
+	# keep the weak empty hooks in posix.cpp.
+	ifeq ($(platform)-$(arch),linux-x86_64)
+		vm-sources += $(src)/sample.cpp
+	endif
 	# inlineNew, youngObjectStore, objectStore, and trivialConstructor
 	# are included from compile.cpp. Frame and Context are local to
 	# that file. objectStoreFacts is its own translation unit.

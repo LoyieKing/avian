@@ -65,6 +65,32 @@ using namespace avian::util;
 void avianSampleArmThread() __attribute__((weak));
 void avianSampleArmThread() {}
 
+void avianSampleNote(const void*, unsigned, const char*) __attribute__((weak));
+void avianSampleNote(const void* code, unsigned size, const char* label)
+{
+  (void)code;
+  (void)size;
+  (void)label;
+}
+
+void avianSampleNoteParts(const void*,
+                          unsigned,
+                          const char*,
+                          const char*,
+                          const char*) __attribute__((weak));
+void avianSampleNoteParts(const void* code,
+                          unsigned size,
+                          const char* class_,
+                          const char* name,
+                          const char* spec)
+{
+  (void)code;
+  (void)size;
+  (void)class_;
+  (void)name;
+  (void)spec;
+}
+
 namespace {
 
 class MutexResource {
