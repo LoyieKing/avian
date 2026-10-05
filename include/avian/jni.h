@@ -12,7 +12,8 @@
 #define AVIAN_JNI_H_
 
 #include <jni.h>
-#include <stdint.h>
+
+#include "avian/state_capture.h"
 
 #ifndef __cplusplus
 #error AvianJniEnv extends the C++ JNIEnv
@@ -23,6 +24,7 @@
    fields and does not move the pointer:
      reinterpret_cast<AvianJniEnv*>(env)->NewStringFromUnmanagedMutf8(header)
    Do not add data members here. They would overlap the thread. */
+
 struct AvianJniEnv : JNIEnv {
   /* header is unmanaged and immovable: a big-endian u2 byte length, then
      that many Modified UTF-8 bytes. The string stores the address and does
@@ -40,7 +42,7 @@ struct AvianJniEnv : JNIEnv {
 
   /* Versioned ByteFun state bytes. A null object is a 2-byte array, not a
      null return. The bytes are produced in native memory; one Java array is
-     allocated only as this call returns. */
+     allocated only as this call returns. emitState uses CaptureState instead. */
   jbyteArray SerializeGraph(jobject obj)
   {
     typedef jbyteArray(JNICALL* Fn)(JNIEnv*, jobject);
@@ -175,6 +177,19 @@ struct AvianJniEnv : JNIEnv {
     const unsigned slot = 247;
     const Fn* table = reinterpret_cast<const Fn*>(functions);
     return table[slot](this, headers, count);
+  }
+
+  /* One VM entry. Copies plugin, the class binary name, and the optional
+     state name into malloc buffers, and serializes state into body. The
+     caller frees every non-null pointer with free. No Java array is
+     allocated for the payload. Returns 0, or -1 when a Java exception is
+     pending. */
+  jint CaptureState(jstring plugin, jobject type, jstring name, jobject state, StateCapture* out)
+  {
+    typedef jint(JNICALL* Fn)(JNIEnv*, jstring, jobject, jstring, jobject, StateCapture*);
+    const unsigned slot = 248;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, plugin, type, name, state, out);
   }
 };
 

@@ -128,6 +128,8 @@ using namespace avian::util;
     type2 name2;                                                     \
   } MAKE_NAME(resource_)(t, name1, name2);
 
+#include "avian/state_capture.h"
+
 namespace vm {
 
 const bool Verbose = false;
@@ -986,6 +988,15 @@ struct JNIEnvVTable {
   jobjectArray(JNICALL* NewReadOnlyUnmanagedStringArray)(JNIEnv*,
                                                         const void* const*,
                                                         jsize);
+
+  // Malloc buffers for one emit. See StateCapture in include/avian/jni.h.
+  // No Java array is allocated for the payload.
+  jint(JNICALL* CaptureState)(JNIEnv*,
+                             jstring,
+                             jobject,
+                             jstring,
+                             jobject,
+                             ::StateCapture*);
 };
 
 // Slots past GetModule. include/avian/jni.h uses the same indexes.
@@ -1003,7 +1014,8 @@ enum {
   AvianJniNewReadOnlyUnmanagedStringFromUnmanagedMutf8 = 244,
   AvianJniGetReadOnlyUnmanagedStringUtfChars = 245,
   AvianJniReleaseReadOnlyUnmanagedStringUtfChars = 246,
-  AvianJniNewReadOnlyUnmanagedStringArray = 247
+  AvianJniNewReadOnlyUnmanagedStringArray = 247,
+  AvianJniCaptureState = 248
 };
 
 inline void atomicOr(uint32_t* p, int v)

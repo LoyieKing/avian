@@ -3745,8 +3745,17 @@ static_assert(offsetof(JNIEnvVTable, NewReadOnlyUnmanagedStringArray)
                       / sizeof(void*)
                   == AvianJniNewReadOnlyUnmanagedStringArray,
               "include/avian/jni.h readonly string array slot");
+static_assert(offsetof(JNIEnvVTable, CaptureState) / sizeof(void*)
+                  == AvianJniCaptureState,
+              "include/avian/jni.h capture state slot");
 
 jbyteArray JNICALL SerializeGraph(Thread* t, jobject object);
+jint JNICALL CaptureState(Thread* t,
+                          jstring plugin,
+                          jobject type,
+                          jstring name,
+                          jobject state,
+                          StateCapture* out);
 jobject JNICALL DeserializeGraph(Thread* t, const uint8_t* data, jint length);
 
 void populateJNITables(JavaVMVTable* vmTable, JNIEnvVTable* envTable)
@@ -3795,6 +3804,7 @@ void populateJNITables(JavaVMVTable* vmTable, JNIEnvVTable* envTable)
       = local::ReleaseReadOnlyUnmanagedStringUtfChars;
   envTable->NewReadOnlyUnmanagedStringArray
       = local::NewReadOnlyUnmanagedStringArray;
+  envTable->CaptureState = CaptureState;
   envTable->DefineClass = local::DefineClass;
   envTable->FindClass = local::FindClass;
   envTable->ThrowNew = local::ThrowNew;

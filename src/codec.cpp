@@ -10,8 +10,8 @@
 
 // ByteFun state graphs. Each class publishes two stubs in
 // VMClass.serializeThunk / deserializeThunk. The serialize walk does not
-// allocate on the Java heap, so object pointers stay put. One byte[] is
-// created only after the native buffer is finished.
+// allocate on the Java heap, so object pointers stay put. CaptureState
+// keeps that buffer. SerializeGraph still wraps it in one byte[].
 
 #include "avian/machine.h"
 
@@ -229,6 +229,12 @@ __thread GcClass* g_mapC = 0;
 __thread GcClass* g_colC = 0;
 __thread GcClass* g_setC = 0;
 __thread int g_hot = 0;
+__thread int g_keep = 0;
+__thread uint8_t* g_kept = 0;
+__thread uint32_t g_kept_n = 0;
+GcClass* g_slot_map = 0;
+GcClass* g_slot_col = 0;
+GcClass* g_slot_set = 0;
 
 pthread_mutex_t g_stubMu = PTHREAD_MUTEX_INITIALIZER;
 uint8_t* g_slab = 0;
@@ -243,12 +249,23 @@ GcByteArray* entry(Thread* t, object self, Plan* plan);
 object dentry(Thread* t, Plan* plan);
 Val read_value(Dec* d);
 
+void drop_kept()
+{
+  if (g_kept) {
+    free(g_kept);
+    g_kept = 0;
+    g_kept_n = 0;
+  }
+}
+
 void poison()
 {
   g_hot = 0;
   g_mapC = 0;
   g_colC = 0;
   g_setC = 0;
+  g_keep = 0;
+  drop_kept();
 }
 
 void cpu_pause()
@@ -887,8 +904,22 @@ void put_cstr(Walk* w, const char* s)
   put_mem(w, s, static_cast<uint32_t>(strlen(s)));
 }
 
+int plain_ascii(const uint8_t* p, unsigned n)
+{
+  for (unsigned i = 0; i < n; ++i) {
+    if (p[i] == 0 || p[i] >= 0x80) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 void put_mutf8_utf8(Walk* w, const uint8_t* p, unsigned n)
 {
+  if (plain_ascii(p, n)) {
+    put_mem(w, p, n);
+    return;
+  }
   uint32_t hole = w->out->len;
   reserve(w, 4);
   uint32_t start = w->out->len;
@@ -919,6 +950,19 @@ void put_dotted_class(Walk* w, GcClass* c)
   }
   unsigned n = bytes_n(c ? c->name() : 0);
   const uint8_t* p = bytes_p(c ? c->name() : 0);
+  if (plain_ascii(p, n)) {
+    uint32_t hole = w->out->len;
+    reserve(w, 4);
+    uint8_t* dst = reserve(w, n);
+    for (unsigned i = 0; i < n; ++i) {
+      dst[i] = p[i] == '/' ? static_cast<uint8_t>('.') : p[i];
+    }
+    w->out->data[hole] = static_cast<uint8_t>(n >> 24);
+    w->out->data[hole + 1] = static_cast<uint8_t>(n >> 16);
+    w->out->data[hole + 2] = static_cast<uint8_t>(n >> 8);
+    w->out->data[hole + 3] = static_cast<uint8_t>(n);
+    return;
+  }
   uint32_t hole = w->out->len;
   reserve(w, 4);
   uint32_t start = w->out->len;
@@ -1308,6 +1352,17 @@ GcClass* resolve_internal(Thread* t, const char* internal, int doThrow)
     fail(t, 0, "bad state payload");
   }
   return c;
+}
+
+GcClass* boot_named(Thread* t, const char* name, GcClass** slot)
+{
+  GcClass* found = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+  if (found) {
+    return found;
+  }
+  found = resolve_internal(t, name, 1);
+  __atomic_store_n(slot, found, __ATOMIC_RELEASE);
+  return found;
 }
 
 void load_collection_classes(Thread* t, GcClass** mapC, GcClass** colC, GcClass** setC)
@@ -2342,6 +2397,11 @@ GcByteArray* entry(Thread* t, object self, Plan* plan)
     free(data);
     fail(t, 0, "bad state payload");
   }
+  if (g_keep) {
+    g_kept = data;
+    g_kept_n = len;
+    return 0;
+  }
   GcByteArray* arr = makeByteArray(t, len);
   if (len && data) {
     memcpy(arr->body().begin(), data, len);
@@ -3311,11 +3371,11 @@ uint64_t serialize_run(Thread* t, uintptr_t* arguments)
     return reinterpret_cast<uint64_t>(makeLocalReference(t, a));
   }
   PROTECT(t, obj);
-  GcClass* mapC = resolve_internal(t, "java/util/Map", 1);
+  GcClass* mapC = boot_named(t, "java/util/Map", &g_slot_map);
   PROTECT(t, mapC);
-  GcClass* colC = resolve_internal(t, "java/util/Collection", 1);
+  GcClass* colC = boot_named(t, "java/util/Collection", &g_slot_col);
   PROTECT(t, colC);
-  GcClass* setC = resolve_internal(t, "java/util/Set", 1);
+  GcClass* setC = boot_named(t, "java/util/Set", &g_slot_set);
   PROTECT(t, setC);
   g_mapC = mapC;
   g_colC = colC;
@@ -3329,6 +3389,131 @@ uint64_t serialize_run(Thread* t, uintptr_t* arguments)
   PROTECT(t, bytes);
   poison();
   return reinterpret_cast<uint64_t>(makeLocalReference(t, bytes));
+}
+
+object ref_obj(jobject ref)
+{
+  return (ref == 0 || *ref == 0) ? 0 : *ref;
+}
+
+void copy_plain(Thread* t, const uint8_t* p, unsigned n, int slash, uint8_t** out, uint32_t* outN)
+{
+  uint8_t* dst = static_cast<uint8_t*>(malloc(static_cast<size_t>(n) + 1));
+  if (!dst) {
+    fail(t, 1, "OutOfMemoryError");
+  }
+  if (n != 0) {
+    memcpy(dst, p, n);
+    if (slash) {
+      for (unsigned i = 0; i < n; ++i) {
+        if (dst[i] == '/') dst[i] = '.';
+      }
+    }
+  }
+  dst[n] = 0;
+  *out = dst;
+  *outN = n;
+}
+
+void copy_text(Thread* t, const uint8_t* p, unsigned n, int slash, uint8_t** out, uint32_t* outN)
+{
+  if (plain_ascii(p, n)) {
+    copy_plain(t, p, n, slash, out, outN);
+    return;
+  }
+  uint32_t len = 0;
+  char* buf = utf8_from_mutf8(t, p, n, &len, slash);
+  *out = reinterpret_cast<uint8_t*>(buf);
+  *outN = len;
+}
+
+void copy_string_obj(Thread* t, object str, uint8_t** out, uint32_t* outN)
+{
+  *out = 0;
+  *outN = 0;
+  if (!str) {
+    return;
+  }
+  const uint8_t* p;
+  unsigned n = 0;
+  string_bytes(str, p, n);
+  copy_text(t, p, n, 0, out, outN);
+}
+
+void copy_class_name(Thread* t, object cls, uint8_t** out, uint32_t* outN)
+{
+  *out = 0;
+  *outN = 0;
+  if (!cls) {
+    fail(t, 0, "state type is null");
+  }
+  GcClass* vm = cast<GcJclass>(t, cls)->vmClass();
+  const char* prim = primitive_name(t, vm);
+  if (prim) {
+    copy_plain(t, reinterpret_cast<const uint8_t*>(prim), static_cast<unsigned>(strlen(prim)), 0, out, outN);
+    return;
+  }
+  object bin = vm ? reinterpret_cast<object>(vm->binaryName()) : 0;
+  if (bin) {
+    copy_string_obj(t, bin, out, outN);
+    return;
+  }
+  copy_text(t, bytes_p(vm ? vm->name() : 0), bytes_n(vm ? vm->name() : 0), 1, out, outN);
+}
+
+uint64_t capture_run(Thread* t, uintptr_t* arguments)
+{
+  poison();
+  g_walk = 0;
+  g_dec = 0;
+  g_kept = 0;
+  g_kept_n = 0;
+  StateCapture* out = reinterpret_cast<StateCapture*>(arguments[4]);
+  memset(out, 0, sizeof *out);
+  object plugin = ref_obj(reinterpret_cast<jobject>(arguments[0]));
+  object type = ref_obj(reinterpret_cast<jobject>(arguments[1]));
+  object name = ref_obj(reinterpret_cast<jobject>(arguments[2]));
+  object state = ref_obj(reinterpret_cast<jobject>(arguments[3]));
+  copy_string_obj(t, plugin, &out->plugin, &out->plugin_n);
+  copy_class_name(t, type, &out->type, &out->type_n);
+  if (name) {
+    out->has_name = 1;
+    copy_string_obj(t, name, &out->name, &out->name_n);
+  }
+  if (!state) {
+    uint8_t* body = static_cast<uint8_t*>(malloc(2));
+    if (!body) {
+      fail(t, 1, "OutOfMemoryError");
+    }
+    body[0] = 1;
+    body[1] = T_NULL;
+    out->body = body;
+    out->body_n = 2;
+    return 1;
+  }
+  PROTECT(t, state);
+  GcClass* mapC = boot_named(t, "java/util/Map", &g_slot_map);
+  PROTECT(t, mapC);
+  GcClass* colC = boot_named(t, "java/util/Collection", &g_slot_col);
+  PROTECT(t, colC);
+  GcClass* setC = boot_named(t, "java/util/Set", &g_slot_set);
+  PROTECT(t, setC);
+  g_mapC = mapC;
+  g_colC = colC;
+  g_setC = setC;
+  g_hot = 1;
+  g_keep = 1;
+  GcClass* c = objectClass(t, state);
+  ensure_fn(t, c);
+  SerFn fn = reinterpret_cast<SerFn>(static_cast<uintptr_t>(
+      __atomic_load_n(&c->serializeThunk(), __ATOMIC_ACQUIRE)));
+  fn(t, state);
+  out->body = g_kept;
+  out->body_n = g_kept_n;
+  g_kept = 0;
+  g_kept_n = 0;
+  poison();
+  return 1;
 }
 
 uint64_t deserialize_run(Thread* t, uintptr_t* arguments)
@@ -3367,6 +3552,28 @@ jbyteArray JNICALL SerializeGraph(Thread* t, jobject object)
 {
   uintptr_t arguments[] = {reinterpret_cast<uintptr_t>(object)};
   return reinterpret_cast<jbyteArray>(run(t, serialize_run, arguments));
+}
+
+jint JNICALL CaptureState(Thread* t,
+                          jstring plugin,
+                          jobject type,
+                          jstring name,
+                          jobject state,
+                          StateCapture* out)
+{
+  if (!out) {
+    return -1;
+  }
+  uintptr_t arguments[] = {reinterpret_cast<uintptr_t>(plugin),
+                           reinterpret_cast<uintptr_t>(type),
+                           reinterpret_cast<uintptr_t>(name),
+                           reinterpret_cast<uintptr_t>(state),
+                           reinterpret_cast<uintptr_t>(out)};
+  run(t, capture_run, arguments);
+  if (t->exception) {
+    return -1;
+  }
+  return 0;
 }
 
 jobject JNICALL DeserializeGraph(Thread* t, const uint8_t* data, jint length)
