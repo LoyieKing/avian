@@ -62,6 +62,9 @@ typedef struct ucontext {
 using namespace vm;
 using namespace avian::util;
 
+void avianSampleArmThread() __attribute__((weak));
+void avianSampleArmThread() {}
+
 namespace {
 
 class MutexResource {
@@ -98,6 +101,7 @@ void handleSignal(int signal, siginfo_t* info, void* context);
 
 void* run(void* r)
 {
+  avianSampleArmThread();
   static_cast<System::Runnable*>(r)->run();
   return 0;
 }
@@ -675,6 +679,7 @@ class MySystem : public System {
   {
     Thread* t = new (allocate(this, sizeof(Thread))) Thread(this, r);
     t->thread = pthread_self();
+    avianSampleArmThread();
     r->attach(t);
     return 0;
   }

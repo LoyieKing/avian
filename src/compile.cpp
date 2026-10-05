@@ -9,6 +9,17 @@
    details. */
 
 #include "avian/machine.h"
+
+namespace vm {
+void noteExclusiveSite(int site);
+}
+
+void avianSampleNote(const void* code, unsigned size, const char* label);
+void avianSampleNoteParts(const void* code,
+                          unsigned size,
+                          const char* class_,
+                          const char* name,
+                          const char* spec);
 #include "compile/rangeCheckElimination.h"
 #include "compile/objectStoreFacts.h"
 #include "avian/debug.h"
@@ -108,6 +119,14 @@ inline bool isVmInvokeUnsafeStack(void* ip)
 }
 
 class MyThread;
+
+// One word of class id, one word of compiled code. classId 0 is empty.
+// The code word is not a managed pointer; the cell lives off the heap.
+struct InterfaceCacheCell {
+  uint32_t classId;
+  uint32_t unused;
+  uintptr_t code;
+};
 
 void* getIp(MyThread*);
 
@@ -285,8 +304,12 @@ class MyThread : public Thread {
         referenceFrame(0),
         methodLockIsClean(true),
         allocationResult(0),
+        interfaceCallTarget(0),
         localHandles(0),
-        spareHandles(0)
+        spareHandles(0),
+        interfaceCache(0),
+        interfaceCacheLength(0),
+        interfaceSiteIndex(~static_cast<uintptr_t>(0))
   {
     arch->acquire();
   }
@@ -318,9 +341,19 @@ class MyThread : public Thread {
   // path store the object here; the continuation loads it. scratch holds
   // the vmInvoke native stack pointer for the whole Java call.
   uintptr_t allocationResult;
-  // After allocationResult so the checked MyThread offsets stay put.
+  // Resolved code pointer for an inlined invokeinterface. The hit path
+  // and the thunk both store here; the one stack call loads it.
+  // Past every assembler-checked MyThread offset, so those constants stay put.
+  uintptr_t interfaceCallTarget;
   LocalHandleBlock* localHandles;
   LocalHandleBlock* spareHandles;
+  // Per-thread monomorphic invokeinterface targets. Indexed by a site
+  // id baked into the caller. Not a GC root: class id and a code address.
+  InterfaceCacheCell* interfaceCache;
+  uintptr_t interfaceCacheLength;
+  // ~0 means the interface thunk should not record. A compiled miss
+  // stores its site id here for the duration of that one call.
+  uintptr_t interfaceSiteIndex;
 };
 
 void transition(MyThread* t,
@@ -843,6 +876,10 @@ class YoungObjectStoreSlowPath;
 
 class StringSlowPath;
 
+class DelegateSlowPath;
+
+class InterfaceEdge;
+
 class TraceElement : public avian::codegen::TraceHandler {
  public:
   static const unsigned VirtualCall = 1 << 0;
@@ -1257,6 +1294,10 @@ class Context {
         youngStoreSlowPathTail(0),
         stringSlowPaths(0),
         stringSlowPathTail(0),
+        delegateSlowPaths(0),
+        delegateSlowPathTail(0),
+        interfaceEdges(0),
+        interfaceEdgeTail(0),
         eventLog(t->m->system, t->m->heap, 1024),
         protector(this),
         resource(this),
@@ -1302,6 +1343,10 @@ class Context {
         youngStoreSlowPathTail(0),
         stringSlowPaths(0),
         stringSlowPathTail(0),
+        delegateSlowPaths(0),
+        delegateSlowPathTail(0),
+        interfaceEdges(0),
+        interfaceEdgeTail(0),
         eventLog(t->m->system, t->m->heap, 0),
         protector(this),
         resource(this),
@@ -1404,6 +1449,14 @@ class Context {
   // so restoring the edge does not attach the rest of the method.
   StringSlowPath* stringSlowPaths;
   StringSlowPath* stringSlowPathTail;
+  // Null-delegate invokevirtual forks. Flushed with the other side
+  // calls so restoring the edge does not attach the rest of the method.
+  DelegateSlowPath* delegateSlowPaths;
+  DelegateSlowPath* delegateSlowPathTail;
+  // invokeinterface itable walks. Edges are flushed after the method
+  // body so a side exit does not attach the rest of the method.
+  InterfaceEdge* interfaceEdges;
+  InterfaceEdge* interfaceEdgeTail;
   Vector eventLog;
   MyProtector protector;
   MyResource resource;
@@ -1475,6 +1528,8 @@ unsigned addDynamic(MyThread* t, GcInvocation* invocation)
                compileRoots(t)->dynamicThunks()->body().begin(),
                compileRoots(t)->dynamicThunks()->length() * BytesPerWord);
       }
+
+      vm::noteExclusiveSite(3);
 
       ENTER(t, Thread::ExclusiveState);
 
@@ -2648,16 +2703,72 @@ int64_t prepareMethodForCall(MyThread* t, GcMethod* target)
   }
 }
 
+static const uintptr_t kNoInterfaceSite = ~static_cast<uintptr_t>(0);
+
+void fillInterfaceCache(MyThread* t,
+                        uintptr_t site,
+                        object instance,
+                        uintptr_t code)
+{
+  if (code == 0 or unresolved(t, code) or code == nativeThunk(t)
+      or code == bootNativeThunk(t)) {
+    return;
+  }
+
+  GcClass* class_ = objectClass(t, instance);
+  PROTECT(t, class_);
+  uint32_t id = class_->runtimeDataIndex();
+  if (id == 0) {
+    getClassRuntimeData(t, class_);
+    id = class_->runtimeDataIndex();
+  }
+  if (id == 0 or site > 0x00ffffff) {
+    return;
+  }
+
+  uintptr_t need = site + 1;
+  if (t->interfaceCacheLength < need) {
+    uintptr_t cap = t->interfaceCacheLength ? t->interfaceCacheLength : 16;
+    while (cap < need) {
+      cap *= 2;
+    }
+    InterfaceCacheCell* grown = static_cast<InterfaceCacheCell*>(
+        realloc(t->interfaceCache, sizeof(InterfaceCacheCell) * cap));
+    if (grown == 0) {
+      abort(t);
+    }
+    memset(grown + t->interfaceCacheLength,
+           0,
+           sizeof(InterfaceCacheCell) * (cap - t->interfaceCacheLength));
+    t->interfaceCache = grown;
+    t->interfaceCacheLength = cap;
+  }
+
+  InterfaceCacheCell* cell = t->interfaceCache + site;
+  cell->code = code;
+  storeStoreMemoryBarrier();
+  cell->classId = id;
+}
+
 int64_t findInterfaceMethodFromInstance(MyThread* t,
                                         GcMethod* method,
                                         object instance)
 {
-  if (instance) {
-    return prepareMethodForCall(
-        t, findInterfaceMethod(t, method, objectClass(t, instance)));
-  } else {
+  uintptr_t site = t->interfaceSiteIndex;
+  t->interfaceSiteIndex = kNoInterfaceSite;
+
+  if (instance == 0) {
     throwNew(t, GcNullPointerException::Type);
   }
+
+  // prepareMethodForCall can compile, and that can move instance.
+  PROTECT(t, instance);
+  int64_t code = prepareMethodForCall(
+      t, findInterfaceMethod(t, method, objectClass(t, instance)));
+  if (site != kNoInterfaceSite) {
+    fillInterfaceCache(t, site, instance, static_cast<uintptr_t>(code));
+  }
+  return code;
 }
 
 int64_t findInterfaceMethodFromInstanceAndReference(MyThread* t,
@@ -3911,6 +4022,9 @@ void compileBackwardGotoSafePoint(MyThread* t,
 #include "compile/objectStore.cpp"
 #include "compile/trivialConstructor.cpp"
 #include "compile/stringIntrinsic.cpp"
+#include "compile/inlineDelegate.cpp"
+#include "compile/inlineLeaf.cpp"
+#include "compile/inlineInterface.cpp"
 #undef AVIAN_COMPILE_CPP_INCLUDE
 
 
@@ -6075,6 +6189,10 @@ loop:
       if (LIKELY(target)) {
         checkMethod(t, target, false);
 
+        if (InlineInterface::tryCompile(t, context, frame, target, ip)) {
+          break;
+        }
+
         argument = target;
         thunk = findInterfaceMethodFromInstanceThunk;
         parameterFootprint = target->parameterFootprint();
@@ -6139,8 +6257,17 @@ loop:
               t, frame, getMethodAddressThunk, target, tailCall);
         } else {
           // Keep target live if the inliner resolves fields and then
-          // falls back to the call.
+          // falls back to the call. The receiver's class is exact for
+          // this invokespecial, so a final override can fold a
+          // null-delegate adapter the same way invokevirtual does.
           PROTECT(t, target);
+          PROTECT(t, class_);
+          if (tryInlineExactDelegate(t, frame, target, class_)) {
+            break;
+          }
+          if (tryInlineGetter(t, frame, getterTarget(t, target, 0, true))) {
+            break;
+          }
           if (not tailCall
               and TrivialConstructor::tryCompile(t, frame, target, ip - 3)) {
             break;
@@ -6202,10 +6329,32 @@ loop:
 
       PROTECT(t, reference);
 
+      // Resolution replaces the pool slot with a MethodHandle, which
+      // does not keep the static owner. Read it first.
+      GcClass* staticClass = 0;
+      if (objectClass(t, reference) == type(t, GcReference::Type)) {
+        staticClass = resolveClassInObject(
+            t,
+            context->method->class_()->loader(),
+            reference,
+            ReferenceClass,
+            false);
+      }
+      PROTECT(t, staticClass);
+
       GcMethod* target = resolveMethod(t, context->method, index - 1, false);
 
       if (LIKELY(target)) {
         checkMethod(t, target, false);
+
+        if (tryInlineExactDelegate(t, frame, target, staticClass)) {
+          break;
+        }
+
+        if (tryInlineGetter(
+                t, frame, getterTarget(t, target, staticClass, false))) {
+          break;
+        }
 
         if (not intrinsic(t, frame, target)) {
           bool tailCall = isTailCall(t, code, ip, context->method, target);
@@ -8273,6 +8422,8 @@ void compile(MyThread* t, Context* context)
   InlineNew::flush(t, context);
   YoungObjectStore::flush(t, context);
   flushStringIntrinsics(t, context);
+  flushDelegateIntrinsics(t, context);
+  InlineInterface::flush(t, context);
 
   free(stackMap);
 }
@@ -10019,6 +10170,10 @@ class MyProcessor : public Processor {
                          0,
                          0,
                          0,
+                         0,
+                         0,
+                         0,
+                         0,
                          vtableLength);
   }
 
@@ -10242,6 +10397,11 @@ class MyProcessor : public Processor {
     MyThread* t = static_cast<MyThread*>(vmt);
 
     releaseLocalHandles(t);
+
+    if (t->interfaceCache) {
+      free(t->interfaceCache);
+      t->interfaceCache = 0;
+    }
 
     t->arch->release();
 
@@ -10657,6 +10817,8 @@ void logCompile(MyThread* t,
           stringOrNull(spec));
 
   MyProcessor* p = static_cast<MyProcessor*>(t->m->processor);
+
+  avianSampleNote(code, size, RUNTIME_ARRAY_BODY(completeName));
 
   if (p->jitDebug) {
     THREAD_RUNTIME_ARRAY(t, char, debugName, nameLength + 16);
@@ -11144,6 +11306,12 @@ void fixupMethods(Thread* t,
                        reinterpret_cast<char*>(method->name()->body().begin()),
                        reinterpret_cast<char*>(method->spec()->body().begin()));
           }
+          avianSampleNoteParts(
+              reinterpret_cast<void*>(methodCompiled(t, method)),
+              methodCompiledSize(t, method),
+              reinterpret_cast<char*>(method->class_()->name()->body().begin()),
+              reinterpret_cast<char*>(method->name()->body().begin()),
+              reinterpret_cast<char*>(method->spec()->body().begin()));
         }
       }
     }

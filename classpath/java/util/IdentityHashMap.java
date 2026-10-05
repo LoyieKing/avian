@@ -78,6 +78,10 @@ public class IdentityHashMap<K, V> implements Map<K, V> {
 
     public boolean equal(K a, K b) {
       return a == b;
-    }    
+    }
+
+    public boolean directCells() {
+      return false;
+    }
   }
 }

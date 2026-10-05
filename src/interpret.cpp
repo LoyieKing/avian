@@ -3573,6 +3573,10 @@ class MyProcessor : public Processor {
                          0,
                          0,
                          0,
+                         0,
+                         0,
+                         0,
+                         0,
                          0);
   }
 

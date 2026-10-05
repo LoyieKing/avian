@@ -40,15 +40,16 @@ public class StringBuilder implements CharSequence, Appendable {
     if (s == null) {
       return append("null");
     } else {
-      if (s.length() > 0) {
-        if (buffer != null && s.length() <= buffer.length - position) {
-          s.getChars(0, s.length(), buffer, position);
-          position += s.length();
+      int n = s.length();
+      if (n > 0) {
+        if (buffer != null && n <= buffer.length - position) {
+          s.getChars(0, n, buffer, position);
+          position += n;
         } else {
           flush();
           chain = new Cell(s, chain);
         }
-        length += s.length();
+        length += n;
       }
       return this;
     }
@@ -342,6 +343,22 @@ public class StringBuilder implements CharSequence, Appendable {
   }
 
   public String toString() {
+    if (position == 0 && length > 0 && chain != null) {
+      byte[] ascii = new byte[length];
+      int at = length;
+      boolean latin = true;
+      for (Cell c = chain; c != null; c = c.next) {
+        byte[] bytes = c.value.latin1();
+        int n = c.value.length();
+        if (bytes == null || at < n) {
+          latin = false;
+          break;
+        }
+        at -= n;
+        for (int i = 0; i < n; ++i) ascii[at + i] = bytes[i];
+      }
+      if (latin && at == 0) return String.fromAscii(ascii);
+    }
     char[] array = new char[length];
     getChars(0, length, array, 0);
     return new String(array, 0, length, false);

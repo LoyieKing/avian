@@ -224,23 +224,84 @@ bool tryStringCharAt(MyThread* t, Frame* frame)
       = c->load(ir::ExtendMode::Signed, charLen, ir::Type::iptr());
   ir::Value* notAscii
       = c->binaryOp(lir::Xor, ir::Type::iptr(), byteLen, charLenWide);
+  // Unmanaged ASCII stores a big-endian u16 byte count, then the bytes.
+  // A null header reads two bytes of the receiver and the mask drops them.
+  // Either the managed array or that header matching the char length is
+  // enough; multibyte payloads fail both and stay on the slow call.
+  ir::Value* header = c->load(
+      ir::ExtendMode::Signed,
+      c->memory(string, ir::Type::iptr(), StringUnsafe_data),
+      ir::Type::iptr());
+  ir::Value* headerPresent = stringPresentMask(c, header);
+  ir::Value* headerAbsent = c->binaryOp(
+      lir::Xor, ir::Type::iptr(), headerPresent, c->constant(-1, ir::Type::iptr()));
+  ir::Value* headerAddr = c->binaryOp(
+      lir::Or,
+      ir::Type::iptr(),
+      c->binaryOp(lir::And, ir::Type::iptr(), header, headerPresent),
+      c->binaryOp(lir::And, ir::Type::iptr(), string, headerAbsent));
+  ir::Value* lenHi = c->load(ir::ExtendMode::Signed,
+                             c->memory(headerAddr, ir::Type::i1(), 0),
+                             ir::Type::iptr());
+  ir::Value* lenLo = c->load(ir::ExtendMode::Signed,
+                             c->memory(headerAddr, ir::Type::i1(), 1),
+                             ir::Type::iptr());
+  ir::Value* hi = c->binaryOp(
+      lir::And, ir::Type::iptr(), lenHi, c->constant(0xff, ir::Type::iptr()));
+  ir::Value* lo = c->binaryOp(
+      lir::And, ir::Type::iptr(), lenLo, c->constant(0xff, ir::Type::iptr()));
+  ir::Value* headerRaw = c->binaryOp(
+      lir::Or,
+      ir::Type::iptr(),
+      c->binaryOp(lir::ShiftLeft,
+                  ir::Type::iptr(),
+                  c->constant(8, ir::Type::iptr()),
+                  hi),
+      lo);
+  ir::Value* headerLen
+      = c->binaryOp(lir::And, ir::Type::iptr(), headerRaw, headerPresent);
+  ir::Value* headerMismatch
+      = c->binaryOp(lir::Xor, ir::Type::iptr(), headerLen, charLenWide);
+  ir::Value* managedMiss = c->binaryOp(lir::Or, ir::Type::iptr(), absent, notAscii);
+  ir::Value* unmanagedMiss
+      = c->binaryOp(lir::Or, ir::Type::iptr(), headerAbsent, headerMismatch);
+  ir::Value* neither
+      = c->binaryOp(lir::And, ir::Type::iptr(), managedMiss, unmanagedMiss);
   ir::Value* blocked
-      = c->binaryOp(lir::Or, ir::Type::iptr(), notAscii, boundsWide);
+      = c->binaryOp(lir::Or, ir::Type::iptr(), neither, boundsWide);
   c->condJump(lir::JumpIfNotEqual, c->constant(0, ir::Type::iptr()), blocked, slow);
   Compiler::State* edge = c->saveState();
   c->startLogicalIp(fastIp);
 
   // Values above the jump have no site on this side. The receiver and
-  // the index are stack homes.
+  // the index are stack homes. Managed bytes sit at array body + index.
+  // Unmanaged bytes sit at header + 2 + index. The branch already
+  // proved exactly one of those bases is live.
   ir::Value* fastData
       = c->load(ir::ExtendMode::Signed,
                 c->memory(string, ir::Type::iptr(), StringData),
                 ir::Type::iptr());
+  ir::Value* fastHeader
+      = c->load(ir::ExtendMode::Signed,
+                c->memory(string, ir::Type::iptr(), StringUnsafe_data),
+                ir::Type::iptr());
+  ir::Value* fastPresent = stringPresentMask(c, fastData);
+  ir::Value* fastAbsent = c->binaryOp(
+      lir::Xor, ir::Type::iptr(), fastPresent, c->constant(-1, ir::Type::iptr()));
+  ir::Value* managedBase = c->binaryOp(
+      lir::Add, ir::Type::iptr(), c->constant(TargetArrayBody, ir::Type::iptr()), fastData);
+  ir::Value* unmanagedBase = c->binaryOp(
+      lir::Add, ir::Type::iptr(), c->constant(2, ir::Type::iptr()), fastHeader);
+  ir::Value* base = c->binaryOp(
+      lir::Or,
+      ir::Type::iptr(),
+      c->binaryOp(lir::And, ir::Type::iptr(), managedBase, fastPresent),
+      c->binaryOp(lir::And, ir::Type::iptr(), unmanagedBase, fastAbsent));
   // ASCII bytes are below 0x80, so a sign-extending load matches a
   // zero-extending one. moveZ has no 8-bit source on x86.
   ir::Value* ch = c->load(
       ir::ExtendMode::Signed,
-      c->memory(fastData, ir::Type::i1(), TargetArrayBody, index),
+      c->memory(base, ir::Type::i1(), 0, index),
       ir::Type::i4());
   c->store(ch,
            c->memory(c->threadRegister(), ir::Type::i4(), AllocationResultOffset));
@@ -498,3 +559,4 @@ unsigned appendStringSlowPathLines(MyThread* t UNUSED,
 #endif
   return count;
 }
+

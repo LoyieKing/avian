@@ -327,15 +327,19 @@ public final class Class <T>
   }
 
   public Field[] getDeclaredFields() {
+    Field[] cached = vmClass.cachedDeclaredFields;
+    if (cached != null) return cached.clone();
+    Field[] array;
     if (vmClass.fieldTable != null) {
-      Field[] array = new Field[vmClass.fieldTable.length];
+      array = new Field[vmClass.fieldTable.length];
       for (int i = 0; i < vmClass.fieldTable.length; ++i) {
         array[i] = new Field(vmClass.fieldTable[i]);
       }
-      return array;
     } else {
-      return new Field[0];
+      array = new Field[0];
     }
+    vmClass.cachedDeclaredFields = array;
+    return array.clone();
   }
 
   private int countPublicFields() {
@@ -351,6 +355,8 @@ public final class Class <T>
   }
 
   public Field[] getFields() {
+    Field[] cached = vmClass.cachedPublicFields;
+    if (cached != null) return cached.clone();
     Field[] array = new Field[countPublicFields()];
     if (vmClass.fieldTable != null) {
       Classes.link(vmClass);
@@ -362,7 +368,8 @@ public final class Class <T>
         }
       }
     }
-    return array;
+    vmClass.cachedPublicFields = array;
+    return array.clone();
   }
 
   private static void getAllFields(VMClass vmClass, ArrayList<Field> fields) {

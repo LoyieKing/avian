@@ -2238,6 +2238,25 @@ class Client : public Assembler::Client {
   Context* c;
 };
 
+class StraightPredecessor : public Compiler::State {
+ public:
+  StraightPredecessor(Stack* stack,
+                      Local* locals,
+                      Event* predecessor,
+                      unsigned logicalIp)
+      : stack(stack),
+        locals(locals),
+        predecessor(predecessor),
+        logicalIp(logicalIp)
+  {
+  }
+
+  Stack* stack;
+  Local* locals;
+  Event* predecessor;
+  unsigned logicalIp;
+};
+
 class MyCompiler : public Compiler {
  public:
   MyCompiler(System* s,
@@ -2359,6 +2378,28 @@ class MyCompiler : public Compiler {
         LogicalInstruction(logicalIp, c.stack, c.locals);
 
     c.logicalIp = logicalIp;
+  }
+
+  virtual void detachPredecessor()
+  {
+    c.predecessor = 0;
+    c.forkState = 0;
+  }
+
+  virtual State* capturePredecessor()
+  {
+    return new (c.zone) StraightPredecessor(
+        c.stack, c.locals, c.predecessor, c.logicalIp);
+  }
+
+  virtual void restorePredecessor(State* state)
+  {
+    StraightPredecessor* saved = static_cast<StraightPredecessor*>(state);
+    c.stack = saved->stack;
+    c.locals = saved->locals;
+    c.predecessor = saved->predecessor;
+    c.logicalIp = saved->logicalIp;
+    c.forkState = 0;
   }
 
   virtual Promise* machineIp(unsigned logicalIp)

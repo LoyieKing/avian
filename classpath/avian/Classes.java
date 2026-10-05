@@ -491,6 +491,10 @@ public class Classes {
   }
 
   public static Method[] getMethods(VMClass vmClass, boolean publicOnly) {
+    Method[] cached = publicOnly ? vmClass.cachedPublicMethods : vmClass.cachedDeclaredMethods;
+    if (cached != null) {
+      return cached.clone();
+    }
     Method[] array = new Method[countMethods(vmClass, publicOnly)];
     VMMethod[] methodTable = vmClass.methodTable;
     if (methodTable != null) {
@@ -507,7 +511,9 @@ public class Classes {
       }
     }
 
-    return array;
+    if (publicOnly) vmClass.cachedPublicMethods = array;
+    else vmClass.cachedDeclaredMethods = array;
+    return array.clone();
   }
 
   public static int countFields(VMClass vmClass, boolean publicOnly) {

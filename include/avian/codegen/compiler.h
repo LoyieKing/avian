@@ -98,6 +98,14 @@ class Compiler {
 
   virtual void visitLogicalIp(unsigned logicalIp) = 0;
   virtual void startLogicalIp(unsigned logicalIp) = 0;
+  // An unconditional jump stays a predecessor until the next append, which
+  // would add a second successor. Call this after the jump is linked to its
+  // real target.
+  virtual void detachPredecessor() = 0;
+  // Remember the current predecessor without forking value reads. Restoring
+  // it links a later event as an ordinary successor.
+  virtual State* capturePredecessor() = 0;
+  virtual void restorePredecessor(State* state) = 0;
 
   virtual Promise* machineIp(unsigned logicalIp) = 0;
 

@@ -139,5 +139,9 @@ public class WeakHashMap<K, V> implements Map<K, V> {
     public HashMap.Cell<K, V> make(K key, V value, HashMap.Cell<K, V> next) {
       return new MyCell(key, queue, value, next, hash(key));
     }
+
+    public boolean directCells() {
+      return false;
+    }
   }
 }

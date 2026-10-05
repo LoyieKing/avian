@@ -20,12 +20,15 @@ public class HashMap<K, V> implements Map<K, V> {
   private int size;
   private Cell[] array;
   private final Helper helper;
+  // Cached so get/put do not interface-call the helper on every probe.
+  private final boolean plain;
 
   public HashMap(int capacity, Helper<K, V> helper) {
     if (capacity > 0) {
       array = new Cell[Data.nextPowerOfTwo(capacity)];
     }
     this.helper = helper;
+    this.plain = helper != null && helper.directCells();
   }
 
   public HashMap(int capacity) {
@@ -92,15 +95,29 @@ public class HashMap<K, V> implements Map<K, V> {
   }
 
   protected Cell<K, V> find(Object key) {
-    if (array != null) {
-      int index = helper.hash(key) & (array.length - 1);
-      for (Cell<K, V> c = array[index]; c != null; c = c.next()) {
-        if (helper.equal(key, c.getKey())) {
-          return c;
-        }
+    if (array == null) return null;
+    if (plain) return findPlain(key);
+    int index = helper.hash(key) & (array.length - 1);
+    for (Cell<K, V> c = array[index]; c != null; c = c.next()) {
+      if (helper.equal(key, c.getKey())) {
+        return c;
       }
     }
+    return null;
+  }
 
+  // MyCell fields, no per-step interface calls. Only for helpers that
+  // did not override hash or equality and whose cells are MyCells.
+  private MyCell<K, V> findPlain(Object key) {
+    int hash = key == null ? 0 : key.hashCode();
+    int index = hash & (array.length - 1);
+    for (MyCell<K, V> c = (MyCell<K, V>) array[index]; c != null;
+         c = (MyCell<K, V>) c.next) {
+      if (c.hashCode == hash) {
+        K stored = c.key;
+        if (stored == key || (key != null && key.equals(stored))) return c;
+      }
+    }
     return null;
   }
 
@@ -112,7 +129,14 @@ public class HashMap<K, V> implements Map<K, V> {
     int index = cell.hashCode() & (array.length - 1);
     cell.setNext(array[index]);
     array[index] = cell;
+    afterInsert(cell);
   }
+
+  protected void afterInsert(Cell<K, V> cell) { }
+
+  protected void afterRemove(Cell<K, V> cell) { }
+
+  protected void afterClear() { }
 
   public void remove(Cell<K, V> cell) {
     int index = cell.hashCode() & (array.length - 1);
@@ -125,6 +149,7 @@ public class HashMap<K, V> implements Map<K, V> {
           p.setNext(c.next());
         }
         -- size;
+        afterRemove(cell);
         break;
       }
     }
@@ -161,6 +186,10 @@ public class HashMap<K, V> implements Map<K, V> {
   }
 
   public V get(Object key) {
+    if (plain && array != null) {
+      MyCell<K, V> plain = findPlain(key);
+      return plain == null ? null : plain.value;
+    }
     Cell<K, V> c = find(key);
     return (c == null ? null : c.getValue());
   }
@@ -179,6 +208,7 @@ public class HashMap<K, V> implements Map<K, V> {
             p.setNext(c.next());
           }
           -- size;
+          afterRemove(old);
           break;
         }
         p = c;
@@ -190,6 +220,16 @@ public class HashMap<K, V> implements Map<K, V> {
   }
 
   public V put(K key, V value) {
+    if (plain) {
+      MyCell<K, V> plain = array == null ? null : findPlain(key);
+      if (plain == null) {
+        insert(helper.make(key, value, null));
+        return null;
+      }
+      V old = plain.value;
+      plain.value = value;
+      return old;
+    }
     Cell<K, V> c = find(key);
     if (c == null) {
       insert(helper.make(key, value, null));
@@ -215,6 +255,7 @@ public class HashMap<K, V> implements Map<K, V> {
   public void clear() {
     array = null;
     size = 0;
+    afterClear();
   }
 
   public Set<Entry<K, V>> entrySet() {
@@ -271,9 +312,12 @@ public class HashMap<K, V> implements Map<K, V> {
     public int hash(K key);
 
     public boolean equal(K a, K b);
+
+    // True when make() returns a MyCell and hash/equal are the defaults.
+    public boolean directCells();
   }
 
-  private static class MyCell<K, V> implements Cell<K, V> {
+  static class MyCell<K, V> implements Cell<K, V> {
     public final K key;
     public V value;
     public Cell<K, V> next;
@@ -324,6 +368,10 @@ public class HashMap<K, V> implements Map<K, V> {
 
     public boolean equal(K a, K b) {
       return (a == null && b == null) || (a != null && a.equals(b));
+    }
+
+    public boolean directCells() {
+      return true;
     }
   }
 
@@ -381,6 +429,7 @@ public class HashMap<K, V> implements Map<K, V> {
             previousCell = null;
           }
         }
+        afterRemove(currentCell);
         currentCell = null;
         -- size;
       } else {

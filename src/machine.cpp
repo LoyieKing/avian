@@ -22,7 +22,12 @@
 #include <avian/util/math.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <time.h>
+#if !defined(PLATFORM_WINDOWS)
+#include <unistd.h>
+#endif
 
 #if defined(PLATFORM_WINDOWS)
 #define WIN32_LEAN_AND_MEAN
@@ -37,12 +42,13 @@ extern unsigned gcTracePhase;
 // Set around one Visitor::visit. The collector copies that referent
 // and does not push it, so its fields stay untraced.
 extern bool gcCopyShallow;
+void allocHistNote(uintptr_t* start, uintptr_t* end);
+void noteExclusiveSite(int site);
 }
 
 namespace {
 
 const bool DebugClassReader = false;
-
 
 void join(Thread* t, Thread* o)
 {
@@ -360,6 +366,9 @@ bool tlabInstall(Thread* t, unsigned chunkWords)
   }
 
   tlabRetireAccounting(t);
+  if (t->heap != 0 and t->heapTop > t->heap) {
+    vm::allocHistNote(t->heap, t->heapTop);
+  }
 
   t->heap = payload;
   t->heapTop = payload;
@@ -384,6 +393,7 @@ bool tlabAllocateOutside(Thread* t, unsigned words, object* result)
 
   memset(payload, 0, words * BytesPerWord);
   *result = reinterpret_cast<object>(payload);
+  vm::allocHistNote(payload, payload + words);
   return true;
 }
 
@@ -3120,6 +3130,7 @@ void updateBootstrapClass(Thread* t, GcClass* bootstrapClass, GcClass* class_)
   PROTECT(t, bootstrapClass);
   PROTECT(t, class_);
 
+  vm::noteExclusiveSite(2);
   ENTER(t, Thread::ExclusiveState);
 
   bootstrapClass->vmFlags() &= ~BootstrapFlag;
@@ -3334,6 +3345,8 @@ void removeMonitor(Thread* t, object o)
     hash = objectHash(t, o);
   }
 
+  // Exclusive collection. Mutators of this map are at a safepoint, or this
+  // thread already holds referenceLock around the insert that triggered GC.
   object m
       = hashMapRemove(t, roots(t)->monitorMap(), o, objectHash, objectEqual);
 
@@ -4071,6 +4084,8 @@ void updatePackageMap(Thread* t, GcClass* class_)
 
 namespace vm {
 
+void noteExclusiveSite(int site);
+
 namespace {
 
 inline unsigned trailingZeros(uintptr_t value)
@@ -4091,6 +4106,144 @@ inline bool fullMask(uintptr_t mask)
 {
   return mask == ~uintptr_t(0);
 }
+
+}  // namespace
+
+namespace {
+
+enum {
+  ExclMonitor = 0,
+  ExclCollect = 1,
+  ExclBootstrap = 2,
+  ExclDynamic = 3,
+  ExclExit = 4,
+  ExclCount = 5
+};
+
+enum {
+  WaitExclBusy = 0,
+  WaitExclDrain = 1,
+  WaitActive = 2,
+  WaitAlloc = 3,
+  WaitClass = 4,
+  WaitFinalize = 5,
+  WaitExit = 6,
+  WaitShutdown = 7,
+  WaitCount = 8
+};
+
+uint64_t exclN[ExclCount];
+uint64_t waitN[WaitCount];
+uint64_t waitNs[WaitCount];
+uint64_t monitorHits;
+uint64_t monitorCreates;
+uint64_t siteLastDumpNs;
+
+uint64_t siteMonoNs()
+{
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull
+         + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+void dumpSites()
+{
+#if !defined(PLATFORM_WINDOWS)
+  uint64_t en[ExclCount];
+  uint64_t wn[WaitCount];
+  uint64_t ws[WaitCount];
+  for (int i = 0; i < ExclCount; ++i) {
+    en[i] = __atomic_load_n(&exclN[i], __ATOMIC_RELAXED);
+  }
+  for (int i = 0; i < WaitCount; ++i) {
+    wn[i] = __atomic_load_n(&waitN[i], __ATOMIC_RELAXED);
+    ws[i] = __atomic_load_n(&waitNs[i], __ATOMIC_RELAXED);
+  }
+  uint64_t hits = __atomic_load_n(&monitorHits, __ATOMIC_RELAXED);
+  uint64_t creates = __atomic_load_n(&monitorCreates, __ATOMIC_RELAXED);
+  char buf[640];
+  int n = ::snprintf(
+      buf,
+      sizeof(buf),
+      "[avian] excl mon=%llu col=%llu boot=%llu dyn=%llu exit=%llu "
+      "hits=%llu creates=%llu "
+      "wait busy=%llu/%llums drain=%llu/%llums active=%llu/%llums "
+      "alloc=%llu/%llums class=%llu/%llums fin=%llu/%llums "
+      "exitw=%llu/%llums shut=%llu/%llums\n",
+      static_cast<unsigned long long>(en[ExclMonitor]),
+      static_cast<unsigned long long>(en[ExclCollect]),
+      static_cast<unsigned long long>(en[ExclBootstrap]),
+      static_cast<unsigned long long>(en[ExclDynamic]),
+      static_cast<unsigned long long>(en[ExclExit]),
+      static_cast<unsigned long long>(hits),
+      static_cast<unsigned long long>(creates),
+      static_cast<unsigned long long>(wn[WaitExclBusy]),
+      static_cast<unsigned long long>(ws[WaitExclBusy] / 1000000ull),
+      static_cast<unsigned long long>(wn[WaitExclDrain]),
+      static_cast<unsigned long long>(ws[WaitExclDrain] / 1000000ull),
+      static_cast<unsigned long long>(wn[WaitActive]),
+      static_cast<unsigned long long>(ws[WaitActive] / 1000000ull),
+      static_cast<unsigned long long>(wn[WaitAlloc]),
+      static_cast<unsigned long long>(ws[WaitAlloc] / 1000000ull),
+      static_cast<unsigned long long>(wn[WaitClass]),
+      static_cast<unsigned long long>(ws[WaitClass] / 1000000ull),
+      static_cast<unsigned long long>(wn[WaitFinalize]),
+      static_cast<unsigned long long>(ws[WaitFinalize] / 1000000ull),
+      static_cast<unsigned long long>(wn[WaitExit]),
+      static_cast<unsigned long long>(ws[WaitExit] / 1000000ull),
+      static_cast<unsigned long long>(wn[WaitShutdown]),
+      static_cast<unsigned long long>(ws[WaitShutdown] / 1000000ull));
+  if (n > 0) {
+    if (n > static_cast<int>(sizeof(buf))) {
+      n = static_cast<int>(sizeof(buf));
+    }
+    ::write(2, buf, static_cast<size_t>(n));
+  }
+#endif
+}
+
+void maybeDumpSites()
+{
+  uint64_t now = siteMonoNs();
+  uint64_t prev = __atomic_load_n(&siteLastDumpNs, __ATOMIC_RELAXED);
+  if (now - prev < 300000000ull) {
+    return;
+  }
+  if (not __atomic_compare_exchange_n(&siteLastDumpNs,
+                                      &prev,
+                                      now,
+                                      false,
+                                      __ATOMIC_RELAXED,
+                                      __ATOMIC_RELAXED)) {
+    return;
+  }
+  dumpSites();
+}
+
+void accountExclusive(int site)
+{
+  if (static_cast<unsigned>(site) < ExclCount) {
+    __atomic_fetch_add(&exclN[site], 1, __ATOMIC_RELAXED);
+  }
+  maybeDumpSites();
+}
+
+void accountWait(int site, uint64_t ns)
+{
+  if (static_cast<unsigned>(site) < WaitCount) {
+    __atomic_fetch_add(&waitN[site], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&waitNs[site], ns, __ATOMIC_RELAXED);
+  }
+  maybeDumpSites();
+}
+
+#define TIME_WAIT(site, call)                \
+  do {                                       \
+    uint64_t t0_ = siteMonoNs();             \
+    call;                                    \
+    accountWait((site), siteMonoNs() - t0_); \
+  } while (0)
 
 }  // namespace
 
@@ -4724,6 +4877,7 @@ void Thread::init()
 void Thread::exit()
 {
   if (state != Thread::ExitState and state != Thread::ZombieState) {
+    noteExclusiveSite(4);
     enter(this, Thread::ExclusiveState);
 
     if (m->liveCount == 1) {
@@ -4787,7 +4941,7 @@ void shutDown(Thread* t)
           break;
         } else {
           ENTER(t, Thread::IdleState);
-          t->m->stateLock->wait(t->systemThread, 0);
+          TIME_WAIT(WaitShutdown, t->m->stateLock->wait(t->systemThread, 0));
         }
       }
     }
@@ -4804,7 +4958,7 @@ void shutDown(Thread* t)
       while (finalizeThread->state != Thread::ZombieState
              and finalizeThread->state != Thread::JoinedState) {
         ENTER(t, Thread::IdleState);
-        t->m->stateLock->wait(t->systemThread, 0);
+        TIME_WAIT(WaitShutdown, t->m->stateLock->wait(t->systemThread, 0));
       }
     }
   }
@@ -4846,6 +5000,11 @@ bool otherThreadRunning(Thread* self, Thread* node)
 
 }  // namespace
 
+void noteExclusiveSite(int site)
+{
+  accountExclusive(site);
+}
+
 void enter(Thread* t, Thread::State s)
 {
   stress(t);
@@ -4875,7 +5034,7 @@ void enter(Thread* t, Thread::State s)
     while (loadExclusive(t->m)) {
       // another thread got here first.
       ENTER(t, Thread::IdleState);
-      t->m->stateLock->wait(t->systemThread, 0);
+      TIME_WAIT(WaitExclBusy, t->m->stateLock->wait(t->systemThread, 0));
     }
 
     switch (t->state) {
@@ -4893,7 +5052,7 @@ void enter(Thread* t, Thread::State s)
     STORE_LOAD_MEMORY_BARRIER;
 
     while (t->m->rootThread and otherThreadRunning(t, t->m->rootThread)) {
-      t->m->stateLock->wait(t->systemThread, 0);
+      TIME_WAIT(WaitExclDrain, t->m->stateLock->wait(t->systemThread, 0));
     }
   } break;
 
@@ -4991,7 +5150,7 @@ void enter(Thread* t, Thread::State s)
       case Thread::IdleState: {
         Thread::State state = loadState(t);
         while (loadExclusive(t->m)) {
-          t->m->stateLock->wait(t->systemThread, 0);
+          TIME_WAIT(WaitActive, t->m->stateLock->wait(t->systemThread, 0));
         }
 
         if (state == Thread::NoState) {
@@ -5028,7 +5187,7 @@ void enter(Thread* t, Thread::State s)
     storeState(t, s);
 
     while (t->m->liveCount - t->m->daemonCount > 1) {
-      t->m->stateLock->wait(t->systemThread, 0);
+      TIME_WAIT(WaitExit, t->m->stateLock->wait(t->systemThread, 0));
     }
   } break;
 
@@ -5101,7 +5260,7 @@ object allocate3(Thread* t,
     ENTER(t, Thread::IdleState);
 
     while (loadExclusive(t->m)) {
-      t->m->stateLock->wait(t->systemThread, 0);
+      TIME_WAIT(WaitAlloc, t->m->stateLock->wait(t->systemThread, 0));
     }
   }
 
@@ -5170,6 +5329,157 @@ object allocate3(Thread* t,
   }
 }
 
+// One-shot class histogram of bytes sitting in live TLABs. Enabled with
+// AVIAN_ALLOC_HIST=1. The scored run leaves it off.
+struct AllocHistSlot {
+  GcClass* class_;
+  uint64_t count;
+  uint64_t bytes;
+};
+
+struct AllocHistRange {
+  uintptr_t* start;
+  uintptr_t* end;
+  AllocHistRange* next;
+};
+
+AllocHistRange* allocHistRanges = 0;
+int allocHistDumped = 0;
+
+bool allocHistOn()
+{
+  static int on = -1;
+  if (on < 0) {
+    const char* enable = getenv("AVIAN_ALLOC_HIST");
+    on = (enable != 0 and enable[0] == '1' and enable[1] == 0) ? 1 : 0;
+  }
+  return on == 1;
+}
+
+void allocHistAdd(AllocHistSlot* table, unsigned slots, GcClass* class_, unsigned bytes)
+{
+  uintptr_t key = reinterpret_cast<uintptr_t>(class_);
+  unsigned mask = slots - 1;
+  unsigned index = static_cast<unsigned>(key >> 4) & mask;
+  for (unsigned step = 0; step < 16; ++step) {
+    AllocHistSlot* slot = table + ((index + step) & mask);
+    if (slot->class_ == 0 or slot->class_ == class_) {
+      slot->class_ = class_;
+      slot->count += 1;
+      slot->bytes += bytes;
+      return;
+    }
+  }
+}
+
+void allocHistNote(uintptr_t* start, uintptr_t* end)
+{
+  if (allocHistDumped or start == 0 or end <= start or not allocHistOn()) {
+    return;
+  }
+  AllocHistRange* range = static_cast<AllocHistRange*>(std::malloc(sizeof(AllocHistRange)));
+  if (range == 0) {
+    return;
+  }
+  range->start = start;
+  range->end = end;
+  AllocHistRange* head;
+  do {
+    head = allocHistRanges;
+    range->next = head;
+  } while (not __sync_bool_compare_and_swap(&allocHistRanges, head, range));
+}
+
+void allocHistWalkRange(Thread* t,
+                        uintptr_t* cursor,
+                        uintptr_t* end,
+                        AllocHistSlot* table,
+                        unsigned slots,
+                        uint64_t* objs,
+                        uint64_t* bytes)
+{
+  while (cursor < end) {
+    object o = reinterpret_cast<object>(cursor);
+    GcClass* class_ = objectClass(t, o);
+    if (class_ == 0) {
+      break;
+    }
+    unsigned words = baseSize(t, o, class_);
+    if (words == 0 or cursor + words > end) {
+      break;
+    }
+    allocHistAdd(table, slots, class_, words * BytesPerWord);
+    *objs += 1;
+    *bytes += static_cast<uint64_t>(words) * BytesPerWord;
+    cursor += words;
+  }
+}
+
+void allocHistWalkCurrent(Thread* t, AllocHistSlot* table, unsigned slots, uint64_t* objs, uint64_t* bytes)
+{
+  if (t->heap != 0 and t->heapTop > t->heap) {
+    allocHistWalkRange(t, t->heap, t->heapTop, table, slots, objs, bytes);
+  }
+  for (Thread* child = t->child; child != 0; child = child->peer) {
+    allocHistWalkCurrent(child, table, slots, objs, bytes);
+  }
+}
+
+int allocHistCompare(const void* a, const void* b)
+{
+  const AllocHistSlot* left = static_cast<const AllocHistSlot*>(a);
+  const AllocHistSlot* right = static_cast<const AllocHistSlot*>(b);
+  if (left->bytes < right->bytes) {
+    return 1;
+  }
+  if (left->bytes > right->bytes) {
+    return -1;
+  }
+  return 0;
+}
+
+void allocHistDump(Thread* t)
+{
+  if (allocHistDumped or not allocHistOn()) {
+    return;
+  }
+  allocHistDumped = 1;
+
+  const unsigned slots = 4096;
+  AllocHistSlot* table = static_cast<AllocHistSlot*>(
+      std::calloc(slots, sizeof(AllocHistSlot)));
+  if (table == 0) {
+    return;
+  }
+  uint64_t objs = 0;
+  uint64_t bytes = 0;
+  for (AllocHistRange* range = allocHistRanges; range != 0; range = range->next) {
+    allocHistWalkRange(t, range->start, range->end, table, slots, &objs, &bytes);
+  }
+  allocHistWalkCurrent(t->m->rootThread, table, slots, &objs, &bytes);
+  std::qsort(table, slots, sizeof(AllocHistSlot), allocHistCompare);
+  fprintf(stderr,
+          "[avian] alloc hist objs=%llu bytes=%llu\n",
+          static_cast<unsigned long long>(objs),
+          static_cast<unsigned long long>(bytes));
+  unsigned shown = 0;
+  for (unsigned i = 0; i < slots and shown < 25; ++i) {
+    if (table[i].class_ == 0 or table[i].bytes == 0) {
+      break;
+    }
+    GcByteArray* name = table[i].class_->name();
+    const char* text = name ? reinterpret_cast<const char*>(name->body().begin()) : "?";
+    fprintf(stderr,
+            "[avian] alloc %s count=%llu bytes=%llu\n",
+            text,
+            static_cast<unsigned long long>(table[i].count),
+            static_cast<unsigned long long>(table[i].bytes));
+    ++shown;
+  }
+  std::free(table);
+  std::fflush(stderr);
+}
+
 void logGc(Thread* t,
            Heap::CollectionType type,
            uint64_t edenUsed,
@@ -5202,6 +5512,7 @@ void logGc(Thread* t,
           gcMajorCount,
           static_cast<unsigned long long>(gcYoungBytes),
           gcTraceWorkers());
+  dumpSites();
 }
 
 void collect(Thread* t, Heap::CollectionType type, int pendingAllocation)
@@ -5209,7 +5520,10 @@ void collect(Thread* t, Heap::CollectionType type, int pendingAllocation)
   uint64_t edenUsed = edenUsedBytes(t->m);
   int64_t started = t->m->system->now();
 
+  noteExclusiveSite(ExclCollect);
   ENTER(t, Thread::ExclusiveState);
+
+  allocHistDump(t);
 
   if (t->m->heap->limitExceeded(pendingAllocation)) {
     type = Heap::MajorCollection;
@@ -5689,6 +6003,10 @@ GcClass* parseClass(Thread* t,
       0,  // source
       0,  // serializeThunk
       0,  // deserializeThunk
+      0,  // cachedDeclaredMethods
+      0,  // cachedPublicMethods
+      0,  // cachedDeclaredFields
+      0,  // cachedPublicFields
       0);  // vtable length
   PROTECT(t, class_);
 
@@ -6193,7 +6511,7 @@ bool preInitClass(Thread* t, GcClass* c)
         noteClinitWait(c);
         while (c->vmFlags() & InitFlag) {
           ENTER(t, Thread::IdleState);
-          t->m->classLock->wait(t->systemThread, 0);
+          TIME_WAIT(WaitClass, t->m->classLock->wait(t->systemThread, 0));
         }
       } else if (c->vmFlags() & InitErrorFlag) {
         throwNew(
@@ -6431,43 +6749,38 @@ GcMonitor* objectMonitor(Thread* t, object o, bool createNew)
 {
   assertT(t, t->state == Thread::ActiveState);
 
+  // The monitor map used to be published inside a global safepoint. Every
+  // first lock of an object stopped the other workers. referenceLock is the
+  // same lock intern() uses for its weak map: mutators exclude each other,
+  // and a collection excludes them by waiting until they reach a safepoint.
+  PROTECT(t, o);
+
+  ACQUIRE(t, t->m->referenceLock);
+
   object m = hashMapFind(t, roots(t)->monitorMap(), o, objectHash, objectEqual);
 
   if (m) {
+    __atomic_fetch_add(&monitorHits, 1, __ATOMIC_RELAXED);
     if (DebugMonitors) {
       fprintf(stderr, "found monitor %p for object %x\n", m, objectHash(t, o));
     }
 
     return cast<GcMonitor>(t, m);
   } else if (createNew) {
-    PROTECT(t, o);
     PROTECT(t, m);
 
-    {
-      ENTER(t, Thread::ExclusiveState);
+    __atomic_fetch_add(&monitorCreates, 1, __ATOMIC_RELAXED);
 
-      m = hashMapFind(t, roots(t)->monitorMap(), o, objectHash, objectEqual);
+    object head = makeMonitorNode(t, 0, 0);
+    m = makeMonitor(t, 0, 0, 0, head, head, 0);
 
-      if (m) {
-        if (DebugMonitors) {
-          fprintf(
-              stderr, "found monitor %p for object %x\n", m, objectHash(t, o));
-        }
-
-        return cast<GcMonitor>(t, m);
-      }
-
-      object head = makeMonitorNode(t, 0, 0);
-      m = makeMonitor(t, 0, 0, 0, head, head, 0);
-
-      if (DebugMonitors) {
-        fprintf(stderr, "made monitor %p for object %x\n", m, objectHash(t, o));
-      }
-
-      hashMapInsert(t, roots(t)->monitorMap(), o, m, objectHash);
-
-      addFinalizer(t, o, removeMonitor);
+    if (DebugMonitors) {
+      fprintf(stderr, "made monitor %p for object %x\n", m, objectHash(t, o));
     }
+
+    hashMapInsert(t, roots(t)->monitorMap(), o, m, objectHash);
+
+    addFinalizer(t, o, removeMonitor);
 
     return cast<GcMonitor>(t, m);
   } else {
@@ -6766,7 +7079,7 @@ void runFinalizeThread(Thread* t)
       while (t->m->finalizeThread and roots(t)->objectsToFinalize() == 0
              and roots(t)->objectsToClean() == 0) {
         ENTER(t, Thread::IdleState);
-        t->m->stateLock->wait(t->systemThread, 0);
+        TIME_WAIT(WaitFinalize, t->m->stateLock->wait(t->systemThread, 0));
       }
 
       if (t->m->finalizeThread == 0) {

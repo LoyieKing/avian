@@ -979,6 +979,13 @@ struct JNIEnvVTable {
   void(JNICALL* ReleaseReadOnlyUnmanagedStringUtfChars)(JNIEnv*,
                                                        jstring,
                                                        const char*);
+
+  // One String[] from u2-prefixed Modified UTF-8 headers. A null header
+  // leaves a null slot. Strings are unmanaged and alias the headers.
+  // The array itself is managed. One VM entry for the whole array.
+  jobjectArray(JNICALL* NewReadOnlyUnmanagedStringArray)(JNIEnv*,
+                                                        const void* const*,
+                                                        jsize);
 };
 
 // Slots past GetModule. include/avian/jni.h uses the same indexes.
@@ -995,7 +1002,8 @@ enum {
   AvianJniNewReadOnlyUnmanagedStringFromMutf8 = 243,
   AvianJniNewReadOnlyUnmanagedStringFromUnmanagedMutf8 = 244,
   AvianJniGetReadOnlyUnmanagedStringUtfChars = 245,
-  AvianJniReleaseReadOnlyUnmanagedStringUtfChars = 246
+  AvianJniReleaseReadOnlyUnmanagedStringUtfChars = 246,
+  AvianJniNewReadOnlyUnmanagedStringArray = 247
 };
 
 inline void atomicOr(uint32_t* p, int v)

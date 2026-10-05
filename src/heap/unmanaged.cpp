@@ -418,6 +418,56 @@ struct Tracked {
 
 Tracked* dirtyHead = 0;
 
+// One list per mutator. A global Treiber stack made every class-graph
+// object bounce the same cache line across the worker threads.
+struct TlsDirty {
+  Tracked* list;
+  TlsDirty* next;
+};
+
+TlsDirty* dirtyPubs = 0;
+__thread TlsDirty* dirtyMine = 0;
+__thread Tracked* trackSlab = 0;
+__thread Tracked* trackSlabEnd = 0;
+
+void ensureDirtyMine()
+{
+  if (dirtyMine != 0) {
+    return;
+  }
+  TlsDirty* created = static_cast<TlsDirty*>(malloc(sizeof(TlsDirty)));
+  if (created == 0) {
+    fprintf(stderr, "[avian] unmanaged track list\n");
+    ::abort();
+  }
+  created->list = 0;
+  TlsDirty* old = __atomic_load_n(&dirtyPubs, __ATOMIC_ACQUIRE);
+  do {
+    created->next = old;
+  } while (not __atomic_compare_exchange_n(&dirtyPubs,
+                                           &old,
+                                           created,
+                                           true,
+                                           __ATOMIC_RELEASE,
+                                           __ATOMIC_ACQUIRE));
+  dirtyMine = created;
+}
+
+Tracked* newTracked()
+{
+  if (trackSlab == trackSlabEnd) {
+    const size_t count = 1024;
+    Tracked* slab = static_cast<Tracked*>(malloc(count * sizeof(Tracked)));
+    if (slab == 0) {
+      fprintf(stderr, "[avian] unmanaged track slab\n");
+      ::abort();
+    }
+    trackSlab = slab;
+    trackSlabEnd = slab + count;
+  }
+  return trackSlab++;
+}
+
 void dirtyPush(Tracked* node)
 {
   // onDirty is 1 exactly while the node is linked. A second store while
@@ -425,15 +475,9 @@ void dirtyPush(Tracked* node)
   if (__atomic_exchange_n(&node->onDirty, 1u, __ATOMIC_ACQ_REL) != 0) {
     return;
   }
-  Tracked* old = __atomic_load_n(&dirtyHead, __ATOMIC_ACQUIRE);
-  do {
-    node->dirtyNext = old;
-  } while (not __atomic_compare_exchange_n(&dirtyHead,
-                                           &old,
-                                           node,
-                                           true,
-                                           __ATOMIC_RELEASE,
-                                           __ATOMIC_ACQUIRE));
+  ensureDirtyMine();
+  node->dirtyNext = dirtyMine->list;
+  dirtyMine->list = node;
 }
 
 }  // namespace
@@ -540,6 +584,33 @@ void* unmanagedAllocate(size_t bytes)
   if (bytes == 0) {
     return 0;
   }
+  // Class-graph strings and member shells are a few dozen bytes. mallocx
+  // with TCACHE_NONE takes the arena lock for each one. A thread-local
+  // chunk from that allocator is still zero-filled and tagged; objects
+  // are slices and are never freed.
+  const size_t bumpLimit = 8192;
+  const size_t chunkBytes = 64 * 1024;
+  if (bytes <= bumpLimit) {
+    size_t aligned = (bytes + 15) & ~size_t(15);
+    static __thread uint8_t* cursor = 0;
+    static __thread uint8_t* end = 0;
+    if (cursor == 0 or static_cast<size_t>(end - cursor) < aligned) {
+      void* chunk = arenaAllocate(chunkBytes);
+      if (chunk == 0) {
+        return 0;
+      }
+      if (not pointerIsUnmanaged(chunk)) {
+        fprintf(stderr, "[avian] unmanaged alloc outside granule %p\n", chunk);
+        fflush(stderr);
+        ::abort();
+      }
+      cursor = static_cast<uint8_t*>(chunk);
+      end = cursor + chunkBytes;
+    }
+    void* p = cursor;
+    cursor += aligned;
+    return p;
+  }
   void* p = arenaAllocate(bytes);
   if (p != 0 and not pointerIsUnmanaged(p)) {
     fprintf(stderr, "[avian] unmanaged alloc outside granule %p\n", p);
@@ -554,11 +625,7 @@ void* unmanagedAllocate(size_t bytes)
 
 void unmanagedTrack(void* object)
 {
-  Tracked* node = static_cast<Tracked*>(malloc(sizeof(Tracked)));
-  if (node == 0) {
-    fprintf(stderr, "[avian] unmanaged track\n");
-    ::abort();
-  }
+  Tracked* node = newTracked();
   node->object = object;
   node->dirtyNext = 0;
   node->onDirty = 0;
@@ -588,14 +655,13 @@ void unmanagedMarkScanDirty(void* object)
   dirtyPush(node);
 }
 
-void unmanagedForEach(void (*fn)(void* object, void* arg), void* arg)
+void walkDirty(Tracked** head, void (*fn)(void* object, void* arg), void* arg, unsigned* guard)
 {
   // Mutators are stopped. Unlink a node the callback just marked clean
   // so the next collection does not chase it. The node stays allocated
   // and the object still points at it.
   Tracked* prev = 0;
-  Tracked* node = dirtyHead;
-  unsigned guard = 0;
+  Tracked* node = *head;
   while (node != 0) {
     Tracked* next = node->dirtyNext;
     fn(node->object, arg);
@@ -603,7 +669,7 @@ void unmanagedForEach(void (*fn)(void* object, void* arg), void* arg)
       if (prev != 0) {
         prev->dirtyNext = next;
       } else {
-        dirtyHead = next;
+        *head = next;
       }
       node->dirtyNext = 0;
       __atomic_store_n(&node->onDirty, 0u, __ATOMIC_RELEASE);
@@ -611,10 +677,19 @@ void unmanagedForEach(void (*fn)(void* object, void* arg), void* arg)
       prev = node;
     }
     node = next;
-    if (++guard == 100000000u) {
+    if (++(*guard) == 100000000u) {
       fprintf(stderr, "[avian] gc dirty list cycle\n");
       ::abort();
     }
+  }
+}
+
+void unmanagedForEach(void (*fn)(void* object, void* arg), void* arg)
+{
+  unsigned guard = 0;
+  walkDirty(&dirtyHead, fn, arg, &guard);
+  for (TlsDirty* pub = dirtyPubs; pub != 0; pub = pub->next) {
+    walkDirty(&pub->list, fn, arg, &guard);
   }
 }
 

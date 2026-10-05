@@ -430,6 +430,38 @@ jstring JNICALL NewReadOnlyUnmanagedStringFromUnmanagedMutf8(Thread* t,
   return NewUnmanagedStringFromUnmanagedMutf8(t, header);
 }
 
+uint64_t newReadOnlyUnmanagedStringArray(Thread* t, uintptr_t* arguments)
+{
+  const uint8_t* const* headers
+      = reinterpret_cast<const uint8_t* const*>(arguments[0]);
+  jsize count = static_cast<jsize>(arguments[1]);
+  if (count < 0) {
+    return 0;
+  }
+  object array = makeObjectArray(t, type(t, GcString::Type), static_cast<unsigned>(count));
+  PROTECT(t, array);
+  for (jsize i = 0; i < count; ++i) {
+    const uint8_t* header = headers == 0 ? 0 : headers[i];
+    object value = 0;
+    if (header != 0) {
+      UnmanagedAllocScope zone(t);
+      value = makeStringFromMutf8Header(t, header);
+    }
+    setField(t, array, ArrayBody + (static_cast<unsigned>(i) * BytesPerWord), value);
+  }
+  return reinterpret_cast<uint64_t>(makeLocalReference(t, array));
+}
+
+jobjectArray JNICALL NewReadOnlyUnmanagedStringArray(Thread* t,
+                                                    const void* const* headers,
+                                                    jsize count)
+{
+  uintptr_t arguments[]
+      = {reinterpret_cast<uintptr_t>(headers), static_cast<uintptr_t>(count)};
+  return reinterpret_cast<jobjectArray>(
+      run(t, newReadOnlyUnmanagedStringArray, arguments));
+}
+
 uint64_t getReadOnlyUnmanagedStringUtfChars(Thread* t, uintptr_t* arguments)
 {
   jobject s = reinterpret_cast<jobject>(arguments[0]);
@@ -3709,6 +3741,10 @@ static_assert(offsetof(JNIEnvVTable, ReleaseReadOnlyUnmanagedStringUtfChars)
                       / sizeof(void*)
                   == AvianJniReleaseReadOnlyUnmanagedStringUtfChars,
               "include/avian/jni.h readonly utf release slot");
+static_assert(offsetof(JNIEnvVTable, NewReadOnlyUnmanagedStringArray)
+                      / sizeof(void*)
+                  == AvianJniNewReadOnlyUnmanagedStringArray,
+              "include/avian/jni.h readonly string array slot");
 
 jbyteArray JNICALL SerializeGraph(Thread* t, jobject object);
 jobject JNICALL DeserializeGraph(Thread* t, const uint8_t* data, jint length);
@@ -3757,6 +3793,8 @@ void populateJNITables(JavaVMVTable* vmTable, JNIEnvVTable* envTable)
       = local::GetReadOnlyUnmanagedStringUtfChars;
   envTable->ReleaseReadOnlyUnmanagedStringUtfChars
       = local::ReleaseReadOnlyUnmanagedStringUtfChars;
+  envTable->NewReadOnlyUnmanagedStringArray
+      = local::NewReadOnlyUnmanagedStringArray;
   envTable->DefineClass = local::DefineClass;
   envTable->FindClass = local::FindClass;
   envTable->ThrowNew = local::ThrowNew;

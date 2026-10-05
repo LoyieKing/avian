@@ -1348,6 +1348,7 @@ ifeq ($(process),compile)
 	vm-sources += $(compiler-sources)
 	vm-sources += $(src)/compile/rangeCheckElimination.cpp
 	vm-sources += $(src)/compile/objectStoreFacts.cpp
+	vm-sources += $(src)/sample.cpp
 	# inlineNew, youngObjectStore, objectStore, and trivialConstructor
 	# are included from compile.cpp. Frame and Context are local to
 	# that file. objectStoreFacts is its own translation unit.

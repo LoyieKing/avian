@@ -206,6 +206,19 @@ public final class String
   public int compareTo(String s) {
     if (this == s) return 0;
 
+    // Unmanaged headers are not Java arrays. Scan them in place.
+    if (data == null && unsafeByteLength(unsafe_data) == length) {
+      if (s.data != null && payload(s.data) == s.length) {
+        return unsafeCompare(unsafe_data, s.data, s.length);
+      }
+      if (s.data == null && unsafeByteLength(s.unsafe_data) == s.length) {
+        return unsafeCompareHeader(unsafe_data, s.unsafe_data);
+      }
+    } else if (s.data == null && data != null && payload(data) == length
+               && unsafeByteLength(s.unsafe_data) == s.length) {
+      return -unsafeCompare(s.unsafe_data, data, length);
+    }
+
     byte[] a = bytes();
     byte[] b = s.bytes();
     int n = length < s.length ? length : s.length;
@@ -327,6 +340,10 @@ public final class String
   public int indexOf(int c, int start) {
     if (start < 0) start = 0;
     if (c < 0 || c > 0xffff) return -1;
+    if (data == null && unsafeByteLength(unsafe_data) == length) {
+      if (c >= 0x80) return -1;
+      return unsafeIndexOfByte(unsafe_data, start, c);
+    }
     byte[] b = bytes();
     if (payload(b) == length && c < 0x80) {
       for (int i = start; i < length; ++i) {
@@ -354,6 +371,15 @@ public final class String
     if (s.length == 0) return start;
     if (start < 0) start = 0;
     if (start > length - s.length) return -1;
+
+    if (data == null && unsafeByteLength(unsafe_data) == length) {
+      if (s.data != null && payload(s.data) == s.length) {
+        return unsafeIndexOf(unsafe_data, start, s.data, s.length);
+      }
+      if (s.data == null && unsafeByteLength(s.unsafe_data) == s.length) {
+        return unsafeIndexOfHeader(unsafe_data, start, s.unsafe_data);
+      }
+    }
 
     byte[] a = bytes();
     byte[] b = s.bytes();
@@ -383,6 +409,14 @@ public final class String
     if (s.length == 0) return lastIndex;
     int i = length - s.length;
     if (lastIndex < i) i = lastIndex;
+    if (data == null && unsafeByteLength(unsafe_data) == length) {
+      if (s.data != null && payload(s.data) == s.length) {
+        return unsafeLastIndexOf(unsafe_data, i, s.data, s.length);
+      }
+      if (s.data == null && unsafeByteLength(s.unsafe_data) == s.length) {
+        return unsafeLastIndexOfHeader(unsafe_data, i, s.unsafe_data);
+      }
+    }
     byte[] a = bytes();
     byte[] b = s.bytes();
     for (; i >= 0; --i) {
@@ -393,6 +427,19 @@ public final class String
 
   public String replace(char oldChar, char newChar) {
     if (oldChar == newChar) return this;
+    if (data == null && unsafeByteLength(unsafe_data) == length) {
+      if (oldChar == 0 || oldChar >= 0x80) return this;
+      if (newChar != 0 && newChar < 0x80) {
+        if (unsafeIndexOfByte(unsafe_data, 0, oldChar) < 0) return this;
+        byte[] buf = unsafeCopy(unsafe_data, 0, length);
+        byte oldByte = (byte) oldChar;
+        byte newByte = (byte) newChar;
+        for (int i = 0; i < length; ++i) {
+          if (buf[i] == oldByte) buf[i] = newByte;
+        }
+        return new String(new Encoded(buf, length));
+      }
+    }
     byte[] b = bytes();
     if (payload(b) == length && oldChar != 0 && newChar != 0
         && oldChar < 0x80 && newChar < 0x80) {
@@ -446,6 +493,10 @@ public final class String
     else if (newLen == 0)
       return "";
 
+    if (data == null && unsafeByteLength(unsafe_data) == length) {
+      return new String(new Encoded(unsafeCopy(unsafe_data, start, newLen), newLen));
+    }
+
     byte[] b = bytes();
     if (payload(b) == length) {
       return slice(b, start, end, newLen);
@@ -465,12 +516,20 @@ public final class String
     if (start < 0 || (long) start > (long) length - s.length) {
       return false;
     }
+    if (data == null && unsafeByteLength(unsafe_data) == length) {
+      if (s.data != null && payload(s.data) == s.length) {
+        return unsafeStarts(unsafe_data, start, s.data, s.length);
+      }
+      if (s.data == null && unsafeByteLength(s.unsafe_data) == s.length) {
+        return unsafeStartsHeader(unsafe_data, start, s.unsafe_data);
+      }
+    }
     return regionEquals(bytes(), start, s.bytes(), s.length);
   }
 
   public boolean endsWith(String s) {
     if (length < s.length) return false;
-    return regionEquals(bytes(), length - s.length, s.bytes(), s.length);
+    return startsWith(s, length - s.length);
   }
 
   public String concat(String s) {
@@ -492,9 +551,7 @@ public final class String
 
     byte[] b = bytes();
     if (payload(b) == length) {
-      for (int i = 0; i < srcLength; ++i) {
-        dst[dstOffset + i] = b[srcOffset + i];
-      }
+      if (srcLength > 0) System.arraycopy(b, srcOffset, dst, dstOffset, srcLength);
       return;
     }
     Seq seq = new Seq(b);
@@ -505,6 +562,12 @@ public final class String
   }
 
   public byte[] getBytes() {
+    byte[] latin = latin1();
+    if (latin != null) {
+      byte[] out = new byte[length];
+      if (length > 0) System.arraycopy(latin, 0, out, 0, length);
+      return out;
+    }
     try {
       return getBytes(DEFAULT_ENCODING);
     } catch (java.io.UnsupportedEncodingException ex) {
@@ -744,6 +807,10 @@ public final class String
   public int lastIndexOf(int ch, int lastIndex) {
     if (ch < 0 || ch > 0xffff) return -1;
     if (lastIndex >= length) lastIndex = length - 1;
+    if (data == null && unsafeByteLength(unsafe_data) == length) {
+      if (ch >= 0x80) return -1;
+      return unsafeLastIndexOfByte(unsafe_data, lastIndex, ch);
+    }
     byte[] b = bytes();
     if (payload(b) == length && ch < 0x80) {
       for (int i = lastIndex; i >= 0; --i) {
@@ -822,6 +889,28 @@ public final class String
 
   private static native byte[] unsafeBytes(long pointer);
 
+  private static native int unsafeIndexOfByte(long header, int from, int b);
+
+  private static native int unsafeLastIndexOfByte(long header, int from, int b);
+
+  private static native int unsafeIndexOf(long header, int from, byte[] needle, int needleLength);
+
+  private static native int unsafeLastIndexOf(long header, int from, byte[] needle, int needleLength);
+
+  private static native int unsafeIndexOfHeader(long header, int from, long needle);
+
+  private static native int unsafeLastIndexOfHeader(long header, int from, long needle);
+
+  private static native int unsafeCompare(long header, byte[] other, int otherLength);
+
+  private static native int unsafeCompareHeader(long header, long other);
+
+  private static native boolean unsafeStarts(long header, int offset, byte[] needle, int needleLength);
+
+  private static native boolean unsafeStartsHeader(long header, int offset, long needle);
+
+  private static native byte[] unsafeCopy(long header, int offset, int count);
+
   private static native boolean unsafeEquals(String a, String b);
 
   private static native int unsafeHash(String s);
@@ -831,6 +920,17 @@ public final class String
   private byte[] bytes() {
     if (data != null) return data;
     return unsafeBytes(unsafe_data);
+  }
+
+  static String fromAscii(byte[] ascii) {
+    return new String(new Encoded(ascii, ascii.length));
+  }
+
+  // Modified UTF-8 bytes when every character is one byte, else null.
+  // The array may have a trailing 0; callers copy length() bytes.
+  byte[] latin1() {
+    if (data == null || payload(data) != length) return null;
+    return data;
   }
 
   // Symbol arrays count a trailing 0. A string may share that array.

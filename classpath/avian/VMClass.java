@@ -42,4 +42,11 @@ public class VMClass {
   // Stub addresses. Primitives, so the garbage collector does not trace them.
   public long serializeThunk;
   public long deserializeThunk;
+  // Reflection queries rebuild a Method/Field per member. Callers such as
+  // kotlin-reflect repeat the same query, so the member objects are kept and
+  // each return is a clone of the array.
+  public volatile java.lang.reflect.Method[] cachedDeclaredMethods;
+  public volatile java.lang.reflect.Method[] cachedPublicMethods;
+  public volatile java.lang.reflect.Field[] cachedDeclaredFields;
+  public volatile java.lang.reflect.Field[] cachedPublicFields;
 }

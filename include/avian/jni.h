@@ -164,6 +164,18 @@ struct AvianJniEnv : JNIEnv {
     const Fn* table = reinterpret_cast<const Fn*>(functions);
     table[slot](this, s, chars);
   }
+
+  /* headers[i] is a u2-prefixed Modified UTF-8 header, or null for a null
+     slot. Each string aliases that header on the unmanaged heap. The
+     array is a normal managed local reference. A negative count returns
+     null. */
+  jobjectArray NewReadOnlyUnmanagedStringArray(const void* const* headers, jsize count)
+  {
+    typedef jobjectArray(JNICALL* Fn)(JNIEnv*, const void* const*, jsize);
+    const unsigned slot = 247;
+    const Fn* table = reinterpret_cast<const Fn*>(functions);
+    return table[slot](this, headers, count);
+  }
 };
 
 #endif /* AVIAN_JNI_H_ */

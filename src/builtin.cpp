@@ -16,6 +16,7 @@
 #include <avian/util/runtime-array.h>
 
 #include <stdlib.h>
+#include <string.h>
 
 using namespace vm;
 
@@ -253,6 +254,294 @@ extern "C" AVIAN_EXPORT int64_t JNICALL
   GcByteArray* array = makeByteArray(t, n);
   if (n) {
     memcpy(array->body().begin(), header + 2, n);
+  }
+  return reinterpret_cast<int64_t>(array);
+}
+
+static uint64_t stringArgU64(uintptr_t* arguments, unsigned index)
+{
+  uint64_t value;
+  memcpy(&value, arguments + index, 8);
+  return value;
+}
+
+static int32_t stringArgI32(uintptr_t* arguments, unsigned index)
+{
+  return static_cast<int32_t>(arguments[index]);
+}
+
+// u2 big-endian byte length, then that many Modified UTF-8 bytes.
+// One-byte-per-char strings are the only callers.
+static void stringHeader(uintptr_t* arguments, unsigned index, const uint8_t** bytes, int32_t* length)
+{
+  uint64_t address = stringArgU64(arguments, index);
+  const uint8_t* header = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(address));
+  unsigned n = (static_cast<unsigned>(header[0]) << 8) | header[1];
+  *bytes = header + 2;
+  *length = static_cast<int32_t>(n);
+}
+
+static const uint8_t* stringNeedle(Thread* t, uintptr_t* arguments, unsigned index, int32_t needleLength)
+{
+  if (needleLength <= 0) {
+    return 0;
+  }
+  object array = reinterpret_cast<object>(arguments[index]);
+  if (UNLIKELY(array == 0)) {
+    throwNew(t, GcNullPointerException::Type);
+  }
+  return reinterpret_cast<const uint8_t*>(cast<GcByteArray>(t, array)->body().begin());
+}
+
+static int32_t stringCompareBytes(const uint8_t* a, int32_t aLen, const uint8_t* b, int32_t bLen)
+{
+  int32_t n = aLen < bLen ? aLen : bLen;
+  if (n < 0) {
+    n = 0;
+  }
+  for (int32_t i = 0; i < n; ++i) {
+    int d = static_cast<int>(a[i]) - static_cast<int>(b[i]);
+    if (d != 0) {
+      return d;
+    }
+  }
+  return static_cast<int32_t>(static_cast<int64_t>(aLen) - static_cast<int64_t>(bLen));
+}
+
+static int32_t stringIndexOfBytes(const uint8_t* hay, int32_t hayLen, int32_t from, const uint8_t* needle, int32_t needleLen)
+{
+  if (needleLen <= 0) {
+    return from;
+  }
+  if (from < 0) {
+    from = 0;
+  }
+  if (needleLen > hayLen || from > hayLen - needleLen) {
+    return -1;
+  }
+  const uint8_t* start = hay + from;
+  size_t span = static_cast<size_t>(hayLen - from);
+  if (needleLen == 1) {
+    const void* found = memchr(start, needle[0], span);
+    if (found == 0) {
+      return -1;
+    }
+    return static_cast<int32_t>(static_cast<const uint8_t*>(found) - hay);
+  }
+  const uint8_t* end = hay + (hayLen - needleLen + 1);
+  for (const uint8_t* p = start; p < end; ++p) {
+    if (*p == needle[0] && memcmp(p, needle, static_cast<size_t>(needleLen)) == 0) {
+      return static_cast<int32_t>(p - hay);
+    }
+  }
+  return -1;
+}
+
+static int32_t stringLastIndexOfBytes(const uint8_t* hay, int32_t hayLen, int32_t from, const uint8_t* needle, int32_t needleLen)
+{
+  if (needleLen <= 0) {
+    return from;
+  }
+  if (needleLen > hayLen) {
+    return -1;
+  }
+  int32_t maxStart = hayLen - needleLen;
+  if (from > maxStart) {
+    from = maxStart;
+  }
+  if (from < 0) {
+    return -1;
+  }
+  for (int32_t i = from; i >= 0; --i) {
+    if (hay[i] == needle[0] && memcmp(hay + i, needle, static_cast<size_t>(needleLen)) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int32_t stringIndexOfByte(const uint8_t* hay, int32_t hayLen, int32_t from, int32_t b)
+{
+  if (from < 0) {
+    from = 0;
+  }
+  if (from >= hayLen) {
+    return -1;
+  }
+  const void* found = memchr(hay + from, b & 0xff, static_cast<size_t>(hayLen - from));
+  if (found == 0) {
+    return -1;
+  }
+  return static_cast<int32_t>(static_cast<const uint8_t*>(found) - hay);
+}
+
+static int32_t stringLastIndexOfByte(const uint8_t* hay, int32_t hayLen, int32_t from, int32_t b)
+{
+  if (from >= hayLen) {
+    from = hayLen - 1;
+  }
+  if (from < 0) {
+    return -1;
+  }
+  uint8_t want = static_cast<uint8_t>(b & 0xff);
+  for (int32_t i = from; i >= 0; --i) {
+    if (hay[i] == want) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int32_t stringStarts(const uint8_t* hay, int32_t hayLen, int32_t offset, const uint8_t* needle, int32_t needleLen)
+{
+  if (needleLen < 0 || offset < 0) {
+    return 0;
+  }
+  if (static_cast<uint32_t>(offset) + static_cast<uint32_t>(needleLen) > static_cast<uint32_t>(hayLen)) {
+    return 0;
+  }
+  if (needleLen == 0) {
+    return 1;
+  }
+  return memcmp(hay + offset, needle, static_cast<size_t>(needleLen)) == 0 ? 1 : 0;
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeIndexOfByte(Thread*, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  return stringIndexOfByte(bytes, length, stringArgI32(arguments, 2), stringArgI32(arguments, 3));
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeLastIndexOfByte(Thread*, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  return stringLastIndexOfByte(bytes, length, stringArgI32(arguments, 2), stringArgI32(arguments, 3));
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeIndexOf(Thread* t, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  int32_t from = stringArgI32(arguments, 2);
+  int32_t needleLength = stringArgI32(arguments, 4);
+  const uint8_t* needle = stringNeedle(t, arguments, 3, needleLength);
+  return stringIndexOfBytes(bytes, length, from, needle, needleLength);
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeLastIndexOf(Thread* t, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  int32_t from = stringArgI32(arguments, 2);
+  int32_t needleLength = stringArgI32(arguments, 4);
+  const uint8_t* needle = stringNeedle(t, arguments, 3, needleLength);
+  return stringLastIndexOfBytes(bytes, length, from, needle, needleLength);
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeIndexOfHeader(Thread*, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  const uint8_t* needle;
+  int32_t needleLength;
+  stringHeader(arguments, 3, &needle, &needleLength);
+  return stringIndexOfBytes(bytes, length, stringArgI32(arguments, 2), needle, needleLength);
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeLastIndexOfHeader(Thread*, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  const uint8_t* needle;
+  int32_t needleLength;
+  stringHeader(arguments, 3, &needle, &needleLength);
+  return stringLastIndexOfBytes(bytes, length, stringArgI32(arguments, 2), needle, needleLength);
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeCompare(Thread* t, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  int32_t otherLength = stringArgI32(arguments, 3);
+  const uint8_t* other = stringNeedle(t, arguments, 2, otherLength);
+  return stringCompareBytes(bytes, length, other, otherLength);
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeCompareHeader(Thread*, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  const uint8_t* other;
+  int32_t otherLength;
+  stringHeader(arguments, 2, &other, &otherLength);
+  return stringCompareBytes(bytes, length, other, otherLength);
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeStarts(Thread* t, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  int32_t offset = stringArgI32(arguments, 2);
+  int32_t needleLength = stringArgI32(arguments, 4);
+  const uint8_t* needle = stringNeedle(t, arguments, 3, needleLength);
+  return stringStarts(bytes, length, offset, needle, needleLength);
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeStartsHeader(Thread*, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  const uint8_t* needle;
+  int32_t needleLength;
+  stringHeader(arguments, 3, &needle, &needleLength);
+  return stringStarts(bytes, length, stringArgI32(arguments, 2), needle, needleLength);
+}
+
+extern "C" AVIAN_EXPORT int64_t JNICALL
+    Avian_java_lang_String_unsafeCopy(Thread* t, object, uintptr_t* arguments)
+{
+  const uint8_t* bytes;
+  int32_t length;
+  stringHeader(arguments, 0, &bytes, &length);
+  int32_t offset = stringArgI32(arguments, 2);
+  int32_t count = stringArgI32(arguments, 3);
+  if (count < 0) {
+    count = 0;
+  }
+  if (offset < 0) {
+    offset = 0;
+  }
+  if (static_cast<uint32_t>(offset) + static_cast<uint32_t>(count) > static_cast<uint32_t>(length)) {
+    count = length - offset;
+    if (count < 0) {
+      count = 0;
+    }
+  }
+  GcByteArray* array = makeByteArray(t, static_cast<unsigned>(count));
+  if (count) {
+    memcpy(array->body().begin(), bytes + offset, static_cast<size_t>(count));
   }
   return reinterpret_cast<int64_t>(array);
 }

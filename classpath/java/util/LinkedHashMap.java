@@ -11,30 +11,24 @@
 package java.util;
 
 public class LinkedHashMap<K, V> extends HashMap<K, V> {
-  private static class LinkedKey<K> {
-    private final K key;
-    private LinkedKey<K> previous, next;
+  static final class OrderCell<K, V> extends MyCell<K, V> {
+    OrderCell<K, V> before, after;
 
-    public LinkedKey(K key) {
-      this.key = key;
-    }
-
-    public boolean equals(Object other) {
-      LinkedKey<K> o = (LinkedKey<K>) other;
-      return key.equals(o.key);
-    }
-
-    public int hashCode() {
-      return key.hashCode();
+    OrderCell(K key, V value, Cell<K, V> next, int hash) {
+      super(key, value, next, hash);
     }
   }
 
-  private LinkedKey first, last;
-  private HashMap<K, LinkedKey<K>> lookup;
+  static final class OrderHelper<K, V> extends MyHelper<K, V> {
+    public Cell<K, V> make(K key, V value, Cell<K, V> next) {
+      return new OrderCell<K, V>(key, value, next, hash(key));
+    }
+  }
+
+  private OrderCell<K, V> head, tail;
 
   public LinkedHashMap(int capacity) {
-    super(capacity);
-    lookup = new HashMap<K, LinkedKey<K>>();
+    super(capacity, new OrderHelper<K, V>());
   }
 
   public LinkedHashMap() {
@@ -46,42 +40,36 @@ public class LinkedHashMap<K, V> extends HashMap<K, V> {
     putAll(map);
   }
 
-  public V put(K key, V value) {
-    if (!super.containsKey(key)) {
-      LinkedKey<K> k = new LinkedKey<K>(key);
-      if (first == null) {
-        first = k;
-      } else {
-        last.next = k;
-        k.previous = last;
-      }
-      last = k;
-      lookup.put(key, k);
+  protected void afterInsert(Cell<K, V> cell) {
+    OrderCell<K, V> created = (OrderCell<K, V>) cell;
+    if (head == null) {
+      head = tail = created;
+    } else {
+      tail.after = created;
+      created.before = tail;
+      tail = created;
     }
-    return super.put(key, value);
   }
 
-  public V remove(Object key) {
-    LinkedKey<K> linked = lookup.get(key);
-    if (linked == null) {
-      return null;
-    }
-    if (linked.previous == null) {
-      first = linked.next;
+  protected void afterRemove(Cell<K, V> cell) {
+    OrderCell<K, V> created = (OrderCell<K, V>) cell;
+    OrderCell<K, V> previous = created.before;
+    OrderCell<K, V> next = created.after;
+    if (previous == null) {
+      head = next;
     } else {
-      linked.previous.next = linked.next;
+      previous.after = next;
     }
-    if (linked.next == null) {
-      last = linked.previous;
+    if (next == null) {
+      tail = previous;
     } else {
-      linked.next.previous = linked.previous;
+      next.before = previous;
     }
-    return super.remove(key);
+    created.before = created.after = null;
   }
 
-  public void clear() {
-    first = last = null;
-    super.clear();
+  protected void afterClear() {
+    head = tail = null;
   }
 
   public Set<Entry<K, V>> entrySet() {
@@ -243,24 +231,28 @@ public class LinkedHashMap<K, V> extends HashMap<K, V> {
   }
 
   private class MyIterator implements Iterator<Entry<K, V>> {
-    private LinkedKey<K> current = first;
+    private OrderCell<K, V> cursor = head;
+    private OrderCell<K, V> current;
 
     public Entry<K, V> next() {
-      if (!hasNext()) {
+      if (cursor == null) {
         throw new NoSuchElementException();
       }
-      Entry<K, V> result = find(current.key);
-      current = current.next;
-      return result;
+      current = cursor;
+      cursor = cursor.after;
+      return current;
     }
 
     public boolean hasNext() {
-      return current != null;
+      return cursor != null;
     }
 
     public void remove() {
-      LinkedHashMap.this.remove(current == null ?
-        last.key : current.previous.key);
+      if (current == null) {
+        throw new IllegalStateException();
+      }
+      LinkedHashMap.this.remove(current.key);
+      current = null;
     }
   }
 }
